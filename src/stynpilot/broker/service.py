@@ -166,3 +166,37 @@ def call(socket_path, message, timeout=1800):
         conn.connect(str(socket_path))
         conn.sendall(json.dumps(message).encode() + b"\n")
         return json.loads(_read_line(conn).decode("utf-8"))
+
+
+class BrokerRefused(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+class BrokerClient:
+    """What the owner-side approval flow uses to talk to the root installer over its socket."""
+
+    def __init__(self, socket_path):
+        self.socket_path = str(socket_path)
+
+    def _ask(self, message, timeout=1800):
+        try:
+            reply = call(self.socket_path, message, timeout=timeout)
+        except (OSError, ValueError):
+            raise BrokerRefused("installer_unavailable") from None
+        if not reply.get("ok"):
+            raise BrokerRefused(str(reply.get("error", "installer_refused")))
+        return reply
+
+    def challenge(self, payload, decision):
+        return self._ask({"op": "challenge", "payload": payload, "decision": decision}, 30)["challenge"]
+
+    def install(self, payload, proof, challenge):
+        return self._ask({"op": "install", "payload": payload, "proof": proof, "challenge": challenge})["result"]
+
+    def rollback(self, payload, proof, challenge):
+        return self._ask({"op": "rollback", "payload": payload, "proof": proof, "challenge": challenge})["result"]
+
+    def deny(self, payload, proof, challenge):
+        return self._ask({"op": "deny", "payload": payload, "proof": proof, "challenge": challenge}, 60)["result"]

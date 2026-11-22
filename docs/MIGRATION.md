@@ -18,13 +18,16 @@ Device IDs, hostnames, emails, Auth0 values and backup data are never copied.
 | `stynpilot/server/tokens.py` | `mcp_token_verifier.py` | Same checks; optional `[server]` extra (PyJWT) |
 | `stynpilot/server/router.py` | `mcp_read_router.py` + `_LocalOwnership` | Health and status share one two-layer check, before and after each read |
 | `stynpilot/server/app.py` | `customer_mcp_server.py` | Read-only tools only for now; optional `[server]` extra (MCP SDK 1.x) |
+| `stynpilot/devices.py` | `auth0_pairing_adapter.PairingDeviceGrantStore`, `device_permissions.SQLiteDevicePermissions` | Reads the **existing** pairing database (schema 2) read-only with the same answers, so the upgrade keeps the pairing; unknown scopes fail closed |
+| `stynpilot/server/oidc.py` | `oidc_provider.py` | Same strict discovery checks; injectable fetch for offline tests |
+| `stynpilot/server/run.py` | `start_health_connection`, `_serve_health_resource_metadata`, `commander_ai_endpoint` metadata helpers | Loopback-only listener, exact host names, RFC 9728 metadata, binds to the one live paired device |
 
 ## Port next (proven, needs adapting)
 
 Ordered by what the Ryzen needs first.
 
 1. `tools/stynpilot_remote_broker.py`: root broker on a private UNIX socket, single-use owner tokens. Generalize from the Forgejo recipe to executing a `ValidatedPlan`.
-2. `src/commander_health_connection.py` (startup, protected-resource metadata, loopback listener) plus `oidc_provider.py`, `owner_proposal_grants.py` and the pairing store: the remaining pieces needed to *run* the endpoint. Tokens, router and tools are done.
+2. Creating a **new** pairing (first-run device pairing for a fresh install, `pairing_engine.py` + `customer_pairing_gateway.py`). Reading the existing pairing is done; creating one belongs with the installer (G7).
 3. `src/stynpilot_files.py`, `stynpilot_file_tools.py`, `stynpilot_file_changes.py`: enrolled folders and USB with path and symlink safety.
 4. `src/commander_phone_bridge.py`, `commander_approval_api.py`, `stynpilot_phone_assets.py`: the phone approval page.
 5. `tools/commander_activation_attestation.py`: root-signed activation. This was the fix for the systemd user-namespace issue.

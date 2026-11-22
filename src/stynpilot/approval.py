@@ -217,11 +217,19 @@ class ApprovalFlow:
             return {"ok": False, "stopped": stopped, "changed_anything": False}
         return result
 
+    def _root_record(self, rid):
+        """('unreachable', None) when the installer can't be asked right now; else ('record', status dict)."""
+        try:
+            return "record", self.broker.status(rid)
+        except Exception as error:
+            if isinstance(error, OSError) or getattr(error, "code", None) == "installer_unavailable":
+                return "unreachable", None
+            return "unknown", None
+
     def _root_result(self, rid):
         """The installer's durable record for this request, as a result; unknown means the owner must verify."""
-        try:
-            record = self.broker.status(rid)
-        except Exception:
+        kind, record = self._root_record(rid)
+        if kind != "record":
             return {"ok": False, "stopped": "installer_unreachable_owner_must_verify", "changed_anything": None,
                     "needs_owner_intervention": True}
         state = record.get("state")
@@ -235,14 +243,36 @@ class ApprovalFlow:
         return {"ok": False, "stopped": "installer_state_unknown_owner_must_verify", "changed_anything": None,
                 "needs_owner_intervention": True}
 
-    def recover(self):
-        """Call once at startup. Every request left approved/running is reconciled with the installer's own
-        record (never retried): finished runs get their real result, unknown ones are marked for the owner."""
-        settled = []
+    def recover(self, patient=False):
+        """Call at startup. Every request left approved/running is reconciled with the installer's own
+        record (never retried): finished runs get their real result, unknown ones are marked for the owner.
+
+        ``patient=True`` (the packaged service, where the root installer may simply start a moment later):
+        if the installer can't be reached, or says the run is still going, the request is LEFT as it is and
+        returned in the second list to be tried again; nothing is marked for the owner on a mere delay."""
+        settled, waiting = [], []
         for rid in self.store.in_flight():
+            if patient:
+                kind, record = self._root_record(rid)
+                if kind == "unreachable" or (kind == "record" and (record or {}).get("state") == "running"):
+                    waiting.append(rid)
+                    continue
             result = self._root_result(rid)
             if self.store.transition(rid, "approved", "running") is False:
                 pass                                           # was already running
             self.store.transition(rid, "running", self._state_for(result), result=result)
             settled.append(rid)
-        return settled
+        return (settled, waiting) if patient else settled
+
+    def _settle_from_root(self, rid):
+        result = self._root_result(rid)
+        self.store.transition(rid, "approved", "running")
+        self.store.transition(rid, "running", self._state_for(result), result=result)
+
+    def give_up_waiting(self, rids):
+        """The installer stayed unreachable (or 'running') for too long: say honestly that the owner must verify."""
+        result = {"ok": False, "stopped": "installer_unreachable_owner_must_verify", "changed_anything": None,
+                  "needs_owner_intervention": True}
+        for rid in rids:
+            self.store.transition(rid, "approved", "running")
+            self.store.transition(rid, "running", "needs_owner_intervention", result=result)

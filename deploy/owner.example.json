@@ -1,0 +1,17 @@
+{
+  "issuer": "https://YOUR-TENANT.example.auth/",
+  "approval_client_id": "YOUR-APPROVAL-APP-CLIENT-ID",
+  "authorize_endpoint": "https://YOUR-TENANT.example.auth/authorize",
+  "token_endpoint": "https://YOUR-TENANT.example.auth/oauth/token",
+  "approval_public_host": "your-computer.your-tailnet.example:8444",
+  "approval_port": 18444,
+  "mcp_public_host": "your-computer.your-tailnet.example",
+  "mcp_port": 18443,
+  "state_dir": "/home/owner/.local/state/stynpilot",
+  "broker_socket": "/run/stynpilot/installer.sock",
+  "pairing_db": "/home/owner/.local/state/stynpilot-pairing/pairing.db",
+  "enrolled_clients": [
+    {"client_id": "YOUR-CHATGPT-CONNECTOR-ID", "name": "chatgpt", "kind": "chatgpt"},
+    {"client_id": "YOUR-CLAUDE-CONNECTOR-ID", "name": "claude", "kind": "claude"}
+  ]
+}

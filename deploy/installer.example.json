@@ -1,0 +1,9 @@
+{
+  "issuer": "https://YOUR-TENANT.example.auth/",
+  "approval_client_id": "YOUR-APPROVAL-APP-CLIENT-ID",
+  "owner": "OWNER-ACCOUNT-ID-FROM-THE-OWNERS-PAIRING",
+  "device": "YOUR-PAIRED-DEVICE-ID",
+  "owner_uid": 1000,
+  "state_dir": "/var/lib/stynpilot-installer",
+  "socket_path": "/run/stynpilot/installer.sock"
+}

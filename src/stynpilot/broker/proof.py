@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import re
+import threading
 import time
 
 import jwt
@@ -81,14 +82,35 @@ def render_summary(payload):
 
 
 class ProofVerifier:
-    def __init__(self, *, issuer, approval_client_id, jwks, clock=time.time):
+    def __init__(self, *, issuer, approval_client_id, jwks, clock=time.time, jwks_loader=None, refresh_cooldown=30.0,
+                 monotonic=time.monotonic):
+        """``jwks_loader``: optional callable returning the issuer's CURRENT JWKS (fetched from the pinned issuer
+        origin). It is consulted only when a token names a key ID we don't have (a provider key rotation), at
+        most once per ``refresh_cooldown`` seconds, and the new set goes through the same strict key checks.
+        A failed refresh keeps the old keys. Issuer, audience, RS256 only and owner checks never change."""
         from ..server.tokens import _load_keys        # same strict JWKS rules as the endpoint
         if not isinstance(issuer, str) or not issuer.startswith("https://"):
             raise ValueError("HTTPS issuer required")
         if type(approval_client_id) is not str or not approval_client_id:
             raise ValueError("Approval app client ID required")
         self.issuer, self.client_id, self.clock = issuer, approval_client_id, clock
+        self._load_keys, self._loader, self._monotonic = _load_keys, jwks_loader, monotonic
+        self._cooldown, self._last_refresh, self._lock = float(refresh_cooldown), None, threading.Lock()
         self.keys = _load_keys(jwks)
+
+    def _key_for(self, kid):
+        key = self.keys.get(kid)
+        if key is not None or self._loader is None or type(kid) is not str:
+            return key
+        with self._lock:
+            now = self._monotonic()
+            if self._last_refresh is None or now - self._last_refresh >= self._cooldown:
+                self._last_refresh = now
+                try:
+                    self.keys = self._load_keys(self._loader())      # replaced whole, or not at all
+                except Exception:
+                    pass
+            return self.keys.get(kid)
 
     def verify(self, id_token, *, expected_nonce, owner):
         """Return the proof fingerprint if this token carries exactly ``expected_nonce`` for the owner."""
@@ -98,7 +120,7 @@ class ProofVerifier:
             header = jwt.get_unverified_header(id_token)
             if header.get("alg") != "RS256" or "jku" in header or "x5u" in header:
                 raise ProofDenied("proof_invalid")
-            key = self.keys.get(header.get("kid"))
+            key = self._key_for(header.get("kid"))
             if key is None:
                 raise ProofDenied("proof_invalid")
             claims = jwt.decode(id_token, key=key, algorithms=["RS256"], issuer=self.issuer,

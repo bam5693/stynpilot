@@ -1,0 +1,367 @@
+"""Packaged service entry points (G6): the owner-side service and the root installer, assembled from one
+private config file each. Nothing here touches Auth0, Tailscale, Cloudflare, the pairing database or any
+live setting: it only reads the values the owner put in the config and starts local listeners.
+
+Owner service start order (the order is the point):
+  0. state is created ONLY by the explicit owner command ``provision`` (never by a normal start, never by an
+     AI): if any of the provisioned files is missing the service refuses to start, so lost state can't
+     silently turn into a pristine one that re-admits revoked AI clients
+  1. state folder checked private; revocation list and request store opened (fail closed)
+  2. restart reconciliation, PATIENT: a request left approved/running is settled from the root installer's own
+     durable record. If the installer simply isn't up yet (or says the run is still going) the request is left
+     as it is and retried in the background; only a long outage is reported, honestly, as "owner must verify".
+     Nothing is ever replayed.
+  3. the approval page (127.0.0.1 only; the owner's HTTPS proxy fronts it), then the AI-facing MCP endpoint
+     (also 127.0.0.1) which can only FILE requests; it has no way to approve, deny or run anything.
+The approval worker is the single background thread inside ApprovalFlow(background=True).
+"""
+from __future__ import annotations
+
+import json
+import os
+import stat
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from .approval import ApprovalFlow
+from .broker import apt
+from .requests import RequestStore
+from .server import run
+from .server.clients import RevocationFile
+from .server.oidc import https_origin
+
+_MAX_CONFIG = 16 * 1024
+OWNER_KEYS = {"issuer", "approval_client_id", "authorize_endpoint", "token_endpoint", "approval_public_host",
+              "approval_port", "state_dir", "broker_socket", "pairing_db", "mcp_public_host", "mcp_port",
+              "enrolled_clients"}
+PROVISIONED = ("requests.sqlite3", "revoked-clients.json", "token-revocations.sqlite3", "provisioned.json")
+INSTALLER_KEYS = {"issuer", "approval_client_id", "owner", "device", "owner_uid", "state_dir", "socket_path"}
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def read_private_json(path, keys):
+    """A config file the owner (or root) wrote: regular file, ours, not group/world readable, exact keys."""
+    path = Path(path)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise ConfigError("config_unreadable") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ConfigError("config_must_be_a_private_file_owned_by_the_service_user")
+        if info.st_size > _MAX_CONFIG:
+            raise ConfigError("config_too_large")
+        try:
+            data = json.loads(os.read(fd, _MAX_CONFIG + 1).decode("utf-8"))
+        except (ValueError, UnicodeError):
+            raise ConfigError("config_not_valid_json") from None
+    finally:
+        os.close(fd)
+    if type(data) is not dict or set(data) != keys:
+        raise ConfigError("config_has_unexpected_or_missing_fields")
+    return data
+
+
+def _abs(value, field):
+    if type(value) is not str or not Path(value).is_absolute():
+        raise ConfigError("%s_must_be_an_absolute_path" % field)
+    return Path(value)
+
+
+@dataclass(frozen=True)
+class OwnerConfig:
+    issuer: str
+    approval_client_id: str
+    authorize_endpoint: str
+    token_endpoint: str
+    approval_public_host: str
+    approval_port: int
+    state_dir: Path
+    broker_socket: Path
+    pairing_db: Path
+    mcp_public_host: str
+    mcp_port: int
+    enrolled_clients: tuple
+
+    @classmethod
+    def from_file(cls, path):
+        return cls.from_dict(read_private_json(path, OWNER_KEYS))
+
+    @classmethod
+    def from_dict(cls, data):
+        try:
+            origin = https_origin(data["issuer"])
+            for field in ("authorize_endpoint", "token_endpoint"):
+                if https_origin(data[field]) != origin:
+                    raise ConfigError("%s_must_stay_on_the_issuer" % field)
+            host = run.check_approval_host(data["approval_public_host"])
+            mcp_host = run.check_public_host(data["mcp_public_host"])
+        except ConfigError:
+            raise
+        except (ValueError, KeyError):
+            raise ConfigError("config_value_invalid") from None
+        port = data["approval_port"]
+        if type(port) is not int or isinstance(port, bool) or not 1024 < port <= 65535:
+            raise ConfigError("approval_port_must_be_unprivileged")
+        if type(data["approval_client_id"]) is not str or not data["approval_client_id"]:
+            raise ConfigError("approval_client_id_required")
+        mcp_port = data["mcp_port"]
+        if type(mcp_port) is not int or isinstance(mcp_port, bool) or not 1024 < mcp_port <= 65535 or mcp_port == port:
+            raise ConfigError("mcp_port_must_be_unprivileged_and_different")
+        clients = data["enrolled_clients"]
+        if (type(clients) is not list or not 1 <= len(clients) <= 8
+                or any(type(c) is not dict or set(c) != {"client_id", "name", "kind"} for c in clients)):
+            raise ConfigError("enrolled_clients_invalid")
+        return cls(data["issuer"], data["approval_client_id"], data["authorize_endpoint"], data["token_endpoint"],
+                   host, port, _abs(data["state_dir"], "state_dir"), _abs(data["broker_socket"], "broker_socket"),
+                   _abs(data["pairing_db"], "pairing_db"), mcp_host, mcp_port, tuple(dict(c) for c in clients))
+
+    @property
+    def redirect_uri(self):
+        return "https://%s/approve/callback" % self.approval_public_host
+
+
+@dataclass
+class OwnerService:
+    flow: ApprovalFlow
+    approval: object
+    mcp: object
+    recovered: list
+    waiting: list
+    _stop: object = None
+    _thread: object = None
+    unreachable_since: dict = None
+
+    def __post_init__(self):
+        self.unreachable_since = {}
+
+    def stop(self):
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        for part in (self.mcp, self.approval):
+            if part is not None:
+                part.stop()
+        if self.flow._pool is not None:
+            self.flow._pool.shutdown(wait=True)
+
+
+def _check_state_dir(state):
+    info = os.lstat(state)
+    if state.is_symlink() or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ConfigError("state_dir_must_be_private_and_owned_by_the_service_user")
+
+
+def provision_owner_state(config):
+    """The ONE place the owner's request store and revocation lists are created. Run deliberately by the owner
+    (or the owner-approved installer), never by a normal start and never reachable by an AI. Refuses if any
+    state is already there: restoring access to revoked AI clients must be an explicit, visible decision."""
+    state = config.state_dir
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _check_state_dir(state)
+    present = [name for name in PROVISIONED + ("requests.sqlite3-journal",) if (state / name).exists()]
+    if present:
+        raise ConfigError("state_already_present_refusing_to_reset_it")
+    RevocationFile(state / "revoked-clients.json").provision()
+    from .identity import SQLiteRevocations
+    SQLiteRevocations(state / "token-revocations.sqlite3").close()
+    RequestStore(state / "requests.sqlite3")
+    fd = os.open(state / "provisioned.json", os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, json.dumps({"provisioned_at": int(time.time()), "version": 1}).encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return sorted(PROVISIONED)
+
+
+def start_owner_service(config, *, broker=None, exchange=None, start_listener=None, start_mcp=None, tokens=None,
+                        clock=time.time, monotonic=time.monotonic, reconcile_interval=5.0, give_up_after=600.0,
+                        resolve_apt=None):
+    """Assemble and start the owner side. The keyword hooks are for tests; production passes none."""
+    import threading
+    from .approval_web import token_exchange
+    from .broker.service import BrokerClient, BrokerLedger
+    from .devices import PairingDeviceGrants
+    from .identity import SQLiteRevocations
+    from .server.clients import EnrolledClients
+    state = config.state_dir
+    if not state.is_dir():
+        raise ConfigError("not_provisioned_owner_must_run_provision")
+    _check_state_dir(state)
+    if any(not (state / name).exists() for name in PROVISIONED):
+        # Lost or misplaced state must NEVER be recreated empty here: that could re-admit revoked AI clients.
+        raise ConfigError("not_provisioned_or_state_missing_owner_must_run_provision_or_restore")
+    revocations = RevocationFile(state / "revoked-clients.json")
+    revocations.revoked()                                  # must be readable and trusted, or we don't start
+    store = RequestStore(state / "requests.sqlite3", clock=clock)
+    broker = broker or BrokerClient(config.broker_socket)
+    flow = ApprovalFlow(store=store, broker=broker,
+                        exchange=exchange or token_exchange(token_endpoint=config.token_endpoint,
+                                                            client_id=config.approval_client_id,
+                                                            redirect_uri=config.redirect_uri),
+                        authorize={"endpoint": config.authorize_endpoint, "client_id": config.approval_client_id,
+                                   "redirect_uri": config.redirect_uri},
+                        clock=clock, background=True)
+    recovered, waiting = flow.recover(patient=True)        # settle what the installer already knows, BEFORE accepting anything
+    service = OwnerService(flow, None, None, recovered, waiting)
+    try:
+        service.approval = (start_listener or run.start_approval)(
+            flow=flow, public_host=config.approval_public_host, port=config.approval_port)
+        if tokens is None:
+            from .server.oidc import OIDCConfig
+            from .server import run as _run
+            tokens = OIDCConfig(issuer=config.issuer, audience="https://%s/mcp" % config.mcp_public_host,
+                                revocations=SQLiteRevocations(state / "token-revocations.sqlite3"),
+                                allowed_scopes=_run.PROPOSE_SCOPES).build_verifier()
+        from . import health, service_status
+        grants = PairingDeviceGrants(config.pairing_db)
+        router = run.router_for_paired_device(tokens=tokens, grants=grants, read_health=health.snapshot,
+                                              read_service_status=service_status.read_service_status)
+        propose = dict(clients=EnrolledClients([dict(c) for c in config.enrolled_clients], revocations=revocations),
+                       store=store, ledger=BrokerLedger(config.broker_socket),
+                       resolve_apt=resolve_apt or apt.resolve,
+                       approval_url="https://%s" % config.approval_public_host)
+        service.mcp = (start_mcp or run.start)(router=router, public_host=config.mcp_public_host,
+                                               port=config.mcp_port, propose=propose)
+    except Exception:
+        service.stop()
+        raise
+    if waiting:
+        stop, thread = threading.Event(), None
+
+        def keep_trying():
+            while service.waiting and not stop.wait(reconcile_interval):
+                try:
+                    reconcile_waiting(service, now=monotonic(), give_up_after=give_up_after)
+                except Exception:
+                    pass                                         # a bad pass must not end the monitoring
+        service._stop = stop
+        service._thread = thread = threading.Thread(target=keep_trying, name="stynpilot-reconcile", daemon=True)
+        thread.start()
+    return service
+
+
+def reconcile_waiting(service, *, now=None, give_up_after=600.0):
+    """One more try at requests whose installer record wasn't available at startup.
+
+    A reachable installer that says "running" is a legitimate long install: keep watching it, however long
+    it takes (if the installer itself crashes, its own restart marks the run for the owner, which we then
+    report). Only an UNREACHABLE installer is an outage, and only after it has been unreachable continuously
+    for ``give_up_after`` seconds is the owner told, honestly, to verify. Nothing is ever re-run."""
+    flow, now = service.flow, (time.monotonic() if now is None else now)
+    for rid in list(service.waiting):
+        kind, record = flow._root_record(rid)
+        if kind == "unreachable":
+            began = service.unreachable_since.setdefault(rid, now)
+            if now - began >= give_up_after:
+                flow.give_up_waiting([rid])
+                service.waiting.remove(rid)
+                service.unreachable_since.pop(rid, None)
+            continue
+        service.unreachable_since.pop(rid, None)                 # reachable again: the outage clock restarts
+        if kind == "record" and (record or {}).get("state") == "running":
+            continue                                             # still legitimately running: keep monitoring
+        flow._settle_from_root(rid)
+        service.waiting.remove(rid)
+        service.recovered.append(rid)
+    return list(service.waiting)
+
+
+# ---------------------------------------------------------------------------------------------------- root
+@dataclass(frozen=True)
+class InstallerConfig:
+    issuer: str
+    approval_client_id: str
+    owner: str
+    device: str
+    owner_uid: int
+    state_dir: Path
+    socket_path: Path
+
+    @classmethod
+    def from_file(cls, path):
+        return cls.from_dict(read_private_json(path, INSTALLER_KEYS))
+
+    @classmethod
+    def from_dict(cls, data):
+        try:
+            https_origin(data["issuer"])
+        except (ValueError, KeyError):
+            raise ConfigError("config_value_invalid") from None
+        for field in ("approval_client_id", "owner", "device"):
+            if type(data[field]) is not str or not data[field]:
+                raise ConfigError("%s_required" % field)
+        uid = data["owner_uid"]
+        if type(uid) is not int or isinstance(uid, bool) or uid < 1000:
+            raise ConfigError("owner_uid_must_be_a_normal_user")
+        return cls(data["issuer"], data["approval_client_id"], data["owner"], data["device"], uid,
+                   _abs(data["state_dir"], "state_dir"), _abs(data["socket_path"], "socket_path"))
+
+
+def fetch_jwks(issuer, fetch=None):
+    """The issuer's signing keys, fetched once at installer start from its own HTTPS origin (strict discovery)."""
+    from .server.oidc import OIDCConfig, jwks_uri_from_discovery
+
+    class _Durable:
+        durable = True
+
+        @staticmethod
+        def revoked_before(*_):
+            return None
+    cfg = OIDCConfig(issuer=issuer, audience="installer", revocations=_Durable(), allowed_scopes=frozenset(),
+                     fetch=fetch)
+    discovery = cfg._fetch(issuer.rstrip("/") + "/.well-known/openid-configuration")
+    return cfg._fetch(jwks_uri_from_discovery(issuer, discovery))
+
+
+def build_installer(config, *, jwks, jwks_loader=None, run_command=apt.real_run, require_root=True,
+                    **executor_options):
+    """The root installer and its socket. Creating the Executor marks any run left 'running' by a crash as
+    needing the owner and blocks new installs until the owner has checked."""
+    from .broker.executor import Executor
+    from .broker.proof import ProofVerifier
+    from .broker.service import BrokerService
+    verifier = ProofVerifier(issuer=config.issuer, approval_client_id=config.approval_client_id, jwks=jwks,
+                             jwks_loader=jwks_loader)
+    executor = Executor(state_dir=config.state_dir, owner=config.owner, device=config.device, verifier=verifier,
+                        run=run_command, require_root=require_root, **executor_options)
+    return BrokerService(socket_path=config.socket_path, executor=executor, allowed_uid=config.owner_uid)
+
+
+def main(argv=None):                                       # pragma: no cover - thin process wrapper
+    import argparse
+    import signal
+    import threading
+    parser = argparse.ArgumentParser(prog="stynpilot-service")
+    parser.add_argument("role", choices=("owner", "installer", "provision"))
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args(argv)
+    if args.role == "installer":
+        config = InstallerConfig.from_file(args.config)
+        service = build_installer(config, jwks=fetch_jwks(config.issuer),
+                                  jwks_loader=lambda: fetch_jwks(config.issuer))     # rotation: only on an unknown key ID
+        service.serve_forever()
+        return 0
+    config = OwnerConfig.from_file(args.config)
+    if args.role == "provision":
+        print("created:", ", ".join(provision_owner_state(config)))
+        return 0
+    service = start_owner_service(config)
+    done = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: done.set())
+    done.wait()
+    service.stop()
+    return 0
+
+
+if __name__ == "__main__":                                 # pragma: no cover
+    raise SystemExit(main())

@@ -1,0 +1,19 @@
+# The owner-side service (a user service: it never runs as root). NOT installed by this repo.
+# Config: ~/.config/stynpilot/owner.json (mode 0600). Listens on 127.0.0.1 only; the owner's HTTPS proxy fronts it.
+# The pairing database is only READ (opened read-only), so it needs no write path.
+[Unit]
+Description=StyNpilot owner service (approval page and request store)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m stynpilot.service owner --config %h/.config/stynpilot/owner.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=%h/.local/state/stynpilot
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

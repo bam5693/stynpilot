@@ -321,6 +321,18 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((result.state, result.note), ("cancelled", "lease_lost"))
         self.assertLess(elapsed, 3.0)
 
+    def test_cancellation_probe_does_not_take_the_write_lock(self):
+        import sqlite3
+        self.task()
+        claimed = self.board.claim("claude-runner-client")
+        writer = sqlite3.connect(self.board.path, isolation_level=None, timeout=0.1)
+        writer.execute("BEGIN IMMEDIATE")        # someone else holds the write lock
+        try:
+            self.assertTrue(self.board.still_leased("claude-runner-client", claimed["task_id"], claimed["lease_id"]))
+        finally:
+            writer.execute("ROLLBACK")
+            writer.close()
+
     def test_cancellation_probe_does_not_spend_the_rate_limit(self):
         self.board.enroll_assistant("probe-runner", "probe-runner", "claude", ["stynpilot"], rate_per_minute=3)
         self.board.create("owner-client", "stynpilot", "Inspect", assignee="probe-runner", claims=("path:src",))

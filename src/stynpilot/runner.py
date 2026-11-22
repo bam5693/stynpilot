@@ -98,7 +98,9 @@ class ClaudeCodeRunner:
         # so it is sent far less often than output is polled.
         self.report_interval = float(report_interval)
         # Cancellation is probed separately and cheaply (board.still_leased is not
-        # rate-limited), so an owner's withdraw stops the CLI within about this many seconds.
+        # rate-limited), so an owner's withdraw is *noticed* within this interval. Stopping can take
+        # longer: stop_grace, a busy database and scheduling add to it. This is a probe interval,
+        # not a hard deadline.
         self.cancel_check_interval = float(cancel_check_interval)
         self.max_runtime, self.max_output_bytes = float(max_runtime), int(max_output_bytes)
         if not (0.01 <= self.poll_interval <= 30 and 0 <= self.stop_grace <= 30

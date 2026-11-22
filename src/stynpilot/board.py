@@ -482,12 +482,18 @@ class Board:
         """
         if not all(type(v) is str and v for v in (client_id, task_id, lease_id)):
             return False
-        with self._tx() as db:
-            me = db.execute("SELECT enabled FROM assistants WHERE client_id=?", (client_id,)).fetchone()
-            if me is None or not me["enabled"]:
-                return False
-            row = db.execute("SELECT assignee,state,lease_id,lease_deadline FROM tasks WHERE task_id=?",
-                             (task_id,)).fetchone()
+        # A plain read (shared lock, no BEGIN IMMEDIATE): the probe never takes the write lock.
+        with self._lock:
+            db = sqlite3.connect(self.path, timeout=10)
+            db.row_factory = sqlite3.Row
+            try:
+                me = db.execute("SELECT enabled FROM assistants WHERE client_id=?", (client_id,)).fetchone()
+                if me is None or not me["enabled"]:
+                    return False
+                row = db.execute("SELECT assignee,state,lease_id,lease_deadline FROM tasks WHERE task_id=?",
+                                 (task_id,)).fetchone()
+            finally:
+                db.close()
         return bool(row is not None and row["assignee"] == client_id and row["state"] == "running"
                     and row["lease_id"] == lease_id and (row["lease_deadline"] or 0) > self.clock())
 

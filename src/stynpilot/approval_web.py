@@ -24,6 +24,7 @@ import urllib.request
 
 from starlette.applications import Starlette
 from starlette.requests import Request
+from starlette.concurrency import run_in_threadpool
 from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
@@ -63,8 +64,11 @@ _MESSAGES = {
 
 
 def _message(error):
+    """Only codes raised before anything could change say "nothing was changed"; others say to check the status."""
     code = error.code
-    return _MESSAGES.get(code, "The request could not be shown (%s). Nothing was changed." % html.escape(code[:60]))
+    if code in _MESSAGES:
+        return _MESSAGES[code], True
+    return "The request could not be completed (%s). Check its status before trying again." % html.escape(code[:60]), False
 
 
 def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
@@ -76,22 +80,29 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
     def host_ok(request):
         return request.headers.get("host", "").lower() == public_host.lower()
 
-    def wrap(handler):
+    def wrap(handler, may_have_acted=False):
         async def inner(request: Request):
             if not host_ok(request):
                 return _page("Not found", "<p>Not found.</p>", 421)
             try:
                 return await handler(request)
             except ApprovalError as error:
-                return _page("Approval", "<h1>Nothing was changed</h1><p>%s</p>" % _message(error), 400,
-                             authorize_origin)
+                text, unchanged = _message(error)
+                return _page("Approval", "<h1>%s</h1><p>%s</p>" % ("Nothing was changed" if unchanged else "Check the status", text),
+                             400, authorize_origin)
+            except Exception:
+                if may_have_acted:       # e.g. the callback: we cannot know how far it got
+                    return _page("Check the status", "<h1>Check the status</h1><p>An unexpected error happened while "
+                                 "completing this. The outcome is uncertain. Open the request's status page before "
+                                 "trying again.</p>", 500)
+                return _page("Error", "<h1>Something went wrong</h1><p>Open the request again.</p>", 500)
         return inner
 
     async def show(request):
         rid = request.path_params["rid"]
         if not _RID.fullmatch(rid):
             return _page("Not found", "<p>Not found.</p>", 404)
-        view = flow.page(rid)
+        view = await run_in_threadpool(flow.page, rid)
         lines = "".join("<li>%s</li>" % html.escape(line) for line in view["summary"])
         body = ("<h1>Approve or deny</h1><p>This text was written by the installer on your computer, not by an "
                 "assistant. Request fingerprint: <code>%s</code></p><ul>%s</ul>"
@@ -117,7 +128,7 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         view = form.get("view", "")
         if request.cookies.get(COOKIE) != view or not view:
             return _page("Refused", "<h1>Nothing was changed</h1><p>%s</p>" % _MESSAGES["page_expired"], 403)
-        started = flow.choose(view, form.get("csrf"), form.get("decision"))
+        started = await run_in_threadpool(flow.choose, view, form.get("csrf"), form.get("decision"))
         return RedirectResponse(started["url"] + "?" + urllib.parse.urlencode(started["params"]), status_code=303)
 
     async def callback(request):
@@ -127,7 +138,11 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         state, code = request.query_params.get("state"), request.query_params.get("code")
         if not state or not code:
             raise ApprovalError("unknown_or_used_state")
-        outcome = flow.finish(state, code, view=request.cookies.get(COOKIE, ""))
+        outcome = await run_in_threadpool(flow.finish, state, code, request.cookies.get(COOKIE, ""))
+        if outcome["state"] == "running":              # long install: answer now, show progress on the status page
+            redirect = RedirectResponse("/approve/status/" + outcome["request_id"], status_code=303)
+            redirect.delete_cookie(COOKIE, path="/approve")
+            return redirect
         text = {"done": "Approved. The installer ran the plan and finished.",
                 "failed": "Approved, but the installer stopped or refused. See the request status for why.",
                 "denied": "Denied. Nothing was changed.",
@@ -138,8 +153,37 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         response.delete_cookie(COOKIE, path="/approve")
         return response
 
+    _STATUS_TEXT = {
+        "pending": "Waiting for the owner's decision.",
+        "approved": "Approved; starting.",
+        "running": "Running. This can take a while; this page refreshes by itself.",
+        "done": "Finished.",
+        "failed": "The installer stopped or refused. Nothing it stopped on was left half-done unless noted below.",
+        "denied": "Denied. Nothing was changed.",
+        "expired": "Expired before it was decided. Nothing was changed.",
+        "needs_owner_intervention": "Needs your attention: the installer could not confirm the machine is back in "
+                                    "its original state, or its outcome is uncertain. Check before installing anything else.",
+    }
+
+    async def status(request):
+        rid = request.path_params["rid"]
+        if not _RID.fullmatch(rid):
+            return _page("Not found", "<p>Not found.</p>", 404)
+        record = await run_in_threadpool(flow.status, rid)
+        state = record["state"]
+        extra = ""
+        result = record.get("result") or {}
+        if result.get("stopped"):
+            extra += "<p>Reason: <code>%s</code></p>" % html.escape(str(result["stopped"])[:80])
+        if result.get("limits"):
+            extra += "<p>%s</p>" % html.escape(str(result["limits"]))
+        refresh = "<meta http-equiv=refresh content=3>" if state in ("approved", "running") else ""
+        return _page("Status", "%s<h1>%s</h1><p>%s</p>%s" % (refresh, html.escape(state.replace("_", " ").title()),
+                                                          html.escape(_STATUS_TEXT.get(state, state)), extra))
+
     return Starlette(routes=[Route("/approve/choose", wrap(choose), methods=["POST"]),
-                             Route("/approve/callback", wrap(callback), methods=["GET"]),
+                             Route("/approve/callback", wrap(callback, may_have_acted=True), methods=["GET"]),
+                             Route("/approve/status/{rid}", wrap(status), methods=["GET"]),
                              Route("/approve/{rid}", wrap(show), methods=["GET"])])
 
 

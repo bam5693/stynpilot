@@ -153,6 +153,41 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(run.check_public_host("Computer-1.Tail0a1b2c.ts.net"), "computer-1.tail0a1b2c.ts.net")
 
 
+    # --- G5: the approval page is a separate, local-only listener the AI-facing app cannot reach ---------------
+    def approval_flow(self):
+        from stynpilot.approval import ApprovalFlow
+        from stynpilot.requests import RequestStore
+        store = RequestStore(self.tmp / "state" / "approval-requests.sqlite3")
+        return ApprovalFlow(store=store, broker=None, exchange=lambda c, v: "x",
+                            authorize={"endpoint": ISS + "authorize", "client_id": "approval-app",
+                                       "redirect_uri": "https://%s/approve/callback" % HOST})
+
+    def test_approval_listener_is_local_only_host_checked_and_separate_from_the_mcp_app(self):
+        flow = self.approval_flow()
+        for address, port in (("0.0.0.0", free_port()), ("192.0.2.1", free_port()), ("::1", free_port()),
+                              ("127.0.0.1", 80), ("127.0.0.1", True)):
+            with self.subTest(address=address, port=port), self.assertRaises(PermissionError):
+                run.start_approval(flow=flow, public_host=HOST, port=port, address=address)
+        for host in ("", "evil/x", "has space.example", "a.b:0", "a.b:99999", "a.b:08", "http://a.b", "localhost"):
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                run.start_approval(flow=flow, public_host=host, port=free_port())
+        self.assertEqual(run.check_approval_host("Ryzen.Example.Test:8444"), "ryzen.example.test:8444")
+        port = free_port()
+        running = run.start_approval(flow=flow, public_host=HOST, port=port)
+        self.addCleanup(running.stop)
+        self.assertEqual(running.local_url, "http://127.0.0.1:%d/approve" % port)
+        self.assertEqual(running.server.config.host, "127.0.0.1")
+        page = httpx.Client(base_url="http://127.0.0.1:%d" % port, timeout=10, trust_env=False)
+        self.addCleanup(page.close)
+        self.assertEqual(page.get("/approve/" + "a" * 64, headers={"Host": HOST}).status_code, 400)   # reached, unknown
+        self.assertEqual(page.get("/approve/" + "a" * 64, headers={"Host": "evil.example"}).status_code, 421)
+        self.assertEqual(page.get("/approve/" + "a" * 64).status_code, 421)                          # raw 127.0.0.1 host
+        # the AI-facing MCP app on its own port serves none of it
+        for method, path in (("GET", "/approve/" + "a" * 64), ("POST", "/approve/choose"), ("GET", "/approve/callback"),
+                             ("GET", "/approve/status/" + "a" * 64)):
+            reply = self.client.request(method, path)
+            self.assertIn(reply.status_code, (404, 405), (method, path))
+
     def test_request_tools_end_to_end_with_signed_tokens(self):
         from stynpilot.requests import RequestStore
         from stynpilot.server.clients import EnrolledClients, RevocationFile
@@ -172,6 +207,10 @@ class StartupTests(unittest.TestCase):
         client = httpx.Client(base_url="http://127.0.0.1:%d" % port, headers={"Host": HOST}, timeout=10,
                               trust_env=False)
         self.addCleanup(client.close)
+        listed = client.post("/mcp", headers={**MCP_HEADERS, "Authorization": self.token(scope="health.read workspace.propose")},
+                             json={"jsonrpc": "2.0", "id": 9, "method": "tools/list", "params": {}}).json()["result"]["tools"]
+        names = {t["name"] for t in listed}
+        self.assertFalse([n for n in names if "approve" in n or "decide" in n or "confirm" in n], names)   # no AI approval tool
         meta = client.get("/.well-known/oauth-protected-resource/mcp").json()
         self.assertEqual(meta["scopes_supported"], ["health.read", "workspace.propose"])
 

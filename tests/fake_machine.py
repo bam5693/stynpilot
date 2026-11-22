@@ -30,6 +30,8 @@ class FakeMachine:
         self.fail_state_while_installed = None           # name: the full dpkg listing fails while it is installed
         self.fail_remove = False
         self.fail_marks = False
+        self.pause = None                                # threading.Event: a real install waits here (long install)
+        self.paused = None                               # threading.Event set when it has started waiting
 
     def changes(self):
         return [c for c in self.commands if c[:2] in (["apt-get", "install"], ["apt-get", "remove"])
@@ -145,6 +147,9 @@ class FakeMachine:
                     origin = self.sim_origin.get(name, "Ubuntu:24.04/noble")
                     lines.append("Inst %s%s (%s %s [amd64])\n" % (name, " [%s]" % old if old else "", version, origin))
             return 0, "".join(lines) + "".join("Remv %s [1]\n" % r for r in self.removes_on_install)
+        if self.pause is not None:
+            self.paused.set()
+            self.pause.wait(20)
         if self.fail_install:
             name, version = plan[0]
             self.installed[name] = version                    # half-done install

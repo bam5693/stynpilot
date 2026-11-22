@@ -587,6 +587,7 @@ class BrokerSocketTests(unittest.TestCase):
     setUp = BrokerTests.setUp
     plan = BrokerTests.plan
     proof = BrokerTests.proof
+    other_expiry = staticmethod(BrokerTests.other_expiry)
 
     def start(self, allowed_uid):
         import threading
@@ -629,6 +630,54 @@ class BrokerSocketTests(unittest.TestCase):
         for kwargs in (dict(software="forgejo", owner=OWNER, device=DEVICE), dict(software="htop", owner="someone-else", device=DEVICE)):
             with self.assertRaises(LedgerError):
                 ledger.rollbackable(rid, **kwargs)
+
+    def test_status_stays_available_while_an_install_runs_but_only_one_change_at_a_time(self):
+        import threading
+        from stynpilot.broker.service import BrokerService, call
+        service = BrokerService(socket_path=self.executor.dir.parent / "b.sock", executor=self.executor,
+                                allowed_uid=os.getuid())
+        listener = service.bind()
+        self.addCleanup(listener.close)
+        threading.Thread(target=service.serve_forever, daemon=True).start()
+        sock = str(service.path)
+        payload = self.plan()
+        rid = request_id(payload)[0]
+        challenge = call(sock, {"op": "challenge", "payload": payload, "decision": "approve"})["challenge"]["challenge"]
+        self.machine.pause, self.machine.paused = threading.Event(), threading.Event()
+        replies = []
+        runner = threading.Thread(target=lambda: replies.append(call(sock, {
+            "op": "install", "payload": payload, "proof": self.proof(payload, challenge), "challenge": challenge})))
+        runner.start()
+        self.assertTrue(self.machine.paused.wait(10))                 # the install is now in progress
+        self.assertEqual(call(sock, {"op": "status", "request_id": rid})["status"]["state"], "running")
+        other = dict(payload, expires_at=self.other_expiry(payload))
+        for message in ({"op": "install", "payload": other, "proof": "x" * 30, "challenge": "0" * 64},
+                        {"op": "challenge", "payload": other, "decision": "approve"}):
+            self.assertEqual(call(sock, message), {"ok": False, "error": "busy"})   # never a second change
+        self.assertEqual(call(sock, {"op": "rollbackable", "rollback_id": "aa" * 16, "software": "htop",
+                                     "owner": OWNER, "device": DEVICE})["error"], "unknown_rollback_id")
+        self.machine.pause.set()
+        runner.join(20)
+        self.assertTrue(replies and replies[0]["ok"] and replies[0]["result"]["ok"], replies)
+        self.assertEqual(call(sock, {"op": "status", "request_id": rid})["status"]["state"], "done")
+        self.assertEqual(len([c for c in self.machine.changes() if c[1] == "install"]), 1)
+
+    def test_a_silent_client_cannot_hold_the_installer_hostage(self):
+        import socket as s, threading
+        from stynpilot.broker import service as module
+        from stynpilot.broker.service import BrokerService, call
+        module.READ_TIMEOUT = 0.3
+        self.addCleanup(setattr, module, "READ_TIMEOUT", 15)
+        service = BrokerService(socket_path=self.executor.dir.parent / "c.sock", executor=self.executor,
+                                allowed_uid=os.getuid())
+        listener = service.bind()
+        self.addCleanup(listener.close)
+        threading.Thread(target=service.serve_forever, daemon=True).start()
+        silent = s.socket(s.AF_UNIX, s.SOCK_STREAM)
+        silent.connect(str(service.path))                              # connects, sends nothing
+        self.addCleanup(silent.close)
+        self.assertEqual(call(str(service.path), {"op": "status", "request_id": "a" * 64}, timeout=5)["status"],
+                         {"state": "not_started"})
 
     def test_any_other_uid_is_refused_at_the_door(self):
         from stynpilot.broker.service import call

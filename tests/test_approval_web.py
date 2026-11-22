@@ -153,3 +153,124 @@ class WebTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(jwt is None, "PyJWT/starlette not installed")
+class LongInstallTests(unittest.TestCase):
+    """A long install runs on a worker; the page and other requests stay responsive; status is durable."""
+    setUpClass = classmethod(ta.ApprovalTests.setUpClass.__func__)
+    plan, proof, file, exchange, make_flow = (ta.ApprovalTests.plan, ta.ApprovalTests.proof, ta.ApprovalTests.file,
+                                              ta.ApprovalTests.exchange, ta.ApprovalTests.make_flow)
+    other_expiry = staticmethod(ta.ApprovalTests.other_expiry)
+    open, choose = WebTests.open, WebTests.choose
+
+    def finish_worker(self):
+        for event in (getattr(self.machine, "pause", None),):
+            if event is not None:
+                event.set()
+        if self.flow._pool is not None:
+            self.flow._pool.shutdown(wait=True)
+
+    def setUp(self):
+        ta.ApprovalTests.setUp(self)
+        self.flow = ApprovalFlow(store=self.store, broker=self.executor, exchange=self.exchange, background=True,
+                                 authorize={"endpoint": "https://issuer.example.test/authorize", "client_id": ta.APP,
+                                            "redirect_uri": "https://computer.example.test/approve/callback"})
+        self.app = build_app(flow=self.flow, public_host=HOST)
+        self.client = TestClient(self.app, base_url="https://" + HOST, follow_redirects=False)
+        self.addCleanup(self.finish_worker)
+
+    def wait_for(self, rid, wanted, seconds=10):
+        end = time.time() + seconds
+        while time.time() < end:
+            if self.store.status(rid, owner=OWNER, device=DEVICE)["state"] in wanted:
+                return
+            time.sleep(0.05)
+        self.fail("request never reached %s" % (wanted,))
+
+    def start_long_install(self):
+        payload, rid = self.file()
+        _, fields = self.open(rid)
+        step = self.choose(fields, "approve")
+        params = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(step.headers["location"]).query))
+        self.last_params = params
+        self.machine.pause, self.machine.paused = threading.Event(), threading.Event()
+        back = self.client.get("/approve/callback", params={"state": params["state"], "code": "c"})
+        return payload, rid, back
+
+    def test_callback_returns_at_once_and_the_page_stays_usable_during_a_long_install(self):
+        payload, rid, back = self.start_long_install()
+        self.assertEqual(back.status_code, 303)                                     # didn't wait for the install
+        self.assertEqual(back.headers["location"], "/approve/status/" + rid)
+        self.assertTrue(self.machine.paused.wait(10))                               # the install is really in progress
+        running = self.client.get("/approve/status/" + rid)
+        self.assertIn("Running", running.text)
+        self.assertIn("http-equiv=refresh", running.text)
+        _, other_rid = self.file(payload=dict(payload, expires_at=self.other_expiry(payload)))
+        self.assertEqual(self.client.get("/approve/" + other_rid).status_code, 200)  # the page still answers mid-install
+        self.assertEqual(self.store.status(rid, owner=OWNER, device=DEVICE)["state"], "running")
+        self.machine.pause.set()
+        self.wait_for(rid, ("done",))
+        self.assertIn("Finished", self.client.get("/approve/status/" + rid).text)
+        self.assertNotIn("http-equiv=refresh", self.client.get("/approve/status/" + rid).text)
+        self.assertEqual(len([c for c in self.machine.changes() if c[1] == "install"]), 1)
+
+    def test_only_one_install_runs_at_a_time_in_the_service(self):
+        payload, rid, _ = self.start_long_install()
+        self.assertTrue(self.machine.paused.wait(10))
+        self.assertEqual(self.flow._pool._max_workers, 1)
+        self.machine.pause.set()
+        self.wait_for(rid, ("done",))
+
+    def test_a_restart_during_a_long_install_is_reconciled_from_the_installer_record(self):
+        payload, rid, _ = self.start_long_install()
+        self.assertTrue(self.machine.paused.wait(10))
+        restarted = self.make_flow(__import__("stynpilot.requests", fromlist=["x"]).RequestStore(
+            self.tmp / "state" / "requests.sqlite3"))
+        restarted.recover()                                                         # installer says: still running
+        self.assertEqual(restarted.store.status(rid, owner=OWNER, device=DEVICE)["state"], "needs_owner_intervention")
+
+    # --- honest errors -------------------------------------------------------------------------------
+    def test_an_unexpected_error_after_approval_never_says_nothing_was_changed(self):
+        payload, rid = self.file()
+        _, fields = self.open(rid)
+        step = self.choose(fields, "approve")
+        params = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(step.headers["location"]).query))
+        self.last_params = params
+        self.flow._pool = None
+        real = self.store.transition
+
+        def broken(rid_, from_state, to_state, **kw):
+            if (from_state, to_state) == ("approved", "running"):
+                raise OSError("database is locked")                                 # after the decision was recorded
+            return real(rid_, from_state, to_state, **kw)
+        self.store.transition = broken
+        back = self.client.get("/approve/callback", params={"state": params["state"], "code": "c"})
+        self.store.transition = real
+        self.assertNotIn("Nothing was changed", back.text)
+        status = self.store.status(rid, owner=OWNER, device=DEVICE)
+        self.assertEqual(status["state"], "needs_owner_intervention")
+        self.assertEqual(status["result"]["stopped"], "unexpected_error_owner_must_verify")
+        self.assertIn("needs your attention", back.text)
+
+    def test_a_crash_inside_the_callback_handler_says_the_outcome_is_uncertain(self):
+        payload, rid = self.file()
+        _, fields = self.open(rid)
+        step = self.choose(fields, "approve")
+        params = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(step.headers["location"]).query))
+        self.flow.finish = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        client = TestClient(self.app, base_url="https://" + HOST, follow_redirects=False, raise_server_exceptions=False)
+        client.cookies.update(self.client.cookies)
+        back = client.get("/approve/callback", params={"state": params["state"], "code": "c"})
+        self.assertEqual(back.status_code, 500)
+        self.assertNotIn("Nothing was changed", back.text)
+        self.assertIn("uncertain", back.text)
+
+    def test_error_codes_raised_before_any_change_still_say_nothing_changed_and_others_do_not(self):
+        reply = self.client.get("/approve/callback", params={"state": "forged", "code": "c"})
+        self.assertIn("Nothing was changed", reply.text)
+        from stynpilot.approval import ApprovalError
+        self.flow.page = lambda rid: (_ for _ in ()).throw(ApprovalError("could_not_record_decision"))
+        reply = self.client.get("/approve/" + "a" * 64)
+        self.assertNotIn("Nothing was changed", reply.text)
+        self.assertIn("Check its status", reply.text)

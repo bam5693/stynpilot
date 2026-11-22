@@ -24,6 +24,7 @@ import hmac
 import secrets
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from .broker.proof import summary_hash
 from .requests import RequestError
@@ -47,7 +48,7 @@ class ApprovalFlow:
     ``exchange``: callable(code, code_verifier) -> Auth0 ID token string.
     ``authorize``: dict(endpoint, client_id, redirect_uri)."""
 
-    def __init__(self, *, store, broker, exchange, authorize, clock=time.time):
+    def __init__(self, *, store, broker, exchange, authorize, clock=time.time, background=False):
         if (type(authorize) is not dict or type(authorize.get("endpoint")) is not str
                 or not authorize["endpoint"].startswith("https://")
                 or type(authorize.get("redirect_uri")) is not str
@@ -56,6 +57,9 @@ class ApprovalFlow:
             raise ValueError("authorize needs an https endpoint, a client_id and an https (or loopback) redirect_uri")
         self.store, self.broker, self.exchange, self.authorize = store, broker, exchange, dict(authorize)
         self.clock, self._lock = clock, threading.Lock()
+        # background=True: the install runs on ONE worker thread, so the approval page and its other requests
+        # stay responsive during a long install. Progress is the request's durable state (running -> done...).
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stynpilot-approve") if background else None
         self._views, self._states = {}, {}
 
     def _sweep(self):
@@ -139,24 +143,61 @@ class ApprovalFlow:
             raise ApprovalError("sign_in_failed") from None
         # One decision per request: the compare-and-set is what stops a double decision.
         target = "approved" if decision == "approve" else "denied"
-        if not self.store.transition(rid, "pending", target):
+        try:
+            moved = self.store.transition(rid, "pending", target)
+        except Exception:
+            raise ApprovalError("could_not_record_decision") from None          # nothing was decided or run
+        if not moved:
             raise ApprovalError("request_not_pending")
         if decision == "deny":
             try:
                 result = self.broker.deny(payload, id_token, item["challenge"])
             except Exception as error:
                 # The owner said no. Even if recording the denial at the installer failed, nothing runs.
-                return {"state": "denied", "recorded_by_installer": False, "note": getattr(error, "code", "unavailable")}
-            return {"state": "denied", "recorded_by_installer": bool(result.get("ok"))}
-        self.store.transition(rid, "approved", "running")
+                return {"state": "denied", "request_id": rid, "recorded_by_installer": False,
+                        "note": getattr(error, "code", "unavailable")}
+            return {"state": "denied", "request_id": rid, "recorded_by_installer": bool(result.get("ok"))}
         method = self.broker.rollback if payload.get("kind") == "rollback" else self.broker.install
         try:
-            result = method(payload, id_token, item["challenge"])
-        except Exception as error:
-            result = self._after_error(rid, error)
-        state_ = self._state_for(result)
-        self.store.transition(rid, "running", state_, result=result)
-        return {"state": state_, "ok": bool(result.get("ok"))}
+            self.store.transition(rid, "approved", "running")
+            if self._pool is not None:
+                self._pool.submit(self._execute, rid, method, payload, id_token, item["challenge"])
+                return {"state": "running", "request_id": rid, "ok": None}
+        except Exception:
+            return self._uncertain(rid)
+        return self._execute(rid, method, payload, id_token, item["challenge"])
+
+    def _execute(self, rid, method, payload, id_token, challenge):
+        """Run the approved action and settle the request's durable state. Never raises."""
+        try:
+            try:
+                result = method(payload, id_token, challenge)
+            except Exception as error:
+                result = self._after_error(rid, error)
+            state_ = self._state_for(result)
+            self.store.transition(rid, "running", state_, result=result)
+            return {"state": state_, "request_id": rid, "ok": bool(result.get("ok"))}
+        except Exception:
+            return self._uncertain(rid)
+
+    def _uncertain(self, rid):
+        """Something unexpected broke AFTER the owner approved: we can't say what happened, so say exactly that."""
+        result = {"ok": False, "stopped": "unexpected_error_owner_must_verify", "changed_anything": None,
+                  "needs_owner_intervention": True}
+        for from_state in ("running", "approved"):
+            try:
+                if self.store.transition(rid, from_state, "needs_owner_intervention", result=result):
+                    break
+            except Exception:
+                continue
+        return {"state": "needs_owner_intervention", "request_id": rid, "ok": False}
+
+    def status(self, request_id):
+        """Safe, durable status of one request (what the approval page shows while an install runs)."""
+        payload = self.store.payload(request_id)
+        if payload is None:
+            raise ApprovalError("unknown_request")
+        return self.store.status(request_id, owner=payload.get("owner"), device=payload.get("device"))
 
     @staticmethod
     def _state_for(result):

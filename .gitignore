@@ -1,0 +1,42 @@
+# Local credentials and environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+*secret*.json
+*credential*.json
+*credentials*.json
+*auth0*private*.json
+
+# Machine-specific configuration and owner state
+.local/
+.private/
+secrets/
+credentials/
+state/
+backups/
+*.sqlite
+*.sqlite3
+*.db
+
+# Python build/test outputs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Editors and operating system
+.idea/
+.vscode/
+.DS_Store
+*.swp

@@ -161,8 +161,10 @@ class StartupTests(unittest.TestCase):
         with self.assertRaises(ValueError):           # memory-only revocations are refused in production
             run.start(router=None, public_host=HOST, port=free_port(),
                       propose=dict(clients=EnrolledClients(enrolled), store=store))
-        propose = dict(clients=EnrolledClients(enrolled, revocations=RevocationFile(self.tmp / "state" / "revoked.json")),
-                       store=store, resolve_apt={"htop": "3.3.0-4build1"}.get)
+        revocations = RevocationFile(self.tmp / "state" / "revoked.json")
+        revocations.provision()
+        propose = dict(clients=EnrolledClients(enrolled, revocations=revocations),
+                       store=store, resolve_apt=lambda names: [{"name": "htop", "version": "3.3.0-4build1"}, {"name": "libnl-3-200", "version": "3.7.0-0.3build1.1"}])
         port = free_port()
         running = run.start(router=run.router_for_paired_device(**self.router_args), public_host=HOST,
                             port=port, propose=propose)

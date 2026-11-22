@@ -46,8 +46,10 @@ class RevocationFile:
     """Durable list of revoked AI client IDs: a private JSON file, replaced atomically.
 
     Read on EVERY check, so a revocation takes effect immediately and survives restarts.
-    If the file exists but can't be read or trusted, every proposal is refused (fail closed).
-    A missing file means "nothing revoked yet".
+    If the file can't be read or trusted, every proposal is refused (fail closed). That includes a
+    MISSING file: it is created once, explicitly, by ``provision()`` (installer / owner setup), so
+    deleting it afterwards can never silently bring a revoked client back. Recovery is an owner
+    action (``provision()`` again, then re-revoke anyone who should stay out).
     """
 
     def __init__(self, path):
@@ -66,8 +68,6 @@ class RevocationFile:
             try:
                 self._check_folder()
                 fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
-            except FileNotFoundError:
-                return frozenset()
             except (OSError, ClientDenied):
                 raise ClientDenied("client_state_unreadable") from None
             try:
@@ -83,6 +83,22 @@ class RevocationFile:
                     or any(type(x) is not str or not _CLIENT.fullmatch(x) for x in data["revoked"])):
                 raise ClientDenied("client_state_unreadable")
             return frozenset(data["revoked"])
+
+    def provision(self):
+        """Create the empty list once. Returns True if created, False if it already exists (left untouched)."""
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._check_folder()
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            except FileExistsError:
+                return False
+            try:
+                os.write(fd, b'{"revoked": []}')
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            return True
 
     def _write(self, revoked):
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

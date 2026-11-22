@@ -134,21 +134,26 @@ class RequestStoreTests(unittest.TestCase):
 class CatalogTests(unittest.TestCase):
     def test_apt_entry_becomes_one_exact_validated_plan(self):
         plan, summary = catalog.install_plan("htop", owner=OWNER, device=DEVICE,
-                                             resolve_apt={"htop": "3.3.0-4build1"}.get, now=NOW)
+                                             resolve_apt=lambda names: [{"name": "htop", "version": "3.3.0-4build1"}, {"name": "libnl-3-200", "version": "3.7.0-0.3build1.1"}], now=NOW)
         content = plan.content()
-        self.assertEqual(content["steps"], [{"kind": "apt", "packages": [{"name": "htop", "version": "3.3.0-4build1"}]}])
+        self.assertEqual(content["steps"], [{"kind": "apt", "packages": [
+            {"name": "htop", "version": "3.3.0-4build1"}, {"name": "libnl-3-200", "version": "3.7.0-0.3build1.1"}]}])
+        self.assertIn("Package libnl-3-200, exact version 3.7.0-0.3build1.1 (needed by it).", summary)
         self.assertEqual((content["owner"], content["device"]), (OWNER, DEVICE))
         self.assertEqual(content["expires_at"], "2026-11-22T18:00:00Z")
         self.assertEqual(len(plan.plan_sha256), 64)
         self.assertIn("Package htop, exact version 3.3.0-4build1.", summary)
 
     def test_refusals(self):
-        cases = {"unknown_software": dict(software="nmap", resolve_apt=str),
-                 "already_installed_by_previous_build": dict(software="forgejo", resolve_apt=str),
-                 "version_resolution_unavailable": dict(software="htop", resolve_apt=None),
-                 "package_not_available": dict(software="htop", resolve_apt=lambda n: None)}
-        for code, kw in cases.items():
-            with self.subTest(code), self.assertRaises(catalog.CatalogError) as caught:
+        cases = [("unknown_software", dict(software="nmap", resolve_apt=list)),
+                 ("already_installed_by_previous_build", dict(software="forgejo", resolve_apt=list)),
+                 ("version_resolution_unavailable", dict(software="htop", resolve_apt=None)),
+                 ("package_not_available", dict(software="htop", resolve_apt=lambda names: None)),
+                 ("package_not_available", dict(software="htop",            # resolver skipped htop itself
+                                                resolve_apt=lambda names: [{"name": "other", "version": "1"}])),
+                 ("package_not_available", dict(software="htop", resolve_apt=lambda names: 1 / 0))]
+        for code, kw in cases:
+            with self.subTest(code=code, kw=str(kw)[:40]), self.assertRaises(catalog.CatalogError) as caught:
                 catalog.install_plan(owner=OWNER, device=DEVICE, now=NOW, **kw)
             self.assertEqual(caught.exception.code, code)
 

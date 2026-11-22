@@ -29,6 +29,7 @@ class FakeMachine:
         self.config_ok = True
         self.fail_state_while_installed = None           # name: the full dpkg listing fails while it is installed
         self.fail_remove = False
+        self.fail_marks = False
 
     def changes(self):
         return [c for c in self.commands if c[:2] in (["apt-get", "install"], ["apt-get", "remove"])
@@ -72,6 +73,8 @@ class FakeMachine:
             if self.fail_state_while_installed in self.installed:
                 return 2, ""
             return 0, "".join("%s\t%s\tii \n" % (n, v) for n, v in sorted(self.installed.items()))
+        if tool == "apt-mark" and self.fail_marks and argv[1] != "showmanual":
+            return 1, ""
         if tool == "apt-mark":
             if argv[1] == "showmanual":
                 return 0, "".join(n + "\n" for n in sorted(self.manual & set(self.installed)))

@@ -54,6 +54,11 @@ def decision_nonce(decision, request_id, plan_sha256, challenge):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def summary_hash(lines):
+    """Fingerprint of the root-rendered summary, so a relay that alters the text is detected."""
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
 def proof_fingerprint(id_token):
     return hashlib.sha256(id_token.encode("ascii", "replace")).hexdigest()
 

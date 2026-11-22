@@ -53,7 +53,7 @@ from ..ledger import InstallLedger, LedgerError
 from ..plan import PlanError, validate_plan
 from ..requests import request_id as payload_hash
 from . import apt
-from .proof import ProofDenied, decision_nonce, render_summary
+from .proof import ProofDenied, decision_nonce, render_summary, summary_hash
 
 CHALLENGE_LIFETIME = 600
 BACKUP_SCOPE = "packages_and_dpkg_tracked_settings_only"
@@ -169,6 +169,10 @@ class Executor:
             self.runs.finish(rid, "needs_owner_intervention", {"ok": False, "stopped": "interrupted_by_restart_or_crash",
                                                                "needs_owner_intervention": True})
 
+    def status(self, request_id):
+        """What the installer's own durable record says about this request (reconciliation source)."""
+        return self.runs.status(request_id)
+
     def needs_attention(self):
         """Durable records of runs that may have left the machine changed. New installs are refused while any exist."""
         return sorted(p.name for p in (self.dir / "attention").glob("*.json"))
@@ -194,9 +198,10 @@ class Executor:
         self._check_payload(payload)
         rid, _ = payload_hash(payload)
         challenge = self.runs.issue(rid, decision)
+        summary = render_summary(payload)
         return {"request_id": rid, "decision": decision, "challenge": challenge,
                 "nonce": decision_nonce(decision, rid, rid, challenge),
-                "summary": render_summary(payload), "expires_in": CHALLENGE_LIFETIME}
+                "summary": summary, "summary_sha256": summary_hash(summary), "expires_in": CHALLENGE_LIFETIME}
 
     def _check_payload(self, payload):
         if type(payload) is not dict:
@@ -348,13 +353,17 @@ class Executor:
                     extra_added = sorted(n for n, v in now.items() if before.get(n) is None and n not in manifest["before"])
             except Exception:
                 extra_added = ()
-            self._restore(manifest, extra_added=extra_added)
+            restored = self._restore(manifest, extra_added=extra_added)
             left = self._diff(before, apt.state(self.run))
+            if not restored and not left:
+                # Package versions match but a settings file or an auto/manual mark did not come back.
+                detail = "settings_or_marks_not_restored"
+                left = None
         except Exception as error:
             detail = "recovery_failed_%s" % type(error).__name__
         if left == {}:
             return {"ok": False, "stopped": reason, "changed_anything": False, "restored_from_backup": True}
-        detail = detail or "not_restored: %s" % ", ".join(sorted(left))
+        detail = detail or "not_restored: %s" % ", ".join(sorted(left or []))
         self._attention(rid, rollback_id, reason, detail)
         return {"ok": False, "stopped": reason, "changed_anything": True, "restored_from_backup": False,
                 "not_restored": sorted(left or []), "needs_owner_intervention": True, "limits": LIMITS}

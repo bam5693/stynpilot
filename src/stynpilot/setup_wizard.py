@@ -126,9 +126,32 @@ def setup_status(home, uid, root_config=ROOT_CONFIG):
                 out["proposal"] = "ok" if existing == installer_proposal(_read_private(paths["config"]), uid) else "mismatch"
             except Exception:
                 out["proposal"] = "mismatch"
-    out["system"] = "done" if Path(root_config).exists() else "pending"
-    out["complete"] = out["system"] == "done" or paths["done"].exists()
+    out["system"] = _system_state(root_config, paths, config, uid)
+    out["was_finished"] = out["system"] == "done" or paths["done"].exists()     # setup got to the end at some point
+    out["complete"] = (out["system"] == "done" and out["config"] == "ok" and out["proposal"] == "ok"
+                       and out["state"] == "complete")
     return out
+
+
+ROOT_UID = 0                                             # who must own the installed system settings (tests override)
+
+
+def _system_state(root_config, paths, config, uid):
+    """"done" only when the file at /etc/stynpilot/installer.json is OUR settings: a plain root-owned private file whose
+    contents are exactly what this owner's setup proposed. An unrelated, different or loose file is "mismatch"."""
+    path = Path(root_config)
+    if not (path.exists() or path.is_symlink()):
+        return "pending"
+    try:
+        info = os.lstat(path)
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != ROOT_UID
+                or info.st_mode & 0o077 or config is None):
+            return "mismatch"
+        installed = json.loads(path.read_text())
+        wanted = installer_proposal(_read_private(paths["config"]), uid)
+        return "done" if installed == wanted else "mismatch"
+    except Exception:
+        return "mismatch"
 
 
 def resume_setup(form, home, uid, root_config=ROOT_CONFIG):
@@ -157,7 +180,7 @@ def resume_setup(form, home, uid, root_config=ROOT_CONFIG):
         write_new_private(paths["proposed"], installer_proposal(data, uid))
     config = OwnerConfig.from_dict(data)
     if status["state"] != "complete":
-        if status["complete"]:
+        if status["was_finished"]:
             raise ConfigError("state_missing_after_setup_restore_a_backup")
         provision_owner_state(config, resume=True)
     return setup_status(home, uid, root_config)
@@ -272,9 +295,16 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
             return page("Setup finished", "<h1>Setup is finished</h1>%s<p>Nothing is running yet. Open <b>StyNpilot Doctor</b> "
                         "from the menu to check everything. Starting the services is a separate step that needs your "
                         "approval.</p>" % progress(status))
+        if status["system"] == "mismatch" and status["proposal"] == "ok":
+            return page("Needs a look", "<h1>A different system settings file is already there</h1>%s<p>The file "
+                        "/etc/stynpilot/installer.json does not match the settings you just made (or is not private to "
+                        "root). Setup will <b>not</b> replace it and nothing was changed. Ask your helper to look at it "
+                        "with Doctor.</p>" % progress(status))
         if status["config"] == "ok" and status["proposal"] == "ok" and status["state"] == "complete":
-            return page("Almost done", "<h1>One step left</h1>%s%s<p>Your computer will ask for your password. You can cancel "
-                        "and come back: nothing is lost.</p><form method=post action=/setup/system><button>Allow system "
+            return page("Almost done", "<h1>One step left</h1>%s%s<p>Your computer will ask for your password. That approves ONE thing: "
+                        "copying the settings you just made to <code>/etc/stynpilot/installer.json</code>, readable only by "
+                        "administrators and set up for your account alone. It installs nothing and starts nothing. You can "
+                        "cancel and come back: nothing is lost.</p><form method=post action=/setup/system><button>Allow system "
                         "part</button></form>" % (note, progress(status)))
         return page("Resume setup", "<h1>Setup was not finished</h1>%s%s<form method=post action=/setup/resume>"
                     "<button>Continue where I left off</button></form>" % (note, progress(status)))

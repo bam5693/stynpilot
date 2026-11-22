@@ -11,7 +11,15 @@
 A backup is one tar of regular files plus a manifest with an exact schema, a kind and a SHA-256 for every file.
 The hashes detect damage or partial files; they are NOT a signature, so someone who can rewrite the whole archive
 can forge it. Restore verifies the complete file set first and only writes into an EMPTY private folder.
-SQLite files are copied with SQLite's own online-backup call (consistent while the service runs).
+SQLite files are copied with SQLite's own online-backup call.
+
+Root backups and restores are ENFORCED to be safe, not just documented (see statelock.py): a backup takes the
+installer's operation lock, so it is refused while an install or rollback is running (and the installer refuses to
+start a change while the backup reads); it is also refused if a run is still marked "running" (an interrupted
+install that the installer has not yet recorded). A restore additionally needs the installer to be stopped. Every
+rollback snapshot the install ledger still points at must be in the archive, complete and hash-correct, or the
+backup/restore is refused. Archives are bounded in file count, per-file size and total size, and a repeated
+member name is refused.
 """
 from __future__ import annotations
 
@@ -27,12 +35,15 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import statelock
+
 SCHEMA = 1
 OWNER_FILES = ("requests.sqlite3", "revoked-clients.json", "token-revocations.sqlite3", "provisioned.json")
 ROOT_DBS = ("runs.sqlite3", "installs.sqlite3")
 ROOT_TREES = ("snapshots", "attention")
 MANIFEST = "manifest.json"
 _MAX_FILE = 1024 * 1024 * 1024
+_MAX_TOTAL = 4 * 1024 * 1024 * 1024
 _MAX_FILES = 20000
 
 
@@ -73,15 +84,36 @@ def _safe_rel(name):
     return name
 
 
+def _sized(path, total):
+    size = path.stat().st_size
+    if size > _MAX_FILE or total + size > _MAX_TOTAL:
+        raise BackupError("backup_would_be_too_large")
+    return size
+
+
+def _sqlite_rows(data, query):
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = Path(tmp) / "c.sqlite3"
+        copy.write_bytes(data)
+        db = sqlite3.connect("file:%s?mode=ro" % copy, uri=True)
+        try:
+            return db.execute(query).fetchall()
+        except sqlite3.Error:
+            raise BackupError("ledger_database_unreadable") from None
+        finally:
+            db.close()
+
+
 def _gather(state_dir, kind):
     state_dir = Path(state_dir)
     _check_dir(state_dir)
-    members = {}
+    members, total = {}, 0
     names = OWNER_FILES if kind == "owner" else ROOT_DBS
     for name in names:
         path = state_dir / name
         if not path.exists() or path.is_symlink():
             raise BackupError("state_file_missing_%s" % name)
+        total += _sized(path, total)
         members[name] = _snapshot(path)
     if kind == "root":
         for tree in ROOT_TREES:
@@ -92,9 +124,10 @@ def _gather(state_dir, kind):
                 if path.is_symlink() or not (path.is_file() or path.is_dir()):
                     raise BackupError("unexpected_entry_in_%s" % tree)
                 if path.is_file():
+                    if len(members) >= _MAX_FILES:
+                        raise BackupError("too_many_files")
+                    total += _sized(path, total)
                     members[path.relative_to(state_dir).as_posix()] = path.read_bytes()
-        if len(members) > _MAX_FILES:
-            raise BackupError("too_many_files")
     return members
 
 
@@ -102,7 +135,15 @@ def make_backup(state_dir, out_file, *, kind="owner", clock=time.time, chown_to=
     if kind not in ("owner", "root"):
         raise BackupError("unknown_kind")
     out_file = Path(out_file)
-    members = _gather(state_dir, kind)
+    if kind == "root":
+        try:
+            with statelock.operation(state_dir, "an_install_or_rollback_is_running_try_again_when_it_finishes"):
+                members = _gather(state_dir, "root")
+        except statelock.Busy as busy:
+            raise BackupError(busy.code) from None
+        _validate_complete("root", members)                    # refuse BEFORE writing anything
+    else:
+        members = _gather(state_dir, kind)
     manifest = {"schema": SCHEMA, "kind": kind, "created": int(clock()),
                 "files": {name: _sha(data) for name, data in members.items()}}
     out_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -128,6 +169,8 @@ def _validate_complete(kind, files):
         return
     if not set(ROOT_DBS) <= set(files):
         raise BackupError("root_backup_missing_its_databases")
+    if _sqlite_rows(files["runs.sqlite3"], "SELECT request_id FROM runs WHERE state='running'"):
+        raise BackupError("an_install_is_marked_running_start_the_installer_so_it_records_it_then_back_up")
     snapshots = {}
     for name in files:
         parts = name.split("/")
@@ -139,6 +182,9 @@ def _validate_complete(kind, files):
             snapshots.setdefault(parts[1], []).append("/".join(parts[2:]))
             continue
         raise BackupError("root_backup_has_an_unexpected_member")
+    for (sid,) in _sqlite_rows(files["installs.sqlite3"], "SELECT snapshot_id FROM installs WHERE rolled_back IS NULL"):
+        if sid not in snapshots:
+            raise BackupError("ledger_points_at_a_snapshot_that_is_not_in_the_backup")
     for sid, inside in snapshots.items():
         if "manifest.json" not in inside:
             raise BackupError("snapshot_without_its_manifest")
@@ -160,12 +206,20 @@ def read_backup(archive, *, expected_kind=None):
     """Verified (manifest, {name: bytes}); refuses anything incomplete, mixed, odd or altered."""
     try:
         with tarfile.open(archive, mode="r:") as tar:
-            files, count = {}, 0
-            for member in tar.getmembers():
+            files, count, total = {}, 0, 0
+            for member in tar:                                      # streamed: never loads the member list first
                 count += 1
-                if not member.isreg() or member.size > _MAX_FILE or count > _MAX_FILES + 1:
-                    raise BackupError("archive_member_not_allowed")
-                files[_safe_rel(member.name)] = tar.extractfile(member).read()
+                total += member.size
+                if (not member.isreg() or member.size > _MAX_FILE or total > _MAX_TOTAL
+                        or count > _MAX_FILES + 1):
+                    raise BackupError("archive_too_large_or_member_not_allowed")
+                name = _safe_rel(member.name)
+                if name in files:
+                    raise BackupError("archive_repeats_a_member_name")
+                data = tar.extractfile(member).read(member.size + 1)
+                if len(data) != member.size:
+                    raise BackupError("archive_unreadable")
+                files[name] = data
     except (tarfile.TarError, OSError):
         raise BackupError("archive_unreadable") from None
     try:
@@ -185,12 +239,26 @@ def read_backup(archive, *, expected_kind=None):
 
 
 def restore_backup(archive, state_dir, *, kind="owner"):
-    """Into an EMPTY private folder only. Everything is verified first; nothing existing is overwritten."""
+    """Into an EMPTY private folder only. Everything is verified first; nothing existing is overwritten.
+    A root restore also needs the installer stopped and idle (statelock), enforced here."""
     manifest, files = read_backup(archive, expected_kind=kind)
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     _check_dir(state_dir)
-    if any(state_dir.iterdir()):
+    if kind == "root":
+        try:
+            with statelock.exclusive_for_restore(state_dir):
+                _write_all(state_dir, files, ignore=statelock.LOCK_FILES)
+        except statelock.Busy as busy:
+            raise BackupError(busy.code) from None
+        (state_dir / "downloads").mkdir(mode=0o700, exist_ok=True)
+    else:
+        _write_all(state_dir, files, ignore=())
+    return manifest
+
+
+def _write_all(state_dir, files, ignore):
+    if any(p.name not in ignore for p in state_dir.iterdir()):
         raise BackupError("destination_not_empty_refusing_to_overwrite")
     for name, data in sorted(files.items()):
         target = state_dir / name
@@ -200,7 +268,3 @@ def restore_backup(archive, state_dir, *, kind="owner"):
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-    if kind == "root":
-        for sub in ("downloads",):
-            (state_dir / sub).mkdir(mode=0o700, exist_ok=True)
-    return manifest

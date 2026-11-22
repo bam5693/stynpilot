@@ -3,14 +3,39 @@
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
   <action id="org.stynpilot.root-setup">
-    <description>Install StyNpilot's system settings</description>
-    <message>Authentication is required to install StyNpilot's system settings</message>
+    <description>StyNpilot: add its system settings file</description>
+    <message>StyNpilot wants to copy ONE settings file to /etc/stynpilot/installer.json, for your account only. It installs nothing and starts nothing.</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
       <allow_active>auth_admin</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/stynpilot/root-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">root-setup</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+  <action id="org.stynpilot.root-backup">
+    <description>StyNpilot: save a copy of its software-install rollback records</description>
+    <message>StyNpilot wants to READ its software-install rollback records and save a private copy in your folder. Nothing is changed or installed. It is refused while an install is running.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/stynpilot/root-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">root-backup</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+  <action id="org.stynpilot.root-restore">
+    <description>StyNpilot: restore its software-install rollback records</description>
+    <message>StyNpilot wants to WRITE back its software-install rollback records from your backup file into its empty records folder. It never overwrites existing records and is refused while the installer is running.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/stynpilot/root-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">root-restore</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

@@ -115,6 +115,14 @@ deb = b"fake deb bytes"; (snap / "debs" / "htop_1.deb").write_bytes(deb)
 (snap / "manifest.json").write_text(json.dumps({"debs": {"htop": {"version": "1", "file": "htop_1.deb", "sha256": hashlib.sha256(deb).hexdigest()}}, "files": {}}))
 PY
 ROOTTAR="$H/root.tar"
+LOCKED="$H/locked.tar"
+if inject no_lock; then
+    assert_refused "backup must be refused while an install/rollback holds the lock" env PKEXEC_UID=$UIDN /usr/libexec/stynpilot/root-helper root-backup --out "$LOCKED"
+else
+    assert_refused "backup must be refused while an install/rollback holds the lock" flock -x /var/lib/stynpilot-installer/installer.lock env PKEXEC_UID=$UIDN /usr/libexec/stynpilot/root-helper root-backup --out "$LOCKED"
+fi
+assert_said "is_running" "the refusal says an install is running"
+assert_absent "$LOCKED" "no partial backup is left behind"
 assert_ok "root backup" helper root-backup --out "$ROOTTAR"
 [ "$(stat -c %U $ROOTTAR)" = "$U" ] || fail "root backup must be owned by the caller"
 [ "$(stat -c %a $ROOTTAR)" = 600 ] || fail "root backup must be 0600"

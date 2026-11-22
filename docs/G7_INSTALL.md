@@ -36,3 +36,16 @@ hashes detect damage; they are **not** a signature and do not prove who made the
 
 `tools/isolated_install_check.sh` exits nonzero on the first false assertion. `SP_INJECT=<name>` breaks one invariant
 on purpose (`enable_unit`, `etc_created`, `allow_overwrite`, `keep_state`, `remove_config`) to prove it can fail.
+
+## Root backup/restore is enforced to be consistent
+
+- A root **backup** takes the installer's operation lock (`installer.lock`). It is refused while an install or rollback
+  is running, and the installer refuses to start a change while a backup is reading. A run still marked "running"
+  (an interrupted install not yet recorded by the installer) also blocks it.
+- A root **restore** additionally needs the installer stopped (`installer.alive`) and only writes into an empty folder.
+- Every snapshot the install ledger still points at (not yet rolled back) must be in the archive, complete and
+  hash-correct, or backup/restore is refused. Archives are limited in file count, per-file size and total size, and
+  duplicate member names are refused.
+- Setup only counts as finished when `/etc/stynpilot/installer.json` is a root-owned private file with exactly the
+  settings this owner's setup proposed. The password prompt names the one operation being approved (one polkit action
+  per job: root-setup, root-backup, root-restore).

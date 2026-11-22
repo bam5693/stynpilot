@@ -141,16 +141,15 @@ class RootBackupTests(unittest.TestCase):
     """Software-install rollback records are a separate backup kind, never mixed with owner state."""
 
     def setUp(self):
-        import sqlite3
+        from stynpilot.broker.executor import Runs
+        from stynpilot.ledger import InstallLedger
         self.tmp = tmpdir(self)
         self.state = self.tmp / "inst"
         self.state.mkdir(mode=0o700)
-        for name in backup.ROOT_DBS:
-            db = sqlite3.connect(self.state / name)
-            db.execute("create table t(x)")
-            db.execute("insert into t values (1)")
-            db.commit()
-            db.close()
+        self.runs = Runs(self.state / "runs.sqlite3")
+        self.ledger = InstallLedger(self.state / "installs.sqlite3")
+        self.ledger.record(rollback_id="a1" * 8, software="htop", owner="o", device="d", request_id="r1",
+                           snapshot_id="abc", snapshot_verified=True)
         snap = self.state / "snapshots/abc/debs"
         snap.mkdir(parents=True)
         (self.state / "snapshots/abc/files").mkdir()
@@ -241,6 +240,149 @@ class RootBackupTests(unittest.TestCase):
             root_helper.root_restore(out, state=self.tmp / "empty", environ=env, geteuid=lambda: 0)
 
 
+    # --- consistency, locking, ledger/snapshot cross-check, bounds -----------------------------------
+    def test_backup_is_refused_while_an_install_or_rollback_holds_the_operation_lock_and_the_change_is_refused_while_backing_up(self):
+        from stynpilot import statelock
+        with statelock.operation(self.state):                                       # an install/rollback is in progress
+            with self.assertRaises(backup.BackupError) as refused:
+                backup.make_backup(self.state, self.tmp / "b.tar", kind="root")
+            self.assertIn("is_running", str(refused.exception))
+        self.assertFalse((self.tmp / "b.tar").exists())                              # nothing half-written
+        real = backup._gather
+        seen = {}
+
+        def while_reading(state, kind):                                              # a change tries to start mid-backup
+            with self.assertRaises(statelock.Busy):
+                with statelock.operation(state):
+                    pass
+            seen["refused"] = True
+            return real(state, kind)
+        backup._gather = while_reading
+        try:
+            backup.make_backup(self.state, self.tmp / "ok.tar", kind="root")
+        finally:
+            backup._gather = real
+        self.assertTrue(seen["refused"])
+
+    def test_the_real_executor_refuses_to_change_anything_while_a_backup_holds_the_lock(self):
+        from stynpilot import statelock
+        from stynpilot.broker.executor import ExecutionDenied, Executor
+        executor = Executor(state_dir=self.state, owner=tb.OWNER, device=tb.DEVICE, verifier=None, require_root=False)
+        with statelock.operation(self.state):
+            for call in (executor.install, executor.rollback):
+                with self.assertRaises(ExecutionDenied) as refused:
+                    call({}, "proof", "challenge")
+                self.assertEqual(refused.exception.code, "a_backup_or_restore_is_running_try_again")
+
+    def test_restore_is_refused_while_the_installer_is_running(self):
+        from stynpilot.broker.executor import Executor
+        out = self.tmp / "root.tar"
+        backup.make_backup(self.state, out, kind="root")
+        live = self.tmp / "live"
+        live.mkdir(mode=0o700)
+        executor = Executor(state_dir=live, owner=tb.OWNER, device=tb.DEVICE, verifier=None, require_root=False)
+        with self.assertRaises(backup.BackupError) as refused:
+            backup.restore_backup(out, live, kind="root")
+        self.assertIn("installer_is_running", str(refused.exception))
+        self.assertEqual(sorted(p.name for p in live.iterdir() if p.name.endswith(".sqlite3")),
+                         ["installs.sqlite3", "runs.sqlite3"])                       # only the installer's own, untouched
+        executor._alive and os.close(executor._alive)                                # installer stopped
+        executor._alive = None
+
+    def test_installer_refuses_to_start_during_a_restore(self):
+        from stynpilot import statelock
+        from stynpilot.broker.executor import ExecutionDenied, Executor
+        with statelock.exclusive_for_restore(self.state):
+            with self.assertRaises(ExecutionDenied):
+                Executor(state_dir=self.state, owner=tb.OWNER, device=tb.DEVICE, verifier=None, require_root=False)
+
+    def test_an_interrupted_install_blocks_the_backup_until_the_installer_has_recorded_it(self):
+        self.runs.issue("r2", "approve")
+        self.runs.consume(challenge=self.runs_challenge("r2"), request_id="r2", decision="approve", proof="p", kind="install")
+        self.assertEqual(self.runs.running(), ["r2"])
+        with self.assertRaises(backup.BackupError) as refused:
+            backup.make_backup(self.state, self.tmp / "x.tar", kind="root")
+        self.assertIn("marked_running", str(refused.exception))
+        self.runs.finish("r2", "needs_owner_intervention", {"ok": False})            # what the installer does when it restarts
+        (self.state / "attention/r2.json").write_text("{}")
+        out = self.tmp / "after.tar"
+        manifest = backup.make_backup(self.state, out, kind="root")
+        self.assertIn("attention/r2.json", manifest["files"])                         # the owner-must-check record is kept
+
+    def runs_challenge(self, rid):
+        import sqlite3
+        db = sqlite3.connect(self.state / "runs.sqlite3")
+        try:
+            return db.execute("SELECT challenge FROM challenges WHERE request_id=?", (rid,)).fetchone()[0]
+        finally:
+            db.close()
+
+    def test_every_snapshot_the_ledger_points_at_must_be_in_the_backup(self):
+        shutil.rmtree(self.state / "snapshots/abc")                                   # snapshot lost, ledger still points at it
+        with self.assertRaises(backup.BackupError) as refused:
+            backup.make_backup(self.state, self.tmp / "m.tar", kind="root")
+        self.assertIn("ledger_points_at_a_snapshot", str(refused.exception))
+        self.assertFalse((self.tmp / "m.tar").exists())
+
+    def test_incomplete_snapshots_are_refused_for_backup(self):
+        (self.state / "snapshots/abc/debs/htop_1.deb").unlink()                       # package file missing
+        with self.assertRaises(backup.BackupError) as refused:
+            backup.make_backup(self.state, self.tmp / "i1.tar", kind="root")
+        self.assertIn("snapshot_package", str(refused.exception))
+        (self.state / "snapshots/abc/debs/htop_1.deb").write_bytes(b"changed")        # present but different from its hash
+        with self.assertRaises(backup.BackupError):
+            backup.make_backup(self.state, self.tmp / "i2.tar", kind="root")
+        (self.state / "snapshots/abc/debs/htop_1.deb").write_bytes(self.deb)
+        (self.state / "snapshots/abc/manifest.json").unlink()                          # half-made snapshot (crash)
+        with self.assertRaises(backup.BackupError) as refused:
+            backup.make_backup(self.state, self.tmp / "i3.tar", kind="root")
+        self.assertIn("without_its_manifest", str(refused.exception))
+
+    def test_a_ledger_entry_already_rolled_back_does_not_demand_its_snapshot(self):
+        self.ledger.mark_rolled_back("a1" * 8)
+        shutil.rmtree(self.state / "snapshots/abc")
+        backup.make_backup(self.state, self.tmp / "rb.tar", kind="root")
+
+    def archive_with(self, entries, kind="owner"):
+        import io
+        path = self.tmp / ("dup%d.tar" % len(list(self.tmp.iterdir())))
+        with tarfile.open(path, "w") as tar:
+            for name, data in entries:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        return path
+
+    def test_duplicate_archive_members_are_refused(self):
+        good = json.dumps({"schema": 1, "kind": "owner", "created": 1, "files": {}}).encode()
+        path = self.archive_with([("requests.sqlite3", b"first"), ("requests.sqlite3", b"second"),
+                                  ("manifest.json", good)])
+        with self.assertRaises(backup.BackupError) as refused:
+            backup.read_backup(path)
+        self.assertIn("repeats", str(refused.exception))
+        twin = self.archive_with([("manifest.json", good), ("manifest.json", good)])
+        with self.assertRaises(backup.BackupError):
+            backup.read_backup(twin)
+
+    def test_size_limits_apply_when_making_and_when_reading(self):
+        old = backup._MAX_TOTAL, backup._MAX_FILE, backup._MAX_FILES
+        try:
+            backup._MAX_TOTAL = 10
+            with self.assertRaises(backup.BackupError) as refused:
+                backup.make_backup(self.state, self.tmp / "big.tar", kind="root")
+            self.assertIn("too_large", str(refused.exception))
+            backup._MAX_TOTAL = old[0]
+            good = self.tmp / "g.tar"
+            backup.make_backup(self.state, good, kind="root")
+            for limit, value in (("_MAX_TOTAL", 100), ("_MAX_FILE", 50), ("_MAX_FILES", 2)):
+                setattr(backup, limit, value)
+                with self.assertRaises(backup.BackupError):
+                    backup.read_backup(good)
+                backup._MAX_TOTAL, backup._MAX_FILE, backup._MAX_FILES = old
+        finally:
+            backup._MAX_TOTAL, backup._MAX_FILE, backup._MAX_FILES = old
+
+
 @unittest.skipIf(jwt is None, "PyJWT/cryptography not installed")
 class DoctorTests(unittest.TestCase):
     def setUp(self):
@@ -324,6 +466,15 @@ class SetupTests(unittest.TestCase):
         self.uid = 1000
         self.root_config = self.home / "etc-installer.json"            # stands in for /etc/stynpilot/installer.json
         self.paths = setup_wizard.default_paths(self.home)
+        real_uid = setup_wizard.ROOT_UID
+        setup_wizard.ROOT_UID = os.geteuid()                              # stands in for "owned by root" in this test
+        self.addCleanup(setattr, setup_wizard, "ROOT_UID", real_uid)
+
+    def install_root_config(self, content=None):
+        """What the root step leaves behind: a private file holding exactly the proposed settings."""
+        data = content if content is not None else json.loads(self.paths["proposed"].read_text())
+        self.root_config.write_text(json.dumps(data))
+        os.chmod(self.root_config, 0o600)
 
     def resume(self, form="form", **kw):
         return setup_wizard.resume_setup(self.form if form == "form" else form, self.home, self.uid, self.root_config)
@@ -387,7 +538,7 @@ class SetupTests(unittest.TestCase):
         self.resume()
         for p in list(self.paths["state"].iterdir()):
             p.unlink()
-        self.root_config.write_text("{}")                                           # the root step had been done
+        self.install_root_config()                                                  # the root step had been done
         with self.assertRaises(ConfigError) as refused:
             self.resume(None)
         self.assertIn("restore_a_backup", str(refused.exception))
@@ -414,6 +565,60 @@ class SetupTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             self.resume(None)
         self.assertEqual(setup_wizard.setup_status(self.home, self.uid, self.root_config)["config"], "invalid")
+
+    def test_an_unrelated_or_loose_root_config_file_does_not_count_as_setup_done(self):
+        self.resume()
+        for label, content in (("empty", {}), ("other owner", dict(json.loads(self.paths["proposed"].read_text()), owner="x"))):
+            self.install_root_config(content)
+            status = setup_wizard.setup_status(self.home, self.uid, self.root_config)
+            self.assertEqual((status["system"], status["complete"]), ("mismatch", False), label)
+        self.install_root_config()
+        self.assertTrue(setup_wizard.setup_status(self.home, self.uid, self.root_config)["complete"])
+        os.chmod(self.root_config, 0o644)                                           # loose permissions
+        self.assertEqual(setup_wizard.setup_status(self.home, self.uid, self.root_config)["system"], "mismatch")
+        os.chmod(self.root_config, 0o600)
+        setup_wizard.ROOT_UID = os.geteuid() + 1                                    # not owned by root
+        self.assertEqual(setup_wizard.setup_status(self.home, self.uid, self.root_config)["system"], "mismatch")
+        # a stray done-marker alone never makes setup complete either
+        self.root_config.unlink()
+        self.paths["done"].write_text("{}")
+        status = setup_wizard.setup_status(self.home, self.uid, self.root_config)
+        self.assertEqual((status["system"], status["complete"]), ("pending", False))
+
+    def test_the_page_for_an_unrelated_root_file_offers_no_button_and_says_nothing_was_changed(self):
+        self.resume()
+        self.install_root_config({})
+        c = self.client(lambda src: SimpleNamespace(returncode=0))
+        c.get("/setup/tok123", headers=self.H)
+        page = c.get("/setup", headers=self.H)
+        self.assertIn("different system settings file", page.text)
+        self.assertNotIn("Setup is finished", page.text)
+        self.assertNotIn("/setup/system", page.text)
+
+    def test_the_password_prompt_texts_name_exactly_what_is_being_approved(self):
+        import xml.dom.minidom as minidom
+        doc = minidom.parse(str(ROOT / "packaging/org.stynpilot.policy"))
+        actions = {a.getAttribute("id"): a for a in doc.getElementsByTagName("action")}
+        self.assertEqual(set(actions), {"org.stynpilot.root-setup", "org.stynpilot.root-backup", "org.stynpilot.root-restore"})
+        for job, words in (("root-setup", ("/etc/stynpilot/installer.json", "installs nothing")),
+                           ("root-backup", ("READ", "Nothing is changed")),
+                           ("root-restore", ("WRITE", "never overwrites"))):
+            action = actions["org.stynpilot." + job]
+            message = action.getElementsByTagName("message")[0].firstChild.data
+            annotations = {n.getAttribute("key"): n.firstChild.data for n in action.getElementsByTagName("annotate")}
+            self.assertEqual(annotations["org.freedesktop.policykit.exec.argv1"], job)          # one action per job
+            self.assertEqual(annotations["org.freedesktop.policykit.exec.path"], "/usr/libexec/stynpilot/root-helper")
+            for w in words:
+                self.assertIn(w, message)
+        page = setup_wizard.build_app(home=self.home, uid=self.uid, token="t", port=1, root_runner=lambda s: None,
+                                      root_config=self.root_config)
+        self.resume()
+        from starlette.testclient import TestClient
+        c = TestClient(page, base_url="http://127.0.0.1:1", follow_redirects=False)
+        c.get("/setup/t", headers={"host": "127.0.0.1:1"})
+        text = c.get("/setup", headers={"host": "127.0.0.1:1"}).text
+        self.assertIn("approves ONE thing", text)
+        self.assertIn("/etc/stynpilot/installer.json", text)
 
     def test_bad_form_or_no_pairing_writes_nothing(self):
         for bad in (dict(self.form, issuer=""), dict(self.form, approval_public_host="10.0.0.1:8444"),
@@ -508,7 +713,7 @@ class SetupTests(unittest.TestCase):
         def runner(src):
             calls.append(src)
             if outcome["ok"]:
-                self.root_config.write_text("{}")
+                self.install_root_config()
             return SimpleNamespace(returncode=0 if outcome["ok"] else 126)
         c = self.client(runner)
         c.get("/setup/tok123", headers=self.H)
@@ -564,7 +769,7 @@ class ScriptAndPolicyTests(unittest.TestCase):
         for bad in ("|| true", "&& echo", "|| echo", "tail -1 ||"):
             self.assertNotIn(bad, text, bad)
         self.assertIn("RESULT: PASS", text)
-        for name in ("enable_unit", "etc_created", "allow_overwrite", "keep_state", "remove_config"):
+        for name in ("enable_unit", "etc_created", "allow_overwrite", "keep_state", "remove_config", "no_lock"):
             self.assertIn("inject %s" % name, text)                                   # each invariant has a self-test hook
         r = subprocess.run(["sh", "-n", str(ROOT / "tools/isolated_install_check.sh")], capture_output=True)
         self.assertEqual(r.returncode, 0)

@@ -51,7 +51,8 @@ class StartupTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         owner = account_id(verified_issuer=ISS, verified_subject=SUBJECT)
-        path = make_pairing_db(Path(tmp.name) / "state", [(DEVICE, owner, time.time() + 3600, None, [])])
+        self.tmp = Path(tmp.name)
+        path = make_pairing_db(self.tmp / "state", [(DEVICE, owner, time.time() + 3600, None, ["workspace.propose"])])
         self.grants = PairingDeviceGrants(path)
         self.addCleanup(self.grants.close)
         docs = {ISS + ".well-known/openid-configuration": {
@@ -63,8 +64,9 @@ class StartupTests(unittest.TestCase):
                 ISS + ".well-known/jwks.json": self.jwks}
         from stynpilot.identity import MemoryRevocations
         tokens = OIDCConfig(issuer=ISS, audience=AUDIENCE, revocations=MemoryRevocations(),
-                            allowed_scopes=frozenset({"health.read"}), allow_volatile_revocations=True,
-                            fetch=docs.__getitem__).build_verifier()
+                            allowed_scopes=frozenset({"health.read", "workspace.propose"}),
+                            allow_volatile_revocations=True, fetch=docs.__getitem__).build_verifier()
+        self.router_args = dict(tokens=tokens, grants=self.grants, read_health=lambda: {"cpu_usage_percent": 2.0})
         router = run.router_for_paired_device(tokens=tokens, grants=self.grants,
                                               read_health=lambda: {"cpu_usage_percent": 2.0},
                                               read_service_status=lambda s: {"state": "setup_required"})
@@ -149,6 +151,44 @@ class StartupTests(unittest.TestCase):
             with self.subTest(host=host), self.assertRaises((ValueError, PermissionError)):
                 run.start(router=None, public_host=host, port=free_port())
         self.assertEqual(run.check_public_host("Computer-1.Tail0a1b2c.ts.net"), "computer-1.tail0a1b2c.ts.net")
+
+
+    def test_request_tools_end_to_end_with_signed_tokens(self):
+        from stynpilot.requests import RequestStore
+        from stynpilot.server.clients import EnrolledClients, RevocationFile
+        store = RequestStore(self.tmp / "state" / "requests.sqlite3")
+        enrolled = [{"client_id": "claude-connector", "name": "claude", "kind": "claude"}]
+        with self.assertRaises(ValueError):           # memory-only revocations are refused in production
+            run.start(router=None, public_host=HOST, port=free_port(),
+                      propose=dict(clients=EnrolledClients(enrolled), store=store))
+        propose = dict(clients=EnrolledClients(enrolled, revocations=RevocationFile(self.tmp / "state" / "revoked.json")),
+                       store=store, resolve_apt={"htop": "3.3.0-4build1"}.get)
+        port = free_port()
+        running = run.start(router=run.router_for_paired_device(**self.router_args), public_host=HOST,
+                            port=port, propose=propose)
+        self.addCleanup(running.stop)
+        client = httpx.Client(base_url="http://127.0.0.1:%d" % port, headers={"Host": HOST}, timeout=10,
+                              trust_env=False)
+        self.addCleanup(client.close)
+        meta = client.get("/.well-known/oauth-protected-resource/mcp").json()
+        self.assertEqual(meta["scopes_supported"], ["health.read", "workspace.propose"])
+
+        def call(token, name, arguments):
+            reply = client.post("/mcp", headers={**MCP_HEADERS, "Authorization": token}, json={
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}})
+            return self.output(reply)
+        both = "health.read workspace.propose"
+        filed = call(self.token(scope=both), "commander_request_software_install", {"device_id": DEVICE, "software": "htop"})
+        self.assertTrue(filed["ok"], filed)
+        self.assertEqual(filed["result"]["requested_by"], "claude")
+        status = call(self.token(scope=both), "commander_software_install_status",
+                      {"device_id": DEVICE, "request_id": filed["result"]["request_id"]})
+        self.assertEqual(status["result"]["state"], "pending")
+        self.assertEqual(call(self.token(scope=both, azp="not-enrolled"), "commander_request_software_install",
+                              {"device_id": DEVICE, "software": "htop"}),
+                         {"ok": False, "error": "client_not_enrolled_or_revoked"})
+        self.assertEqual(call(self.token(scope="health.read"), "commander_request_software_install",
+                              {"device_id": DEVICE, "software": "htop"}), {"ok": False, "error": "not_authorized"})
 
 
 if __name__ == "__main__":

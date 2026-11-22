@@ -59,7 +59,9 @@ def _bearer():
     return "Bearer " + raw
 
 
-def create_server(*, router, resource_url, allowed_hosts=None):
+def create_server(*, router, resource_url, allowed_hosts=None, propose=None):
+    """``propose``: optional dict(clients=EnrolledClients, store=RequestStore, resolve_apt=..., approval_url=...)
+    that adds the YELLOW request tools. Without it the server is read-only."""
     if not isinstance(router, ReadRouter):
         raise ValueError("A ReadRouter is required")
     if not isinstance(resource_url, str) or not resource_url.startswith("https://"):
@@ -82,8 +84,9 @@ def create_server(*, router, resource_url, allowed_hosts=None):
             enable_dns_rebinding_protection=True, allowed_hosts=list(allowed_hosts), allowed_origins=[])
     server = FastMCP(
         name="StyNpilot",
-        instructions=("Read the paired computer's health and the status of StyNpilot-installed software. "
-                      "This server cannot approve or change anything."),
+        instructions=("Read the paired computer's health and the status of StyNpilot-installed software"
+                      + (", and ask the owner to approve catalog software installs or rollbacks" if propose else "")
+                      + ". This server cannot approve anything; the owner approves separately on his phone."),
         auth=AuthSettings(issuer_url=router.tokens.issuer, resource_server_url=exact,
                           required_scopes=[READ_SCOPE], validate_token_resource=False),
         token_verifier=_SDKTokenVerifier(router),
@@ -124,5 +127,9 @@ def create_server(*, router, resource_url, allowed_hosts=None):
                 _LOG.warning("service_status_internal_failure type=%s", type(error).__name__)
                 return {"ok": False, "error": "service_status_temporarily_unavailable"}
             return {"ok": True, "device_id": device_id, "scope": READ_SCOPE, "status": report}
+
+    if propose is not None:
+        from .propose_tools import register
+        register(server, router=router, bearer=_bearer, **propose)
 
     return server

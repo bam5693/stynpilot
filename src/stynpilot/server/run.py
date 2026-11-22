@@ -57,7 +57,10 @@ def www_authenticate(resource):
     return 'Bearer resource_metadata="%s"' % metadata_url(resource)
 
 
-def build_app(*, router, public_host, port, scopes=READ_SCOPES):
+PROPOSE_SCOPES = frozenset({"health.read", "workspace.propose"})
+
+
+def build_app(*, router, public_host, port, scopes=None, propose=None):
     """The ASGI app: MCP at /mcp plus its metadata document, both host-checked."""
     from starlette.responses import JSONResponse
     from starlette.routing import Route
@@ -67,7 +70,8 @@ def build_app(*, router, public_host, port, scopes=READ_SCOPES):
     public_host = check_public_host(public_host)
     resource = "https://%s/mcp" % public_host
     hosts = [public_host, "%s:%d" % (LISTEN_ADDRESS, port)]
-    server = create_server(router=router, resource_url=resource, allowed_hosts=hosts)
+    scopes = scopes or (PROPOSE_SCOPES if propose else READ_SCOPES)
+    server = create_server(router=router, resource_url=resource, allowed_hosts=hosts, propose=propose)
     app = server.streamable_http_app()
     document = protected_resource_metadata(resource, router.tokens.issuer, scopes)
     allowed = {h.lower() for h in hosts}
@@ -92,15 +96,17 @@ class Running:
         self.thread.join(timeout=timeout)
 
 
-def start(*, router, public_host, port, address=LISTEN_ADDRESS, startup_timeout=15):
+def start(*, router, public_host, port, address=LISTEN_ADDRESS, startup_timeout=15, propose=None):
     """Start in a background thread. Only 127.0.0.1, an unprivileged port and a strict host name."""
+    if propose is not None and getattr(propose.get("clients"), "revocations", None) is None:
+        raise ValueError("Request tools need a durable revocation file (EnrolledClients(revocations=...))")
     if address != LISTEN_ADDRESS:
         raise PermissionError("The endpoint listens on 127.0.0.1 only")
     if type(port) is not int or isinstance(port, bool) or not 1024 < port <= 65535:
         raise PermissionError("Unprivileged port required")
     check_public_host(public_host)
     import uvicorn
-    app = build_app(router=router, public_host=public_host, port=port)
+    app = build_app(router=router, public_host=public_host, port=port, propose=propose)
     web = uvicorn.Server(uvicorn.Config(app, host=address, port=port, log_level="warning",
                                         proxy_headers=False, server_header=False))
     thread = threading.Thread(target=web.run, name="stynpilot-mcp", daemon=True)

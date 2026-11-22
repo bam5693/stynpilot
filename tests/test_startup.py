@@ -155,9 +155,13 @@ class StartupTests(unittest.TestCase):
 
     def test_request_tools_end_to_end_with_signed_tokens(self):
         from stynpilot.requests import RequestStore
-        from stynpilot.server.clients import EnrolledClients
+        from stynpilot.server.clients import EnrolledClients, RevocationFile
         store = RequestStore(self.tmp / "state" / "requests.sqlite3")
-        propose = dict(clients=EnrolledClients([{"client_id": "claude-connector", "name": "claude", "kind": "claude"}]),
+        enrolled = [{"client_id": "claude-connector", "name": "claude", "kind": "claude"}]
+        with self.assertRaises(ValueError):           # memory-only revocations are refused in production
+            run.start(router=None, public_host=HOST, port=free_port(),
+                      propose=dict(clients=EnrolledClients(enrolled), store=store))
+        propose = dict(clients=EnrolledClients(enrolled, revocations=RevocationFile(self.tmp / "state" / "revoked.json")),
                        store=store, resolve_apt={"htop": "3.3.0-4build1"}.get)
         port = free_port()
         running = run.start(router=run.router_for_paired_device(**self.router_args), public_host=HOST,

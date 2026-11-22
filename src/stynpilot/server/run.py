@@ -98,6 +98,8 @@ class Running:
 
 def start(*, router, public_host, port, address=LISTEN_ADDRESS, startup_timeout=15, propose=None):
     """Start in a background thread. Only 127.0.0.1, an unprivileged port and a strict host name."""
+    if propose is not None and getattr(propose.get("clients"), "revocations", None) is None:
+        raise ValueError("Request tools need a durable revocation file (EnrolledClients(revocations=...))")
     if address != LISTEN_ADDRESS:
         raise PermissionError("The endpoint listens on 127.0.0.1 only")
     if type(port) is not int or isinstance(port, bool) or not 1024 < port <= 65535:

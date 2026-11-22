@@ -13,9 +13,12 @@ A propose call must come from:
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 PROPOSE_SCOPE = "workspace.propose"
 REVIEW_SCOPE = "workspace.review"
@@ -39,10 +42,76 @@ class Proposer:
     account: str
 
 
-class EnrolledClients:
-    """The owner's list of AI clients, e.g. [{"client_id": ..., "name": "claude", "kind": "claude"}]."""
+class RevocationFile:
+    """Durable list of revoked AI client IDs: a private JSON file, replaced atomically.
 
-    def __init__(self, clients):
+    Read on EVERY check, so a revocation takes effect immediately and survives restarts.
+    If the file exists but can't be read or trusted, every proposal is refused (fail closed).
+    A missing file means "nothing revoked yet".
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        if not self.path.is_absolute():
+            raise ValueError("Absolute revocation file path required")
+        self._lock = threading.Lock()
+
+    def _check_folder(self):
+        info = os.lstat(self.path.parent)
+        if self.path.parent.is_symlink() or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ClientDenied("client_state_unreadable")
+
+    def revoked(self):
+        with self._lock:
+            try:
+                self._check_folder()
+                fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                return frozenset()
+            except (OSError, ClientDenied):
+                raise ClientDenied("client_state_unreadable") from None
+            try:
+                info = os.fstat(fd)
+                if info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_size > 65536:
+                    raise ClientDenied("client_state_unreadable")
+                data = json.loads(os.read(fd, 65537).decode("utf-8"))
+            except (OSError, ValueError, UnicodeError):
+                raise ClientDenied("client_state_unreadable") from None
+            finally:
+                os.close(fd)
+            if (type(data) is not dict or set(data) != {"revoked"} or type(data["revoked"]) is not list
+                    or any(type(x) is not str or not _CLIENT.fullmatch(x) for x in data["revoked"])):
+                raise ClientDenied("client_state_unreadable")
+            return frozenset(data["revoked"])
+
+    def _write(self, revoked):
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._check_folder()
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, json.dumps({"revoked": sorted(revoked)}).encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, self.path)
+
+    def set_revoked(self, client_id, revoked):
+        """Owner-side only (owner tool / phone, G5). Never exposed to an AI."""
+        current = set(self.revoked())
+        (current.add if revoked else current.discard)(client_id)
+        with self._lock:
+            self._write(current)
+
+
+class EnrolledClients:
+    """The owner's list of AI clients, e.g. [{"client_id": ..., "name": "claude", "kind": "claude"}].
+
+    ``revocations``: a RevocationFile. Production must pass one; without it, revocations
+    live only in memory (tests).
+    """
+
+    def __init__(self, clients, *, revocations=None):
         if type(clients) is not list or not 1 <= len(clients) <= 8:
             raise ValueError("One to eight enrolled AI clients required")
         self._clients, names = {}, set()
@@ -56,15 +125,27 @@ class EnrolledClients:
                 raise ValueError("Invalid or duplicate AI client")
             self._clients[item["client_id"]] = dict(item)
             names.add(item["name"])
-        self._revoked, self._lock = set(), threading.Lock()
+        self._memory, self._lock, self.revocations = set(), threading.Lock(), revocations
+
+    def _revoked(self):
+        if self.revocations is not None:
+            return self.revocations.revoked()
+        with self._lock:
+            return frozenset(self._memory)
 
     def revoke(self, client_id):
-        with self._lock:
-            self._revoked.add(client_id)
+        if self.revocations is not None:
+            self.revocations.set_revoked(client_id, True)
+        else:
+            with self._lock:
+                self._memory.add(client_id)
 
     def reinstate(self, client_id):
-        with self._lock:
-            self._revoked.discard(client_id)
+        if self.revocations is not None:
+            self.revocations.set_revoked(client_id, False)
+        else:
+            with self._lock:
+                self._memory.discard(client_id)
 
     def proposer(self, who):
         """``who`` is a verified Authorization. Returns a Proposer or raises ClientDenied."""
@@ -76,8 +157,7 @@ class EnrolledClients:
             raise ClientDenied("assistant_session_must_not_have_review_scope")
         if PROPOSE_SCOPE not in scopes:
             raise ClientDenied("insufficient_scope")
-        with self._lock:
-            entry = None if client in self._revoked else self._clients.get(client)
+        entry = None if client in self._revoked() else self._clients.get(client)
         if entry is None:
             raise ClientDenied("client_not_enrolled_or_revoked")
         return Proposer(client=client, name=entry["name"], kind=entry["kind"], account=who.account)

@@ -3,8 +3,11 @@
 An AI files a request; it waits here until the owner decides on his phone (G5), and
 the executor (G4) runs only an *approved* request's exact stored plan. This module:
 
-- stores the exact validated plan with its SHA-256; the request ID IS that hash, so
-  the same request filed twice is one request, and a changed plan is a new request;
+- stores the exact validated plan with its SHA-256; the request ID IS that hash;
+- deduplicates by *what* is asked ("install htop on this device"): while such a request
+  is pending, asking again (by any assistant, at any later second) returns the original
+  request with its original exact plan and original expiry. Nothing is extended or
+  re-hashed. Once it is decided or expired, a new ask files a new request;
 - never approves anything: there is no AI-facing way to change a request's state;
 - expires requests whose plan has expired;
 - limits each AI client to a few pending requests, so a runaway assistant can't flood
@@ -66,11 +69,12 @@ class RequestStore:
                 raise RequestError("store_newer_than_program")
             if version == 0:
                 db.execute("""CREATE TABLE requests (
-                    request_id TEXT PRIMARY KEY, kind TEXT NOT NULL, software TEXT NOT NULL,
+                    request_id TEXT PRIMARY KEY, logical_key TEXT NOT NULL, kind TEXT NOT NULL, software TEXT NOT NULL,
                     device TEXT NOT NULL, owner TEXT NOT NULL, client TEXT NOT NULL, client_name TEXT NOT NULL,
                     payload TEXT NOT NULL, summary TEXT NOT NULL,
                     state TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL,
                     decided REAL, result TEXT)""")
+                db.execute("CREATE INDEX requests_logical ON requests(logical_key, state)")
                 db.execute("PRAGMA user_version = %d" % self.SCHEMA)
 
     @contextmanager
@@ -99,8 +103,13 @@ class RequestStore:
         if type(expires) not in (int, float) or expires <= self.clock():
             raise RequestError("expired")
         rid, canonical = request_id(payload)
+        logical = "%s|%s|%s|%s" % (kind, software, owner, device)
         with self._tx() as db:
             self._expire(db)
+            same = db.execute("SELECT * FROM requests WHERE logical_key=? AND state='pending' "
+                              "ORDER BY created LIMIT 1", (logical,)).fetchone()
+            if same is not None:
+                return self._receipt(same), False        # original plan, original expiry
             row = db.execute("SELECT * FROM requests WHERE request_id=?", (rid,)).fetchone()
             if row is not None:
                 if row["owner"] != owner or row["device"] != device:
@@ -110,9 +119,9 @@ class RequestStore:
                                  (proposer.client,)).fetchone()[0]
             if pending >= MAX_PENDING_PER_CLIENT:
                 raise RequestError("too_many_pending_requests")
-            db.execute("INSERT INTO requests (request_id, kind, software, device, owner, client, client_name, "
-                       "payload, summary, state, created, expires) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                       (rid, kind, software, device, owner, proposer.client, proposer.name, canonical,
+            db.execute("INSERT INTO requests (request_id, logical_key, kind, software, device, owner, client, "
+                       "client_name, payload, summary, state, created, expires) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (rid, logical, kind, software, device, owner, proposer.client, proposer.name, canonical,
                         json.dumps(summary[:16]), "pending", self.clock(), float(expires)))
             return self._receipt(db.execute("SELECT * FROM requests WHERE request_id=?", (rid,)).fetchone()), True
 

@@ -22,6 +22,7 @@ from mcp.types import ToolAnnotations
 
 from .. import catalog
 from ..identity import TokenDenied
+from ..ledger import LedgerError
 from ..plan import PlanError
 from ..requests import RequestError
 from .clients import PROPOSE_SCOPE, ClientDenied
@@ -58,7 +59,7 @@ class ProposeGate:
         return proposer, who.account
 
 
-def register(server, *, router, clients, store, bearer, resolve_apt=None, approval_url=None, clock=None):
+def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt=None, approval_url=None, clock=None):
     """Add the request tools. ``bearer()`` returns the verified request's bearer header or None."""
     gate = ProposeGate(router=router, clients=clients)
     now = clock or (lambda: datetime.now(timezone.utc))
@@ -131,16 +132,22 @@ def register(server, *, router, clients, store, bearer, resolve_apt=None, approv
             item = catalog.entry(software)
             if type(rollback_id) is not str or not _ROLLBACK_ID.fullmatch(rollback_id):
                 return _error("invalid_rollback_id")
+            if ledger is None:
+                return _error("rollback_not_available")
+            # Only a real StyNpilot install of this software, on this owner's device, with a
+            # verified backup, may be rolled back. Anything else is refused before the owner is asked.
+            install = ledger.rollbackable(rollback_id, software=software, owner=owner, device=device_id)
             expires = now() + timedelta(hours=1)
             payload = {"kind": "rollback", "software": software, "rollback_id": rollback_id,
+                       "request_id": install["request_id"], "snapshot_id": install["snapshot_id"],
                        "owner": owner, "device": device_id, "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
-            summary = ["Roll back %s to its state before the recorded install %s." % (item["title"], rollback_id[:12]),
-                       "User data is kept; only files StyNpilot created and that are unchanged are removed.",
+            summary = ["Roll back %s to the verified backup taken before install %s." % (item["title"], rollback_id[:12]),
+                       "That backup was verified restorable when it was taken; it is checked again before restoring.",
                        "Expires %s UTC if not approved." % payload["expires_at"].replace("T", " ").rstrip("Z")]
             result, _ = store.submit(kind="rollback", software=software, device=device_id, owner=owner,
                                      proposer=proposer, payload=payload, summary=summary,
                                      expires=expires.timestamp())
-        except (ClientDenied, catalog.CatalogError, RequestError) as denied:
+        except (ClientDenied, catalog.CatalogError, RequestError, LedgerError) as denied:
             return _error(denied.code)
         except Exception as error:
             _LOG.warning("rollback request failed type=%s", type(error).__name__)

@@ -80,14 +80,15 @@ class RequestStoreTests(unittest.TestCase):
                                  proposer=proposer or self.chatgpt, payload=payload,
                                  summary=["Install htop."], expires=expires)
 
-    def test_same_plan_is_one_request_and_a_changed_plan_is_a_new_one(self):
-        first, created = self.submit({"p": 1})
-        again, created_again = self.submit({"p": 1}, proposer=self.claude)
-        other, _ = self.submit({"p": 2})
+    def test_same_ask_while_pending_is_one_request_even_with_a_newer_plan(self):
+        first, created = self.submit({"p": 1, "expires_at": "first"})
+        self.now[0] = 1300.0
+        again, created_again = self.submit({"p": 1, "expires_at": "later"}, proposer=self.claude, expires=6000.0)
         self.assertTrue(created)
         self.assertFalse(created_again)
         self.assertEqual(first["request_id"], again["request_id"])
-        self.assertNotEqual(first["request_id"], other["request_id"])
+        self.assertEqual(again["expires_at"], 5000)                          # original expiry kept
+        self.assertEqual(self.store.payload(first["request_id"])["expires_at"], "first")   # original plan kept
         self.assertEqual((first["state"], first["requested_by"], first["approved_by_ai"]), ("pending", "chatgpt", False))
         self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
@@ -99,20 +100,26 @@ class RequestStoreTests(unittest.TestCase):
             with self.subTest(owner=owner[:8], device=device[-6:], value=value[:6]), self.assertRaises(RequestError):
                 self.store.status(value, owner=owner, device=device)
 
-    def test_requests_expire(self):
+    def test_requests_expire_and_a_new_ask_then_files_a_new_request(self):
         rid = self.submit({"p": 1}, expires=1500.0)[0]["request_id"]
         self.now[0] = 1600.0
         self.assertEqual(self.store.status(rid, owner=OWNER, device=DEVICE)["state"], "expired")
+        fresh, created = self.submit({"p": 1, "n": 2}, expires=9000.0)
+        self.assertTrue(created)
+        self.assertNotEqual(fresh["request_id"], rid)
         with self.assertRaises(RequestError):
             self.submit({"p": 9}, expires=1500.0)
 
     def test_one_assistant_cannot_flood_the_owner(self):
         for n in range(MAX_PENDING_PER_CLIENT):
-            self.submit({"p": n})
+            self.store.submit(kind="install", software="app%d" % n, device=DEVICE, owner=OWNER, proposer=self.chatgpt,
+                              payload={"p": n}, summary=["x"], expires=5000.0)
         with self.assertRaises(RequestError) as caught:
-            self.submit({"p": "one too many"})
+            self.store.submit(kind="install", software="one-too-many", device=DEVICE, owner=OWNER,
+                              proposer=self.chatgpt, payload={"p": "x"}, summary=["x"], expires=5000.0)
         self.assertEqual(caught.exception.code, "too_many_pending_requests")
-        self.assertTrue(self.submit({"p": "other assistant"}, proposer=self.claude)[1])
+        self.assertTrue(self.store.submit(kind="install", software="other", device=DEVICE, owner=OWNER,
+                                          proposer=self.claude, payload={"p": "y"}, summary=["x"], expires=5000.0)[1])
 
     def test_store_has_no_ai_facing_way_to_approve(self):
         for name in dir(self.store):

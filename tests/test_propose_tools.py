@@ -1,6 +1,7 @@
 """The YELLOW request tools through the real MCP server: two assistants, one owner, no approvals."""
 import asyncio
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -9,9 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from datetime import timedelta
+
 from stynpilot.identity import TokenDenied
+from stynpilot.ledger import InstallLedger
 from stynpilot.requests import RequestStore
-from stynpilot.server.clients import EnrolledClients
+from stynpilot.server.clients import EnrolledClients, RevocationFile
 from stynpilot.server.router import LocalOwnership, ReadRouter
 
 try:
@@ -71,13 +75,16 @@ class ProposeToolTests(unittest.TestCase):
         self.grants = Grants()
         router = ReadRouter(tokens=Tokens(), ownership=LocalOwnership(grants=self.grants, owner_id=OWNER, device_id=DEVICE),
                             read_health=lambda: {"cpu_usage_percent": 1.0})
-        self.clients = EnrolledClients([{"client_id": "chatgpt-connector", "name": "chatgpt", "kind": "chatgpt"},
-                                        {"client_id": "claude-connector", "name": "claude", "kind": "claude"}])
-        self.store = RequestStore(Path(tmp.name) / "state" / "requests.sqlite3")
+        self.state = Path(tmp.name) / "state"
+        self.enrolled = [{"client_id": "chatgpt-connector", "name": "chatgpt", "kind": "chatgpt"},
+                         {"client_id": "claude-connector", "name": "claude", "kind": "claude"}]
+        self.clients = EnrolledClients(self.enrolled, revocations=RevocationFile(self.state / "revoked-clients.json"))
+        self.now = [datetime(2026, 11, 22, 17, 0, 5, tzinfo=timezone.utc)]
+        self.store = RequestStore(self.state / "requests.sqlite3", clock=lambda: self.now[0].timestamp())
+        self.ledger = InstallLedger(self.state / "installs.sqlite3", clock=lambda: self.now[0].timestamp())
         self.server = create_server(router=router, resource_url=AUDIENCE, propose=dict(
-            clients=self.clients, store=self.store, resolve_apt={"htop": "3.3.0-4build1"}.get,
-            approval_url="https://ryzen.example.test/app",
-            clock=lambda: datetime.now(timezone.utc)))
+            clients=self.clients, store=self.store, ledger=self.ledger, resolve_apt={"htop": "3.3.0-4build1"}.get,
+            approval_url="https://ryzen.example.test/app", clock=lambda: self.now[0]))
 
     def call(self, name, arguments, token="chatgpt"):
         who = Tokens.valid.get(token)
@@ -142,16 +149,95 @@ class ProposeToolTests(unittest.TestCase):
         self.assertEqual(self.install("claude"), {"ok": False, "error": "client_not_enrolled_or_revoked"})
         self.assertTrue(self.install("chatgpt")["ok"])
 
-    def test_rollback_request(self):
-        filed = self.call("commander_request_software_rollback",
-                          {"device_id": DEVICE, "software": "forgejo", "rollback_id": "ab" * 16})
+    def rollback(self, rollback_id, software="htop", token="chatgpt"):
+        return self.call("commander_request_software_rollback",
+                         {"device_id": DEVICE, "software": software, "rollback_id": rollback_id}, token)
+
+    def test_rollback_only_for_a_recorded_install_with_a_verified_backup(self):
+        """PR #10 review: a rollback ID must be a real StyNpilot install of that software on that device."""
+        self.ledger.record(rollback_id="ab" * 16, software="htop", owner=OWNER, device=DEVICE,
+                           request_id="c" * 64, snapshot_id="snap-1", snapshot_verified=True)
+        self.ledger.record(rollback_id="cd" * 16, software="htop", owner=OWNER, device=DEVICE,
+                           request_id="d" * 64, snapshot_id="snap-2", snapshot_verified=False)
+        self.ledger.record(rollback_id="ef" * 16, software="htop", owner="acct_" + "b" * 40, device=DEVICE,
+                           request_id="e" * 64, snapshot_id="snap-3", snapshot_verified=True)
+        filed = self.rollback("ab" * 16)
         self.assertTrue(filed["ok"], filed)
         self.assertEqual((filed["result"]["kind"], filed["result"]["state"]), ("rollback", "pending"))
-        for bad in ("", "../x", "AB" * 16, "short"):
-            with self.subTest(bad=bad):
-                self.assertEqual(self.call("commander_request_software_rollback",
-                                           {"device_id": DEVICE, "software": "forgejo", "rollback_id": bad}),
-                                 {"ok": False, "error": "invalid_rollback_id"})
+        self.assertIn("verified backup", filed["result"]["summary"][0])
+        cases = {
+            "invalid_rollback_id": ("", "../x", "AB" * 16, "short"),
+            "unknown_rollback_id": ("99" * 16, "ef" * 16),            # nonexistent; another owner's install
+            "no_verified_backup": ("cd" * 16,),
+        }
+        for code, ids in cases.items():
+            for value in ids:
+                with self.subTest(code=code, value=value):
+                    self.assertEqual(self.rollback(value), {"ok": False, "error": code})
+        self.assertEqual(self.rollback("ab" * 16, software="forgejo"),
+                         {"ok": False, "error": "rollback_id_is_for_other_software"})
+        self.assertEqual(self.rollback("99" * 16, software="forgejo"), {"ok": False, "error": "unknown_rollback_id"})
+
+    # --- PR #10 review: one logical request, however many seconds or assistants later ------
+    def test_asking_again_later_returns_the_original_request_and_expiry(self):
+        first = self.install("chatgpt")["result"]
+        for minutes, token in ((0.1, "chatgpt"), (5, "claude"), (59, "chatgpt")):
+            with self.subTest(minutes=minutes, token=token):
+                self.now[0] = datetime(2026, 11, 22, 17, 0, 5, tzinfo=timezone.utc) + timedelta(minutes=minutes)
+                again = self.install(token)["result"]
+                self.assertEqual(again["request_id"], first["request_id"])
+                self.assertEqual(again["expires_at"], first["expires_at"])       # never silently extended
+                self.assertEqual(again["requested_by"], "chatgpt")               # provenance kept
+        import sqlite3
+        with sqlite3.connect(self.store.path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM requests").fetchone()[0], 1)
+        self.now[0] = datetime(2026, 11, 22, 18, 1, tzinfo=timezone.utc)           # the first one expired
+        fresh = self.install("claude")["result"]
+        self.assertNotEqual(fresh["request_id"], first["request_id"])
+        self.assertEqual(fresh["requested_by"], "claude")
+
+    # --- PR #10 review: assistants may read each other's status, never more ---------------
+    def test_assistants_can_read_each_others_status_but_revoked_or_strangers_cannot(self):
+        rid = self.install("chatgpt")["result"]["request_id"]
+        args = {"device_id": DEVICE, "request_id": rid}
+        status = self.call("commander_software_install_status", args, "claude")["result"]
+        self.assertEqual((status["state"], status["requested_by"]), ("pending", "chatgpt"))
+        self.assertNotIn("payload", status)
+        self.assertNotIn("steps", json.dumps(status))
+        self.assertEqual(self.call("commander_software_install_status", args, "stranger"),
+                         {"ok": False, "error": "device_unavailable_or_not_authorized"})
+        self.clients.revoke("claude-connector")
+        self.assertEqual(self.call("commander_software_install_status", args, "claude"),
+                         {"ok": False, "error": "client_not_enrolled_or_revoked"})
+
+    # --- PR #10 review: revocation survives a restart and fails closed ---------------------
+    def test_revocation_survives_restart_and_bad_state_refuses_everyone(self):
+        self.clients.revoke("claude-connector")
+        restarted = EnrolledClients(self.enrolled, revocations=RevocationFile(self.state / "revoked-clients.json"))
+        from stynpilot.server.clients import ClientDenied
+        claude = Tokens.valid["claude"]
+        with self.assertRaises(ClientDenied) as caught:
+            restarted.proposer(claude)
+        self.assertEqual(caught.exception.code, "client_not_enrolled_or_revoked")
+        self.assertEqual(restarted.proposer(Tokens.valid["chatgpt"]).name, "chatgpt")
+        path = self.state / "revoked-clients.json"
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        for breakage in ("world-readable", "corrupt", "wrong shape"):
+            with self.subTest(breakage):
+                if breakage == "world-readable":
+                    os.chmod(path, 0o644)
+                elif breakage == "corrupt":
+                    os.chmod(path, 0o600)
+                    path.write_text("{not json")
+                else:
+                    path.write_text(json.dumps({"revoked": "claude-connector"}))
+                with self.assertRaises(ClientDenied) as caught:
+                    restarted.proposer(Tokens.valid["chatgpt"])               # even the unrevoked one
+                self.assertEqual(caught.exception.code, "client_state_unreadable")
+                self.assertEqual(self.install("chatgpt"), {"ok": False, "error": "client_state_unreadable"})
+        path.unlink()
+        restarted.reinstate("claude-connector")
+        self.assertEqual(restarted.proposer(claude).name, "claude")
 
     def test_catalog_listing_is_read_only_and_needs_no_propose(self):
         listing = self.call("commander_software_catalog", {}, "readonly")

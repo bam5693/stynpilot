@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from stynpilot import board as cc
 from stynpilot.board import Board, Denied
 
+COMMIT = "commit:" + "a" * 40
 FORBIDDEN = {"approve", "approval", "decide", "confirm", "review", "run", "execute", "ticket", "password"}
 
 
@@ -47,6 +48,16 @@ class BoardCase(unittest.TestCase):
 
 class BoardTests(BoardCase):
     # -- storage and identities -------------------------------------------------------
+    def test_board_folder_must_be_private(self):
+        shared = Path(self.tmp.name) / "shared"
+        shared.mkdir()
+        for mode in (0o777, 0o775, 0o757):
+            shared.chmod(mode)
+            with self.subTest(mode=oct(mode)), self.assertRaises(ValueError):
+                Board(shared / "board.sqlite")
+        shared.chmod(0o700)
+        Board(shared / "board.sqlite")
+
     def test_board_file_is_private_and_loose_files_are_refused(self):
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
         loose = Path(self.tmp.name) / "loose.sqlite"
@@ -372,14 +383,14 @@ class ReviewTests(BoardCase):
         super().setUp()
         # Claude can assign here so it can request reviews from ChatGPT too.
         self.board.enroll_assistant("claude-runner", "claude-runner", "claude", ["stynpilot"], can_assign=True)
-        work = self.make(title="Build installer validator", assignee="claude-runner", claims=("pr:2",))
+        work = self.board.create("claude-runner", "stynpilot", "Build installer validator", claims=("pr:2",))
         claimed = self.board.claim("claude-runner")
         self.board.finish("claude-runner", claimed["task_id"], claimed["lease_id"], "done", "PR #2 ready")
         self.work_id = work["task_id"]
 
     def review(self, n=1, who="claude-runner", reviewer="chatgpt-client"):
         return self.board.create(who, "stynpilot", "Review installer validator round %d" % n,
-                                 assignee=reviewer, kind="review", parent_task_id=self.work_id, ref="pr:2")
+                                 assignee=reviewer, kind="review", parent_task_id=self.work_id, ref=COMMIT)
 
     def finish_review(self, verdict):
         task = self.board.claim("chatgpt-client")
@@ -398,6 +409,30 @@ class ReviewTests(BoardCase):
     def test_another_identity_of_the_same_assistant_is_not_independent(self):
         # claude-client is a second Claude identity; it cannot review claude-runner's work.
         self.denied("reviewer_must_be_a_different_assistant", self.review, reviewer="claude-client")
+
+    def test_whoever_wrote_the_task_cannot_review_it(self):
+        # ChatGPT writes a task, hands it to Claude, then tries to review the result.
+        task = self.make(title="ChatGPT spec, Claude builds", assignee="claude-runner", claims=())
+        claimed = self.board.claim("claude-runner")
+        self.board.finish("claude-runner", claimed["task_id"], claimed["lease_id"], "done", "built")
+        self.denied("reviewer_must_differ_from_author", self.board.create, "claude-runner", "stynpilot", "Review it",
+                    assignee="chatgpt-client", kind="review", parent_task_id=task["task_id"], ref=COMMIT)
+
+    def test_review_needs_finished_work_and_an_exact_commit(self):
+        unfinished = self.board.create("claude-runner", "stynpilot", "Still going", claims=())
+        self.denied("review_needs_finished_work", self.board.create, "claude-runner", "stynpilot", "Early review",
+                    assignee="chatgpt-client", kind="review", parent_task_id=unfinished["task_id"], ref=COMMIT)
+        for ref in (None, "pr:2", "branch:main", "commit:abc", "commit:" + "A" * 40):
+            self.denied("review_needs_exact_commit_ref" if ref is None or ref.startswith(("pr", "branch")) else "bad_ref",
+                        self.board.create, "claude-runner", "stynpilot", "Moving target %s" % ref,
+                        assignee="chatgpt-client", kind="review", parent_task_id=self.work_id, ref=ref)
+
+    def test_a_verdict_needs_evidence(self):
+        self.review()
+        task = self.board.claim("chatgpt-client")
+        for empty in ("", "   "):
+            self.denied("review_needs_evidence", self.board.finish, "chatgpt-client", task["task_id"],
+                        task["lease_id"], "done", empty, verdict="approve")
 
     def test_review_needs_a_real_parent_in_the_same_project(self):
         self.denied("review_needs_parent", self.board.create, "claude-runner", "stynpilot", "R",
@@ -495,7 +530,7 @@ class ToolTests(unittest.TestCase):
         work = t["commander_task_create"]("stynpilot", "Plan", assignee_client_id="chatgpt-client")["result"]
         lease = t["commander_task_claim"]()["result"]["lease_id"]
         t["commander_task_finish"](work["task_id"], lease, "done", "plan in PR")
-        review = t["commander_task_create"]("stynpilot", "Review plan", "", "claude-client", None, 3, "pr:1",
+        review = t["commander_task_create"]("stynpilot", "Review plan", "", "claude-client", None, 3, COMMIT,
                                             "review", work["task_id"])
         self.assertTrue(review["ok"], review)
         self.as_("claude-client")

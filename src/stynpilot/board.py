@@ -12,9 +12,12 @@ cannot enroll or reinstate anyone. The board records who works on what:
 * revoking one identity blocks its tasks and releases its claims without touching others.
 
 Review flow (new in this repository):
-* a ``review`` task points at a parent task and can never be assigned to the parent's
-  assignee, so work is always checked by a different identity;
-* a review finishes with a verdict: approve, approve-with-changes or object;
+* a ``review`` task points at a FINISHED parent task and an exact ``commit:<sha>``; new commits
+  need a new review;
+* the reviewer must be a different assistant from both the parent's creator and assignee;
+* a review finishes with a verdict (approve, approve-with-changes or object) and evidence;
+* reviews are ADVISORY records for the owner. Nothing in StyNpilot treats a verdict as an
+  approval or as permission to merge or run anything; the owner decides;
 * at most MAX_REVIEW_ROUNDS reviews per parent (first review plus two rebuttals); after
   that the assistants must hand the owner one decision question instead of looping;
 * tasks created under other tasks may nest only MAX_DEPTH levels deep.
@@ -50,7 +53,8 @@ RATE_WINDOW = 60
 NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 CLIENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}")
 CLAIM = re.compile(r"(path|branch|mr|pr|issue):[A-Za-z0-9._/@-]{1,160}")
-REF = re.compile(r"(issue|mr|pr|branch):[A-Za-z0-9._/#!@-]{1,160}")
+REF = re.compile(r"(issue|mr|pr|branch):[A-Za-z0-9._/#!@-]{1,160}|commit:[0-9a-f]{40}")
+COMMIT_REF = re.compile(r"commit:[0-9a-f]{40}")
 TASK_ID = re.compile(r"[0-9a-f]{16}")
 KINDS = ("chatgpt", "claude", "local")
 TASK_KINDS = ("work", "review")
@@ -129,6 +133,11 @@ class Board:
         if not callable(clock):
             raise ValueError("Clock required")
         self.path, self.clock, self._lock = Path(path), clock, threading.RLock()
+        # The folder must be private too: otherwise another account could swap the file
+        # between this check and SQLite opening it.
+        parent = os.lstat(self.path.parent)
+        if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_mode & 0o022:
+            raise ValueError("Task board folder must be owned by this account and not group/world writable")
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             info = os.fstat(fd)
@@ -293,7 +302,7 @@ class Board:
                     pass
             raise
 
-    def _lineage(self, db, proj, kind, parent_task_id, target_id):
+    def _lineage(self, db, proj, kind, parent_task_id, target_id, ref):
         """Return (depth, review_round) for a new task, enforcing the review and nesting rules."""
         if parent_task_id is None:
             if kind == "review":
@@ -311,13 +320,19 @@ class Board:
             return depth, 0
         if parent["task_kind"] == "review":
             raise Denied("cannot_review_a_review")
-        if target_id == parent["assignee"]:
+        if parent["state"] != "done":
+            raise Denied("review_needs_finished_work")
+        if not (type(ref) is str and COMMIT_REF.fullmatch(ref)):
+            raise Denied("review_needs_exact_commit_ref")
+        # Whoever wrote the task and whoever did it are both authors. Neither they nor another
+        # identity of the same assistant (for example the Claude app and the Claude runner)
+        # is an independent reviewer.
+        authors = (parent["assignee"], parent["creator"])
+        if target_id in authors:
             raise Denied("reviewer_must_differ_from_author")
-        # Two identities of the same assistant (for example the Claude app and the Claude
-        # runner) are not independent reviewers of each other.
-        kinds = dict(db.execute("SELECT client_id,kind FROM assistants WHERE client_id IN (?,?)",
-                                (target_id, parent["assignee"])).fetchall())
-        if kinds.get(target_id) == kinds.get(parent["assignee"]):
+        kinds = dict(db.execute("SELECT client_id,kind FROM assistants WHERE client_id IN (?,?,?)",
+                                (target_id, *authors)).fetchall())
+        if kinds.get(target_id) in (kinds.get(authors[0]), kinds.get(authors[1])):
             raise Denied("reviewer_must_be_a_different_assistant")
         rounds = db.execute("SELECT COUNT(*) FROM tasks WHERE parent_task_id=? AND task_kind='review'",
                             (parent_task_id,)).fetchone()[0]
@@ -349,7 +364,7 @@ class Board:
                 target = self._me(db, target_id, proj)
             except Denied:
                 raise Denied("assignee_unavailable") from None
-            depth, review_round = self._lineage(db, proj, kind, parent_task_id, target_id)
+            depth, review_round = self._lineage(db, proj, kind, parent_task_id, target_id, ref)
             self._recover(db)
             if db.execute("SELECT COUNT(*) FROM tasks WHERE assignee=? AND state IN ('queued','running')",
                           (target_id,)).fetchone()[0] >= target["max_open"]:
@@ -431,6 +446,8 @@ class Board:
             if row["task_kind"] == "review" and outcome == "done":
                 if verdict not in VERDICTS:
                     raise Denied("review_needs_verdict")
+                if not (type(summary) is str and summary.strip()):
+                    raise Denied("review_needs_evidence")
             elif verdict is not None:
                 raise Denied("verdict_only_for_finished_reviews")
             text, now = _text(summary, 1000, multiline=True, empty=True), self.clock()

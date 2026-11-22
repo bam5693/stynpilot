@@ -29,7 +29,7 @@ PUBLIC_HOST = re.compile(r"(?=.{1,253}\Z)%s(?:\.%s)+\Z" % (_LABEL, _LABEL))
 
 
 def check_public_host(host):
-    if type(host) is not str or not PUBLIC_HOST.fullmatch(host):
+    if type(host) is not str or not PUBLIC_HOST.fullmatch(host) or host.rsplit(".", 1)[-1].isdigit():
         raise ValueError("Public host must be a plain DNS name such as computer.example.net")
     return host.lower()
 

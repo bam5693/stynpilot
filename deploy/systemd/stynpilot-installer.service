@@ -1,0 +1,26 @@
+# The root installer. NOT installed by this repo: the owner approves the exact install commands (G7/G8).
+# Config: /etc/stynpilot/installer.json (root-owned, mode 0600). Socket: /run/stynpilot/installer.sock (0600, owner UID only).
+[Unit]
+Description=StyNpilot root installer (approved software changes only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 -m stynpilot.service installer --config /etc/stynpilot/installer.json
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=stynpilot
+RuntimeDirectoryMode=0755
+StateDirectory=stynpilot-installer
+StateDirectoryMode=0700
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# dpkg maintainer scripts need normal root capabilities, so NoNewPrivileges and ProtectSystem are NOT set.
+
+[Install]
+WantedBy=multi-user.target

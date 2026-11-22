@@ -21,20 +21,25 @@ it is the one to work from. This file only tracks the **work in this repository*
   approval. BLACK actions are never done.
 
 ## Work in this repository, in order
-- [x] PR #2: foundation (GREEN/YELLOW/BLACK policy, task board with
-  independent reviews, install-plan checker). Reviewed.
-- [x] PR #4: runner M1 skeleton (read-only Claude Code worker).
-- [x] PR #5: fixes for the runner review (rate-limit-safe progress, late
-  instructions reported, CLI self-check). 90/90 tests pass locally.
-- [ ] Review #5, merge it into #4's branch, then the owner merges #2 and #4 into
-  `main` (#1 comes in with #2).
-- [ ] Wire the task board into the packaged service. It must fail closed.
-- [ ] Tests that the runner's user can't reach the approval broker, owner state
-  or Docker.
-- [ ] Port the broker so it executes only a validated install plan. That gives
-  one owner approval per plan, with no per-app installer.
-- [ ] Reach parity with the current private build, then package from here.
-- [ ] Free local CI on the owner's own machine.
+This repository is the fresh start. Useful code from the older GitLab prototype
+is ported here one piece at a time, with its tests, until this build replaces
+what runs on the owner's computer. `docs/MIGRATION.md` records each port.
+
+- [x] PR #2: foundation (policy, task board, install-plan checker).
+- [x] PR #4 + #5: read-only runner M1 and its review fixes.
+- [x] PR #7: read-only MCP endpoint core (health, software status, token
+  checks, owner/device checks). 110/110 tests pass locally.
+- [ ] Endpoint startup: listener, OAuth metadata, identity config, device
+  grants and pairing.
+- [ ] Software catalog and the install / status / rollback request tools.
+- [ ] Root broker that executes only a validated install plan (one owner
+  approval per plan, no per-app installer).
+- [ ] Owner phone approval.
+- [ ] Activation, services, packaging, installer, health doctor, backups.
+- [ ] The owner upgrades his computer to this build (the old build is kept for
+  rollback). Then the owner merges the PR stack into `main`.
+- [ ] Runner on the owner's computer, the first general install, and free
+  local CI.
 
 ## Handoff
 When you stop: tick what's done with evidence (a commit or PR link), write the

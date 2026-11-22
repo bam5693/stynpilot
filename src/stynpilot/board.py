@@ -313,6 +313,12 @@ class Board:
             raise Denied("cannot_review_a_review")
         if target_id == parent["assignee"]:
             raise Denied("reviewer_must_differ_from_author")
+        # Two identities of the same assistant (for example the Claude app and the Claude
+        # runner) are not independent reviewers of each other.
+        kinds = dict(db.execute("SELECT client_id,kind FROM assistants WHERE client_id IN (?,?)",
+                                (target_id, parent["assignee"])).fetchall())
+        if kinds.get(target_id) == kinds.get(parent["assignee"]):
+            raise Denied("reviewer_must_be_a_different_assistant")
         rounds = db.execute("SELECT COUNT(*) FROM tasks WHERE parent_task_id=? AND task_kind='review'",
                             (parent_task_id,)).fetchone()[0]
         if rounds >= MAX_REVIEW_ROUNDS:

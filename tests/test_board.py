@@ -395,6 +395,10 @@ class ReviewTests(BoardCase):
         self.denied("reviewer_must_differ_from_author", self.review, who="chatgpt-client", reviewer="claude-runner")
         self.denied("reviewer_must_differ_from_author", self.review, reviewer="claude-runner")
 
+    def test_another_identity_of_the_same_assistant_is_not_independent(self):
+        # claude-client is a second Claude identity; it cannot review claude-runner's work.
+        self.denied("reviewer_must_be_a_different_assistant", self.review, reviewer="claude-client")
+
     def test_review_needs_a_real_parent_in_the_same_project(self):
         self.denied("review_needs_parent", self.board.create, "claude-runner", "stynpilot", "R",
                     assignee="chatgpt-client", kind="review")

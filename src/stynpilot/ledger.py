@@ -89,6 +89,13 @@ class InstallLedger:
                        (rollback_id, software, owner, device, request_id, snapshot_id,
                         int(snapshot_verified), self.clock()))
 
+    def mark_rolled_back(self, rollback_id):
+        """Executor only (G4), after a verified restore."""
+        with self._tx() as db:
+            if db.execute("UPDATE installs SET rolled_back=? WHERE rollback_id=? AND rolled_back IS NULL",
+                          (self.clock(), rollback_id)).rowcount != 1:
+                raise LedgerError("unknown_rollback_id")
+
     def rollbackable(self, rollback_id, *, software, owner, device):
         """The entry if a rollback may be *requested*; otherwise LedgerError with the reason."""
         if type(rollback_id) is not str or not ROLLBACK_ID.fullmatch(rollback_id):

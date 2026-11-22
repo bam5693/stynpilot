@@ -10,9 +10,10 @@ own recipe. Its facts are kept for status checks and rollback, and a new install
 request is refused because it is already installed. Its fields are tied to the
 GitLab recipe by a test.
 
-Exact apt versions are resolved on the owner's computer at request time by a
-``resolve_apt(name) -> version`` function supplied by the executor (G4). The plan
-shows the resolved version, and the executor stops if the machine would install
+Exact apt versions are resolved on the owner's computer at request time by
+``resolve_apt(names) -> [{"name", "version"}, ...]`` (``broker.apt.resolve``, a read-only
+simulation). It returns the requested packages AND every dependency apt would add, so
+the owner approves the complete set. The executor stops if the machine would install
 anything different.
 """
 from __future__ import annotations
@@ -81,17 +82,20 @@ def install_plan(software, *, owner, device, resolve_apt, now=None):
         raise CatalogError("unsupported_entry")
     if not callable(resolve_apt):
         raise CatalogError("version_resolution_unavailable")
-    packages = []
-    for name in item["packages"]:
-        version = resolve_apt(name)
-        if type(version) is not str or not version:
-            raise CatalogError("package_not_available")
-        packages.append({"name": name, "version": version})
+    try:
+        packages = resolve_apt(list(item["packages"]))
+    except Exception:
+        raise CatalogError("package_not_available") from None
+    if (type(packages) is not list or not packages
+            or not all(type(p) is dict and set(p) == {"name", "version"} for p in packages)
+            or not set(item["packages"]) <= {p["name"] for p in packages}):
+        raise CatalogError("package_not_available")
     raw = {"schema": 1, "owner": owner, "device": device, "steps": [{"kind": "apt", "packages": packages}],
            "backup": BACKUP, "rollback": ROLLBACK, "expires_at": _expiry(now)}
     validated = validate_plan(raw, expected_owner=owner, expected_device=device, now=now)
     summary = ["Install %s from the Ubuntu archive." % item["title"]]
-    summary += ["Package %s, exact version %s." % (p["name"], p["version"]) for p in packages]
+    summary += ["Package %s, exact version %s%s." % (p["name"], p["version"],
+                "" if p["name"] in item["packages"] else " (needed by it)") for p in packages]
     summary += ["A backup is taken before anything changes; rollback restores it.",
                 "Expires %s UTC if not approved." % raw["expires_at"].replace("T", " ").rstrip("Z")]
     return validated, summary

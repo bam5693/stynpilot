@@ -24,6 +24,9 @@ Device IDs, hostnames, emails, Auth0 values and backup data are never copied.
 | `stynpilot/requests.py` | the request queue inside `commander_composition` / `submit_proposal` | Standalone private SQLite queue; request ID = plan hash; per-assistant pending cap; expiry; no AI-facing approve |
 | `stynpilot/catalog.py` | `tools/stynpilot_software_catalog.py` | Entries compile to the **general** validated plan (apt / pinned containers); Forgejo kept as a `legacy` entry; drift test with `service_status.py` |
 | `stynpilot/ledger.py` | executor rollback records (`tools/stynpilot_software_executor.py`) | Rollback requests only for a recorded install of that software, owner and device with a verified backup |
+| `stynpilot/broker/proof.py` | broker's "root bound to the specific phone approval" (`tools/stynpilot_remote_broker.py`) | Approval = an Auth0-signed ID token whose `nonce` binds the exact request and plan; fresh sign-in; one-time use. A compromised owner-user service can't forge it |
+| `stynpilot/broker/apt.py`, `broker/executor.py` | `tools/stynpilot_software_executor.py`, `tools/stynpilot_software_gate.py` | **Redesigned** around `ValidatedPlan`: hash re-check, proof, single use, drift and removal stop, backup snapshot, pinned install, verified rollback simulation, automatic restore on failure, root ledger. apt only; containers refused until reviewed |
+| `stynpilot/broker/service.py` | broker UNIX socket in `tools/stynpilot_remote_broker.py` | 0600 socket; caller identified by SO_PEERCRED (owner UID only); one change at a time; 256 KiB cap |
 | `stynpilot/server/propose_tools.py` | `src/stynpilot_software_tools.py` | Same four tool names; ask-only; owner approval stays separate (G5) |
 | `stynpilot/server/run.py` | `start_health_connection`, `_serve_health_resource_metadata`, `commander_ai_endpoint` metadata helpers | Loopback-only listener, exact host names, RFC 9728 metadata, binds to the one live paired device |
 

@@ -83,7 +83,7 @@ class ProposeToolTests(unittest.TestCase):
         self.store = RequestStore(self.state / "requests.sqlite3", clock=lambda: self.now[0].timestamp())
         self.ledger = InstallLedger(self.state / "installs.sqlite3", clock=lambda: self.now[0].timestamp())
         self.server = create_server(router=router, resource_url=AUDIENCE, propose=dict(
-            clients=self.clients, store=self.store, ledger=self.ledger, resolve_apt={"htop": "3.3.0-4build1"}.get,
+            clients=self.clients, store=self.store, ledger=self.ledger, resolve_apt=lambda names: [{"name": "htop", "version": "3.3.0-4build1"}, {"name": "libnl-3-200", "version": "3.7.0-0.3build1.1"}],
             approval_url="https://ryzen.example.test/app", clock=lambda: self.now[0]))
 
     def call(self, name, arguments, token="chatgpt"):

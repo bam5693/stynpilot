@@ -454,13 +454,42 @@ class Board:
             elif verdict is not None:
                 raise Denied("verdict_only_for_finished_reviews")
             text, now = _text(summary, 1000, multiline=True, empty=True), self.clock()
+            # Follow-ups that were never acknowledged are voided below. Say so in the result
+            # itself, so a late instruction can never disappear silently (even one that
+            # arrived a moment before this call, after the worker's last checkpoint).
+            unapplied = db.execute("SELECT COUNT(*) FROM instructions WHERE task_id=? AND state IN "
+                                   "('pending','delivered')", (task_id,)).fetchone()[0]
+            if unapplied:
+                note = (" [%d follow-up instruction(s) were not applied before this task finished; "
+                        "send them as a new task.]" % unapplied)
+                text = text[:1000 - len(note)].rstrip() + note
             db.execute("UPDATE tasks SET state=?,result=?,verdict=?,lease_id=NULL,lease_deadline=NULL,progress=?,"
                        "updated=? WHERE task_id=?",
                        (outcome, text, verdict, 100 if outcome == "done" else row["progress"], now, task_id))
             self._void(db, task_id)
             self._event(db, client_id, "finish", task_id, outcome if verdict is None else outcome + ":" + verdict)
-            return self._view(db, self._row(db, task_id))
+            view = self._view(db, self._row(db, task_id))
+            view["unapplied_instructions"] = unapplied
+            return view
         return self._run(client_id, "finish", body)
+
+    def still_leased(self, client_id, task_id, lease_id):
+        """Cheap cancellation probe: is this lease still mine and running?
+
+        Exempt from the rate limit on purpose, so a worker can notice an owner's withdraw
+        within seconds. It is safe to exempt: it reads only the caller's own lease, returns
+        a single boolean, writes nothing, and changes nothing.
+        """
+        if not all(type(v) is str and v for v in (client_id, task_id, lease_id)):
+            return False
+        with self._tx() as db:
+            me = db.execute("SELECT enabled FROM assistants WHERE client_id=?", (client_id,)).fetchone()
+            if me is None or not me["enabled"]:
+                return False
+            row = db.execute("SELECT assignee,state,lease_id,lease_deadline FROM tasks WHERE task_id=?",
+                             (task_id,)).fetchone()
+        return bool(row is not None and row["assignee"] == client_id and row["state"] == "running"
+                    and row["lease_id"] == lease_id and (row["lease_deadline"] or 0) > self.clock())
 
     def withdraw(self, client_id, task_id):
         """Cancel a task. Only its creator or assignee may. The worker's next checkpoint gets lease_lost."""

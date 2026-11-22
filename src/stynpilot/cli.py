@@ -19,10 +19,13 @@ def main(argv=None):
     svc.add_argument("role", choices=("owner", "installer", "provision"))
     svc.add_argument("--config", required=True)
     sub.add_parser("setup")
-    root = sub.add_parser("root-setup")
-    root.add_argument("--from", dest="source", required=True)
+    rbak = sub.add_parser("root-backup", help="back up the installer's rollback records (asks for your password)")
+    rbak.add_argument("--out", required=True)
+    rres = sub.add_parser("root-restore", help="restore the installer's rollback records (asks for your password)")
+    rres.add_argument("--archive", required=True)
     doc = sub.add_parser("doctor")
     doc.add_argument("--config", default=DEFAULT_OWNER_CONFIG)
+    doc.add_argument("--html", action="store_true", help="show the report in a window (browser) instead of the terminal")
     bak = sub.add_parser("backup")
     bak.add_argument("--config", default=DEFAULT_OWNER_CONFIG)
     bak.add_argument("--out")
@@ -41,9 +44,11 @@ def main(argv=None):
         elif args.command == "setup":
             from . import setup_wizard
             setup_wizard.serve()
-        elif args.command == "root-setup":
-            from . import setup_wizard
-            print("wrote", setup_wizard.root_setup(args.source))
+        elif args.command in ("root-backup", "root-restore"):
+            import subprocess
+            from .setup_wizard import ROOT_HELPER
+            job = ["root-backup", "--out", args.out] if args.command == "root-backup" else ["root-restore", "--archive", args.archive]
+            return subprocess.run(["pkexec", ROOT_HELPER] + job).returncode
         elif args.command == "doctor":
             from . import doctor
             from .broker.service import BrokerClient
@@ -54,7 +59,10 @@ def main(argv=None):
                                        client=BrokerClient(config.broker_socket) if config else None)
             if config is None:
                 checks.insert(2, ("owner config", doctor.WARN, "not set up yet: open StyNpilot Setup from the menu"))
-            print(doctor.render(checks))
+            if args.html:
+                doctor.show_html(checks)
+            else:
+                print(doctor.render(checks))
             return doctor.exit_code(checks)
         elif args.command in ("backup", "restore"):
             from . import backup
@@ -62,7 +70,8 @@ def main(argv=None):
             if args.command == "backup":
                 out = args.out or str(config.state_dir.parent / ("stynpilot-backup-%s.tar" % time.strftime("%Y%m%d-%H%M%S")))
                 manifest = backup.make_backup(config.state_dir, out)
-                print("backup written to", out, "(%d files, hashes recorded)" % len(manifest["files"]))
+                print("owner-state backup written to", out, "(%d files, integrity hashes recorded). This covers YOUR request "
+                      "queue and revoked connectors only; use root-backup for software-rollback records." % len(manifest["files"]))
             else:
                 backup.restore_backup(args.archive, config.state_dir)
                 print("state restored from", args.archive)

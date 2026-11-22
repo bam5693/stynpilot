@@ -162,3 +162,24 @@ def render(checks):
 
 def exit_code(checks):
     return 1 if any(level == FAIL for _, level, _ in checks) else 0
+
+
+def render_html(checks):
+    import html
+    colour = {OK: "#1a7f37", WARN: "#9a6700", FAIL: "#cf222e"}
+    rows = "".join("<tr><td style='color:%s;font-weight:700'>%s</td><td>%s</td><td>%s</td></tr>"
+                   % (colour[l], l.upper(), html.escape(n), html.escape(d)) for n, l, d in checks)
+    bad = sum(1 for _, l, _ in checks if l == FAIL)
+    head = "Needs attention" if bad else "Healthy"
+    return ("<!doctype html><meta charset=utf-8><title>StyNpilot Doctor</title><body style='font-family:system-ui;"
+            "max-width:48rem;margin:2rem auto'><h1>StyNpilot Doctor: %s</h1><table cellpadding=6>%s</table>"
+            "<p>This report only reads. Nothing was changed.</p>" % (head, rows))
+
+
+def show_html(checks):                                       # pragma: no cover - opens a browser
+    import tempfile
+    import webbrowser
+    fd, path = tempfile.mkstemp(prefix="stynpilot-doctor-", suffix=".html")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(render_html(checks))
+    webbrowser.open("file://" + path)

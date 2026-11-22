@@ -25,6 +25,7 @@ from pathlib import Path
 from .service import ConfigError, InstallerConfig, OwnerConfig, provision_owner_state
 
 ROOT_CONFIG = Path("/etc/stynpilot/installer.json")
+ROOT_HELPER = "/usr/libexec/stynpilot/root-helper"
 APPROVAL_PORT, MCP_PORT = 18444, 18443
 FIELDS = ("issuer", "approval_client_id", "approval_public_host", "mcp_public_host", "pairing_db",
           "chatgpt_client_id", "claude_client_id")
@@ -33,7 +34,22 @@ FIELDS = ("issuer", "approval_client_id", "approval_public_host", "mcp_public_ho
 def default_paths(home):
     home = Path(home)
     return {"config": home / ".config/stynpilot/owner.json", "proposed": home / ".config/stynpilot/installer.proposed.json",
-            "state": home / ".local/state/stynpilot"}
+            "done": home / ".config/stynpilot/setup-complete.json", "state": home / ".local/state/stynpilot"}
+
+
+def discover_pairing_db(home):
+    """The existing build's pairing database, found read-only at its known location (never created or changed)."""
+    from .compat_check import STATE_DIR
+    from .devices import PairingDeviceGrants
+    candidate = Path(home) / STATE_DIR / "pairing.sqlite3"
+    try:
+        grants = PairingDeviceGrants(candidate)
+        try:
+            return str(candidate) if len(grants.paired_devices()) == 1 else None
+        finally:
+            grants.close()
+    except Exception:
+        return None
 
 
 def owner_config_from_form(form, home):
@@ -83,17 +99,78 @@ def installer_proposal(owner_data, uid):
     return data
 
 
-def run_setup(form, home, uid):
-    """Steps 1-3. Returns what was written. Refuses to overwrite anything."""
+def _read_private(path):
+    from .service import INSTALLER_KEYS, OWNER_KEYS, read_private_json
+    return read_private_json(path, OWNER_KEYS if Path(path).name == "owner.json" else INSTALLER_KEYS)
+
+
+def setup_status(home, uid, root_config=ROOT_CONFIG):
+    """Where first-run setup stands, read-only. config / proposal / state / system / complete."""
+    from .service import PROVISIONED
     paths = default_paths(home)
-    if paths["config"].exists():
-        raise ConfigError("already_set_up_refusing_to_overwrite")
-    data = owner_config_from_form(form, home)
-    proposal = installer_proposal(data, uid)                  # fails before anything is written
-    write_new_private(paths["config"], data)
-    created = provision_owner_state(OwnerConfig.from_dict(data))
-    write_new_private(paths["proposed"], proposal)
-    return {"config": str(paths["config"]), "state_files": created, "proposed": str(paths["proposed"])}
+    out = {"config": "missing", "proposal": "missing", "state": "missing", "system": "pending", "complete": False}
+    config = None
+    if paths["config"].exists() or paths["config"].is_symlink():
+        try:
+            config = OwnerConfig.from_file(paths["config"])
+            out["config"] = "ok"
+        except ConfigError:
+            out["config"] = "invalid"
+    if config is not None:
+        state = config.state_dir
+        have = [(state / n).exists() for n in PROVISIONED]
+        out["state"] = "complete" if all(have) else "partial" if any(have) else "missing"
+        if paths["proposed"].exists() or paths["proposed"].is_symlink():
+            try:
+                existing = _read_private(paths["proposed"])
+                out["proposal"] = "ok" if existing == installer_proposal(_read_private(paths["config"]), uid) else "mismatch"
+            except Exception:
+                out["proposal"] = "mismatch"
+    out["system"] = "done" if Path(root_config).exists() else "pending"
+    out["complete"] = out["system"] == "done" or paths["done"].exists()
+    return out
+
+
+def resume_setup(form, home, uid, root_config=ROOT_CONFIG):
+    """First-run setup that can be started, interrupted, and started again. Each stage is idempotent and never
+    overwrites or resets anything: owner settings -> proposed root settings -> owner state (created last).
+    Existing settings that don't match what was typed, or that fail their checks, stop everything (fail closed).
+    After setup is complete, lost state is never recreated here."""
+    status = setup_status(home, uid, root_config)
+    paths = default_paths(home)
+    if status["config"] == "invalid":
+        raise ConfigError("existing_settings_invalid_not_changing_them")
+    if status["config"] == "ok":
+        existing = _read_private(paths["config"])
+        if form is not None and owner_config_from_form(form, home) != existing:
+            raise ConfigError("existing_settings_differ_from_what_was_typed_not_changing_them")
+        data = existing
+    else:
+        if form is None:
+            raise ConfigError("nothing_to_resume_fill_in_the_form")
+        data = owner_config_from_form(form, home)
+        installer_proposal(data, uid)                          # fail before anything is written
+        write_new_private(paths["config"], data)
+    if status["proposal"] == "mismatch":
+        raise ConfigError("proposed_settings_do_not_match_not_changing_them")
+    if status["proposal"] == "missing":
+        write_new_private(paths["proposed"], installer_proposal(data, uid))
+    config = OwnerConfig.from_dict(data)
+    if status["state"] != "complete":
+        if status["complete"]:
+            raise ConfigError("state_missing_after_setup_restore_a_backup")
+        provision_owner_state(config, resume=True)
+    return setup_status(home, uid, root_config)
+
+
+def run_setup(form, home, uid, root_config=ROOT_CONFIG):
+    return resume_setup(form, home, uid, root_config)
+
+
+def mark_complete(home):
+    path = default_paths(home)["done"]
+    if not path.exists():
+        write_new_private(path, {"completed": True})
 
 
 # ----------------------------------------------------------------------------------------------- root step
@@ -132,23 +209,30 @@ def root_setup(source, *, dest=ROOT_CONFIG, invoking_uid=None, geteuid=os.geteui
 # ------------------------------------------------------------------------------------------------- web page
 _STYLE = ("body{font-family:system-ui,sans-serif;max-width:42rem;margin:2rem auto;padding:0 1rem}"
           "label{display:block;margin:.8rem 0 .2rem;font-weight:600}input{width:100%;padding:.5rem;font-size:1rem}"
-          "button{font-size:1.1rem;padding:.7rem 1.4rem;margin-top:1rem}small{color:#555}")
+          "button{font-size:1.1rem;padding:.7rem 1.4rem;margin-top:1rem}small{color:#555}li{margin:.3rem 0}")
 LABELS = {"issuer": ("Auth0 domain", "like your-tenant.us.auth0.com"),
           "approval_client_id": ("Approval app client ID", "the Auth0 application used only for approvals"),
           "approval_public_host": ("Approval page address", "your computer's HTTPS name and port, e.g. pc.tailnet.ts.net:8444"),
           "mcp_public_host": ("AI connection address", "your computer's HTTPS name, e.g. pc.tailnet.ts.net"),
-          "pairing_db": ("Existing pairing database", "full path of the file your current StyNpilot already uses"),
+          "pairing_db": ("Existing pairing database", "found automatically when possible"),
           "chatgpt_client_id": ("ChatGPT connector ID", "from the ChatGPT connector settings"),
           "claude_client_id": ("Claude connector ID", "from the Claude connector settings")}
+_STAGES = (("config", "Your settings are saved"), ("proposal", "System settings are prepared"),
+           ("state", "Your private records are created"), ("system", "System part is allowed"))
 
 
-def build_app(*, home, uid, token, port, root_runner=None, setup=run_setup):
+def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONFIG, setup=resume_setup):
+    """The link is a ONE-TIME entry: the first visit trades the secret URL for a browser session cookie and the URL
+    stops working. Close the browser and start Setup again from the menu to get a new link. Every later request
+    needs that cookie, the exact Host, and (for posts) the exact Origin."""
     from starlette.applications import Starlette
     from starlette.requests import Request
-    from starlette.responses import HTMLResponse
+    from starlette.responses import HTMLResponse, RedirectResponse
     from starlette.routing import Route
     host = "127.0.0.1:%d" % port
-    runner = root_runner or (lambda src: subprocess.run(["pkexec", "/usr/bin/stynpilot", "root-setup", "--from", src],
+    session = secrets.token_urlsafe(24)
+    used = {"entered": False}
+    runner = root_runner or (lambda src: subprocess.run(["pkexec", ROOT_HELPER, "root-setup", "--from", src],
                                                         capture_output=True, text=True, timeout=300))
 
     def page(title, body, status=200):
@@ -158,45 +242,95 @@ def build_app(*, home, uid, token, port, root_runner=None, setup=run_setup):
                             "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"})
         return out
 
-    def allowed(request):
-        return (request.headers.get("host") == host
-                and hmac.compare_digest(request.path_params.get("token", ""), token)
-                and (request.method == "GET" or request.headers.get("origin") == "http://" + host))
+    def nope():
+        return page("Not found", "<p>Not found.</p>", 404)
 
-    async def form_page(request: Request):
+    def allowed(request):
+        if request.headers.get("host") != host:
+            return False
+        if not hmac.compare_digest(request.cookies.get("sp_setup", ""), session):
+            return False
+        return request.method == "GET" or request.headers.get("origin") == "http://" + host
+
+    async def enter(request: Request):
+        if request.headers.get("host") != host or used["entered"] \
+                or not hmac.compare_digest(request.path_params.get("token", ""), token):
+            return nope()
+        used["entered"] = True                                  # one-time: the URL secret is spent now
+        response = RedirectResponse("/setup", status_code=303)
+        response.set_cookie("sp_setup", session, httponly=True, samesite="strict", path="/")
+        return response
+
+    def progress(status):
+        rows = "".join("<li>%s %s</li>" % ("&#10003;" if status[k] in ("ok", "complete", "done") else "&#9675;", html.escape(t))
+                       for k, t in _STAGES)
+        return "<ul>%s</ul>" % rows
+
+    def next_step(status, note=""):
+        if status["config"] == "ok" and status["proposal"] == "ok" and status["state"] == "complete" \
+                and status["system"] == "done":
+            return page("Setup finished", "<h1>Setup is finished</h1>%s<p>Nothing is running yet. Open <b>StyNpilot Doctor</b> "
+                        "from the menu to check everything. Starting the services is a separate step that needs your "
+                        "approval.</p>" % progress(status))
+        if status["config"] == "ok" and status["proposal"] == "ok" and status["state"] == "complete":
+            return page("Almost done", "<h1>One step left</h1>%s%s<p>Your computer will ask for your password. You can cancel "
+                        "and come back: nothing is lost.</p><form method=post action=/setup/system><button>Allow system "
+                        "part</button></form>" % (note, progress(status)))
+        return page("Resume setup", "<h1>Setup was not finished</h1>%s%s<form method=post action=/setup/resume>"
+                    "<button>Continue where I left off</button></form>" % (note, progress(status)))
+
+    async def home_page(request: Request):
         if not allowed(request):
-            return page("Not found", "<p>Not found.</p>", 404)
-        rows = "".join("<label>%s</label><input name=%s autocomplete=off><small>%s</small>"
-                       % (html.escape(LABELS[n][0]), n, html.escape(LABELS[n][1])) for n in FIELDS)
+            return nope()
+        status = setup_status(home, uid, root_config)
+        if status["config"] != "missing":
+            return next_step(status)
+        found = discover_pairing_db(home) or ""
+        rows = "".join("<label>%s</label><input name=%s autocomplete=off value='%s'><small>%s</small>"
+                       % (html.escape(LABELS[n][0]), n, html.escape(found if n == "pairing_db" else ""),
+                          html.escape(LABELS[n][1])) for n in FIELDS)
         return page("StyNpilot setup", "<h1>StyNpilot first-time setup</h1><p>Nothing starts or changes until you finish "
-                    "the last step. Your existing sign-in, pairing and Preview26 are not modified.</p>"
-                    "<form method=post action=/setup/%s/save>%s<button>Save and prepare</button></form>" % (token, rows))
+                    "the last step. Your existing sign-in, pairing and Preview26 are not modified. This page can be "
+                    "closed and reopened at any time: setup resumes where it stopped.</p>"
+                    "<form method=post action=/setup/save>%s<button>Save and prepare</button></form>" % rows)
 
     async def save(request: Request):
         if not allowed(request):
-            return page("Not found", "<p>Not found.</p>", 404)
+            return nope()
         values = {k: v for k, v in (await request.form()).items() if isinstance(v, str) and len(v) < 512}
         try:
-            done = setup(values, home, uid)
+            status = setup(values, home, uid, root_config)
         except ConfigError as error:
-            return page("Check the form", "<h1>Not saved</h1><p>%s</p><p><a href=/setup/%s>Back</a></p>"
-                        % (html.escape(str(error)), token), 400)
-        return page("Almost done", "<h1>Saved</h1><p>Your settings were saved privately.</p><p>Last step: allow the "
-                    "system part. Your computer will ask for your password.</p><form method=post action=/setup/%s/system>"
-                    "<input type=hidden name=go value=1><button>Allow system part</button></form>" % token) \
-            if done else page("Error", "<p>Nothing saved.</p>", 500)
+            return page("Check the form", "<h1>Not saved</h1><p>%s</p><p><a href=/setup>Back</a></p>"
+                        % html.escape(str(error)), 400)
+        return next_step(status)
+
+    async def resume(request: Request):
+        if not allowed(request):
+            return nope()
+        try:
+            status = setup(None, home, uid, root_config)
+        except ConfigError as error:
+            return page("Cannot resume safely", "<h1>Stopped, nothing was changed</h1><p>%s</p><p>Run <b>StyNpilot Doctor</b> "
+                        "or restore a backup.</p>" % html.escape(str(error)), 400)
+        return next_step(status)
 
     async def system(request: Request):
         if not allowed(request):
-            return page("Not found", "<p>Not found.</p>", 404)
+            return nope()
+        status = setup_status(home, uid, root_config)
+        if not (status["config"] == "ok" and status["proposal"] == "ok" and status["state"] == "complete"):
+            return page("Not ready", "<h1>Not ready for this step</h1><p><a href=/setup>Back</a></p>", 400)
         result = runner(str(default_paths(home)["proposed"]))
-        if getattr(result, "returncode", 1) != 0:
-            return page("Not completed", "<h1>The system step did not finish</h1><p>Nothing was started. You can "
-                        "close this and try again from the menu.</p>", 400)
-        return page("Done", "<h1>Setup finished</h1><p>Nothing is running yet. Run <b>StyNpilot Doctor</b> from the menu "
-                    "to check everything. Starting the services is a separate step that needs your approval.</p>")
-    return Starlette(routes=[Route("/setup/{token}", form_page), Route("/setup/{token}/save", save, methods=["POST"]),
-                             Route("/setup/{token}/system", system, methods=["POST"])])
+        status = setup_status(home, uid, root_config)
+        if getattr(result, "returncode", 1) != 0 or status["system"] != "done":
+            return next_step(status, "<p><b>The system step did not finish</b> (cancelled or refused). Nothing was "
+                                     "started. You can try again.</p>")
+        mark_complete(home)
+        return next_step(setup_status(home, uid, root_config))
+    return Starlette(routes=[Route("/setup/{token}", enter), Route("/setup", home_page),
+                             Route("/setup/save", save, methods=["POST"]), Route("/setup/resume", resume, methods=["POST"]),
+                             Route("/setup/system", system, methods=["POST"])])
 
 
 def serve(home=None, uid=None, open_browser=True):                     # pragma: no cover - interactive wrapper

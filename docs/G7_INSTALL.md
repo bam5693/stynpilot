@@ -11,3 +11,28 @@ Nothing here is deployed yet. G8 (owner-approved upgrade of the Ryzen) will give
   Restoring keeps revoked AI connectors revoked. A normal start never recreates lost state on its own.
 - **Roll back the package:** `sudo apt remove stynpilot`. This removes only the program; your settings, state and Preview26
   stay. `sudo apt install ./older.deb` brings back an earlier build.
+
+## Setup can be resumed (G7 review corrections)
+
+Setup is a set of small, ordered stages: owner settings, the proposed installer settings, owner state, then the one
+system step (the password prompt). If the window is closed, the prompt is cancelled or the computer stops part-way,
+open **StyNpilot Setup** again and choose **Continue where I left off**. Existing settings and revocations are never
+rewritten. If the saved settings differ from what is now typed, are loose (not private), or were tampered with, setup
+stops and changes nothing. If setup had finished and the owner state later disappears, it is **not** recreated:
+restore a backup. The setup link in the browser works once and then becomes a private session.
+
+## Three different kinds of recovery
+
+| Kind | Holds | Made / restored by |
+|---|---|---|
+| Owner state | requests, revoked clients, token revocations | `stynpilot backup` / `restore` (as the owner) |
+| Software-install rollback records | root ledgers `installs.sqlite3`, `runs.sqlite3`, `snapshots/`, attention records | `stynpilot root-backup` / `root-restore` (graphical password prompt, fixed helper) |
+| Preview26 rollback | existing Preview26 mechanism | unchanged; not touched by StyNpilot |
+
+Backups carry an exact manifest with their kind; a backup of the wrong kind or a partial one is refused. Manifest
+hashes detect damage; they are **not** a signature and do not prove who made the backup.
+
+## Acceptance script
+
+`tools/isolated_install_check.sh` exits nonzero on the first false assertion. `SP_INJECT=<name>` breaks one invariant
+on purpose (`enable_unit`, `etc_created`, `allow_overwrite`, `keep_state`, `remove_config`) to prove it can fail.

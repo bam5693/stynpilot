@@ -2,7 +2,7 @@
 Type=Application
 Name=StyNpilot Doctor
 Comment=Check StyNpilot's health and permissions (changes nothing)
-Exec=sh -c '/usr/bin/stynpilot doctor; echo; read -r -p "Press Enter to close" _'
+Exec=/usr/bin/stynpilot doctor --html
 Icon=utilities-system-monitor
 Categories=System;
-Terminal=true
+Terminal=false

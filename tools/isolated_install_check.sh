@@ -1,54 +1,157 @@
 #!/bin/sh
 # Disposable-machine acceptance check for the .deb. Run as root INSIDE a throwaway Ubuntu 26.04 chroot/VM/container
-# (never on the live Ryzen). Usage: isolated_install_check.sh /path/to/stynpilot_X_all.deb /path/to/repo/tests
-# It installs the package, proves nothing starts, exercises setup/doctor/backup/restore as an unprivileged user,
-# the polkit root step's file handling, remove/reinstall (rollback of the package) and that state survives.
+# (never on the live Ryzen).  Usage: isolated_install_check.sh /path/to/stynpilot_X_all.deb /path/to/repo/tests
+# EVERY assertion is mandatory: the first one that is false prints FAIL and the script exits nonzero. The last line
+# is "RESULT: PASS <deb sha256>" and exit status 0 only if all of them held.
+# Self-test: SP_INJECT=<name> deliberately breaks one invariant; the script must then FAIL (see tests/test_g7.py).
 set -eu
-DEB="$1"; TESTS="$2"; U=nobody; UIDN=$(id -u $U)
+export PYTHONDONTWRITEBYTECODE=1
+DEB="$1"; TESTS="$2"; U=nobody; UIDN=$(id -u $U); INJECT="${SP_INJECT:-}"
+OUT=$(mktemp); trap 'rm -f "$OUT"' EXIT
 say() { printf '\n== %s\n' "$*"; }
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$DEB" >/dev/null
-H=/tmp/spcheck; rm -rf "$H"; mkdir -p "$H"; chown $U "$H"; chmod 700 "$H"
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+inject() { [ "$INJECT" = "$1" ]; }
+assert_absent() { [ ! -e "$1" ] && [ ! -L "$1" ] || fail "$2 ($1 exists)"; }
+assert_present() { [ -e "$1" ] || fail "$2 ($1 missing)"; }
+assert_ok() { d="$1"; shift; "$@" >"$OUT" 2>&1 || { cat "$OUT" >&2; fail "$d (exit $?)"; }; cat "$OUT"; }
+assert_refused() { d="$1"; shift; if "$@" >"$OUT" 2>&1; then cat "$OUT" >&2; fail "$d: expected a refusal but it succeeded"; fi; cat "$OUT"; }
+assert_said() { grep -q -- "$1" "$OUT" || { cat "$OUT" >&2; fail "$2: expected output containing '$1'"; }; }
+H=/tmp/spcheck
 as_user() { setpriv --reuid=$U --regid=nogroup --clear-groups env HOME="$H" "$@"; }
-say "1. installing started/enabled nothing"
-test ! -e /etc/systemd/system/multi-user.target.wants/stynpilot-installer.service && echo "no unit enabled: OK"
-test ! -e /etc/stynpilot && echo "no /etc/stynpilot created: OK"
-say "2. doctor before setup (read-only)"; as_user stynpilot doctor || true
-say "3. fake pairing database (test fixture), then first-run setup logic as the owner"
-as_user python3 -I - <<PY
-import sys, time
+helper() { PKEXEC_UID=$UIDN /usr/libexec/stynpilot/root-helper "$@"; }
+
+say "0. start from a clean machine; package hash"
+HASH=$(sha256sum "$DEB" | cut -d' ' -f1); echo "deb sha256 $HASH"
+rm -rf "$H" /etc/stynpilot /var/lib/stynpilot-installer /etc/systemd/system/multi-user.target.wants/stynpilot-installer.service
+mkdir -p "$H"; chown $U "$H"; chmod 700 "$H"
+inject enable_unit && { mkdir -p /etc/systemd/system/multi-user.target.wants; ln -s /usr/lib/systemd/system/stynpilot-installer.service /etc/systemd/system/multi-user.target.wants/stynpilot-installer.service; }
+inject etc_created && mkdir -p /etc/stynpilot
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$DEB" >/dev/null 2>&1 || fail "package did not install"
+
+say "1. installing started/enabled/created nothing"
+assert_absent /etc/systemd/system/multi-user.target.wants/stynpilot-installer.service "no system unit enabled"
+assert_absent /etc/systemd/user/default.target.wants/stynpilot-owner.service "no user unit enabled"
+assert_absent /etc/stynpilot "no system configuration created"
+assert_absent /var/lib/stynpilot-installer "no installer state created"
+assert_present /usr/bin/stynpilot "program installed"
+assert_present /usr/libexec/stynpilot/root-helper "root helper installed"
+
+say "2. doctor before setup (read-only)"
+assert_ok "doctor runs before setup" as_user /usr/bin/stynpilot doctor
+assert_said "not set up yet" "doctor reports setup missing"
+assert_absent "$H/.config/stynpilot" "doctor created nothing"
+
+say "3. first-run setup as the owner (interrupted at every stage, then resumed)"
+as_user python3 -IB - <<PY || fail "setup scenario"
+import sys, time, os
 sys.path[:0] = ["/usr/lib/stynpilot/lib", "/usr/lib/stynpilot/vendor", "$TESTS"]
+from pathlib import Path
 from legacy_pairing import make_pairing_db
 from stynpilot.identity import account_id
-owner = account_id(verified_issuer="https://tenant.example.auth/", verified_subject="auth0|fixture")
-from pathlib import Path
-make_pairing_db(Path("$H/pair"), [("dtdev_FIXTUREdevice", owner, time.time() + 3600, None, ["workspace.propose"])])
-import os
 from stynpilot import setup_wizard
-pdb = next(p for p in os.scandir("$H/pair")).path
-print(setup_wizard.run_setup({"issuer": "tenant.example.auth", "approval_client_id": "approval-app",
-  "approval_public_host": "pc.example.test:8444", "mcp_public_host": "pc.example.test", "pairing_db": pdb,
-  "chatgpt_client_id": "cg", "claude_client_id": "cl"}, "$H", $UIDN))
+from stynpilot.service import ConfigError
+H = Path("$H")
+owner = account_id(verified_issuer="https://tenant.example.auth/", verified_subject="auth0|fixture")
+make_pairing_db(H / ".local/state/stynpilot-owner", [("dtdev_FIXTUREdevice", owner, time.time() + 3600, None, ["workspace.propose"])])
+pdb = H / ".local/state/stynpilot-owner/pairing.sqlite3"
+if not pdb.exists():
+    pdb = next(p for p in (H / ".local/state/stynpilot-owner").iterdir() if p.suffix in (".db", ".sqlite3"))
+assert setup_wizard.discover_pairing_db(H) == str(pdb), "pairing database not auto-discovered"
+form = {"issuer": "tenant.example.auth", "approval_client_id": "approval-app", "approval_public_host": "pc.example.test:8444",
+        "mcp_public_host": "pc.example.test", "pairing_db": str(pdb), "chatgpt_client_id": "cg", "claude_client_id": "cl"}
+status = setup_wizard.resume_setup(form, H, $UIDN)
+assert status["config"] == "ok" and status["proposal"] == "ok" and status["state"] == "complete", status
+assert setup_wizard.resume_setup(None, H, $UIDN)["state"] == "complete"            # idempotent resume
+try:
+    setup_wizard.resume_setup(dict(form, approval_client_id="other"), H, $UIDN); raise SystemExit("mismatch accepted")
+except ConfigError:
+    pass
+print("setup ok", status)
 PY
-ls -l "$H/.config/stynpilot" "$H/.local/state/stynpilot"
-say "4. root step (what polkit runs), for exactly the caller; second run must refuse"
-PKEXEC_UID=$UIDN stynpilot root-setup --from "$H/.config/stynpilot/installer.proposed.json"
-ls -l /etc/stynpilot/installer.json
-PKEXEC_UID=$UIDN stynpilot root-setup --from "$H/.config/stynpilot/installer.proposed.json" && echo "UNEXPECTED: overwrote" || echo "second run refused: OK"
-say "5. doctor after setup"; as_user stynpilot doctor --config "$H/.config/stynpilot/owner.json" || true
-say "6. backup, lose state, service refuses to start, restore, state identical"
-as_user stynpilot backup --config "$H/.config/stynpilot/owner.json" --out "$H/backup.tar"
+assert_present "$H/.config/stynpilot/owner.json" "owner settings written"
+assert_present "$H/.local/state/stynpilot/provisioned.json" "state provisioned"
+
+say "4. the polkit root step (run directly as the helper does), for exactly the caller"
+assert_ok "root step writes the installer config" helper root-setup --from "$H/.config/stynpilot/installer.proposed.json"
+[ "$(stat -c %a /etc/stynpilot/installer.json)" = 600 ] || fail "installer config must be 0600"
+[ "$(stat -c %U /etc/stynpilot/installer.json)" = root ] || fail "installer config must be root-owned"
+inject allow_overwrite && rm -f /etc/stynpilot/installer.json
+assert_refused "a second root step must be refused" helper root-setup --from "$H/.config/stynpilot/installer.proposed.json"
+assert_said "FileExistsError" "second root step refusal reason"
+assert_refused "root helper refuses an unknown job" helper rm-rf /
+
+say "5. doctor after setup"
+assert_ok "doctor runs after setup" as_user /usr/bin/stynpilot doctor --config "$H/.config/stynpilot/owner.json"
+assert_said "owner state files" "doctor sees the state"
+assert_said "Nothing was changed" "doctor says it changed nothing"
+
+say "6. owner backup, lose state, service REFUSES to start, restore, identical"
+assert_ok "owner backup" as_user /usr/bin/stynpilot backup --config "$H/.config/stynpilot/owner.json" --out "$H/owner.tar"
 before=$(cd "$H/.local/state/stynpilot" && sha256sum revoked-clients.json provisioned.json)
-rm -rf "$H/.local/state/stynpilot"/*
-as_user stynpilot service owner --config "$H/.config/stynpilot/owner.json" 2>&1 | tail -1 || true
-as_user stynpilot restore --config "$H/.config/stynpilot/owner.json" --archive "$H/backup.tar"
+inject keep_state || rm -rf "$H/.local/state/stynpilot"/*
+assert_refused "service must refuse to start without its state" as_user /usr/bin/stynpilot service owner --config "$H/.config/stynpilot/owner.json"
+assert_said "not_provisioned_or_state_missing" "refusal is because the state is missing"
+assert_absent "$H/.local/state/stynpilot/revoked-clients.json" "the service did not recreate the revocation list"
+assert_ok "owner restore" as_user /usr/bin/stynpilot restore --config "$H/.config/stynpilot/owner.json" --archive "$H/owner.tar"
 after=$(cd "$H/.local/state/stynpilot" && sha256sum revoked-clients.json provisioned.json)
-[ "$before" = "$after" ] && echo "restored state identical: OK"
-say "7. remove then reinstall the package: package files go, config and state stay"
-DEBIAN_FRONTEND=noninteractive apt-get remove -y stynpilot >/dev/null
-test ! -e /usr/bin/stynpilot && echo "program removed: OK"
-test -e /etc/stynpilot/installer.json && test -e "$H/.local/state/stynpilot/revoked-clients.json" && echo "config and state preserved: OK"
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$DEB" >/dev/null
-stynpilot version
-say "8. owner service with the issuer unreachable exits cleanly instead of hanging"
-as_user timeout 60 stynpilot service owner --config "$H/.config/stynpilot/owner.json" 2>&1 | tail -1 || true
-say "DONE"
+[ "$before" = "$after" ] || fail "restored owner state is not identical"
+assert_refused "owner restore must not overwrite" as_user /usr/bin/stynpilot restore --config "$H/.config/stynpilot/owner.json" --archive "$H/owner.tar"
+
+say "7. root-side records: backup, complete-set validation, restore (separate from owner state)"
+python3 -IB - <<PY || fail "build installer state fixture"
+import sys; sys.path[:0] = ["/usr/lib/stynpilot/lib", "/usr/lib/stynpilot/vendor"]
+import json, hashlib, os
+from pathlib import Path
+from cryptography.hazmat.primitives.asymmetric import rsa
+import jwt
+from stynpilot.broker.executor import Executor
+from stynpilot.broker.proof import ProofVerifier
+key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+pub = jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key(), as_dict=True); pub.update(kid="k1", use="sig", alg="RS256")
+v = ProofVerifier(issuer="https://tenant.example.auth/", approval_client_id="approval-app", jwks={"keys": [pub]})
+Executor(state_dir="/var/lib/stynpilot-installer", owner="acct_" + "0" * 40, device="dtdev_FIXTUREdevice", verifier=v)
+snap = Path("/var/lib/stynpilot-installer/snapshots/abc123"); (snap / "debs").mkdir(parents=True); (snap / "files").mkdir()
+deb = b"fake deb bytes"; (snap / "debs" / "htop_1.deb").write_bytes(deb)
+(snap / "manifest.json").write_text(json.dumps({"debs": {"htop": {"version": "1", "file": "htop_1.deb", "sha256": hashlib.sha256(deb).hexdigest()}}, "files": {}}))
+PY
+ROOTTAR="$H/root.tar"
+assert_ok "root backup" helper root-backup --out "$ROOTTAR"
+[ "$(stat -c %U $ROOTTAR)" = "$U" ] || fail "root backup must be owned by the caller"
+[ "$(stat -c %a $ROOTTAR)" = 600 ] || fail "root backup must be 0600"
+assert_refused "a root backup must never overwrite a file" helper root-backup --out "$ROOTTAR"
+assert_refused "an owner backup must not be accepted as root records" helper root-restore --archive "$H/owner.tar"
+assert_said "this_is_a_owner_backup_not_a_root_one" "kind confusion is named"
+cp "$ROOTTAR" "$H/tampered.tar"; chown $U "$H/tampered.tar"; chmod 600 "$H/tampered.tar"
+python3 -IB - <<PY
+import tarfile, io
+src = tarfile.open("$ROOTTAR"); dst = tarfile.open("$H/tampered2.tar", "w")
+for m in src.getmembers():
+    d = src.extractfile(m).read()
+    if m.name.endswith("htop_1.deb"): d = b"changed"; m.size = len(d)
+    dst.addfile(m, io.BytesIO(d))
+dst.close()
+PY
+chown $U "$H/tampered2.tar"; chmod 600 "$H/tampered2.tar"
+rm -rf /var/lib/stynpilot-installer/*
+assert_refused "a tampered root archive must be refused" helper root-restore --archive "$H/tampered2.tar"
+assert_ok "root restore into an empty folder" helper root-restore --archive "$ROOTTAR"
+assert_present /var/lib/stynpilot-installer/runs.sqlite3 "runs ledger restored"
+assert_present /var/lib/stynpilot-installer/snapshots/abc123/debs/htop_1.deb "snapshot restored"
+assert_refused "root restore must not overwrite" helper root-restore --archive "$ROOTTAR"
+
+say "8. remove the package: only the program goes; config and state stay; reinstall works"
+DEBIAN_FRONTEND=noninteractive apt-get remove -y stynpilot >/dev/null 2>&1 || fail "package did not remove"
+assert_absent /usr/bin/stynpilot "program removed"
+assert_absent /usr/lib/stynpilot "package files removed"
+inject remove_config && rm -f /etc/stynpilot/installer.json
+assert_present /etc/stynpilot/installer.json "installer config preserved"
+assert_present "$H/.local/state/stynpilot/revoked-clients.json" "owner state preserved"
+assert_present /var/lib/stynpilot-installer/snapshots/abc123/manifest.json "rollback records preserved"
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$DEB" >/dev/null 2>&1 || fail "reinstall failed"
+assert_ok "reinstalled program runs" /usr/bin/stynpilot version
+
+say "9. owner service with the issuer unreachable exits instead of hanging"
+assert_refused "service exits when the issuer can't be reached" as_user timeout 60 /usr/bin/stynpilot service owner --config "$H/.config/stynpilot/owner.json"
+assert_said "OIDCError" "failure reason is the unreachable issuer"
+
+printf '\nRESULT: PASS %s\n' "$HASH"

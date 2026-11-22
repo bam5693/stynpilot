@@ -189,6 +189,9 @@ class BrokerClient:
             raise BrokerRefused(str(reply.get("error", "installer_refused")))
         return reply
 
+    def status(self, request_id):
+        return self._ask({"op": "status", "request_id": request_id}, 30)["status"]
+
     def challenge(self, payload, decision):
         return self._ask({"op": "challenge", "payload": payload, "decision": decision}, 30)["challenge"]
 

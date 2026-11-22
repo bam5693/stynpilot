@@ -389,6 +389,36 @@ class BrokerTests(unittest.TestCase):
         other = dict(payload, expires_at=self.other_expiry(payload))
         self.denied("owner_intervention_required", restarted.challenge, other, "approve")
 
+    def test_recovery_is_only_claimed_when_settings_and_marks_are_verified_too(self):
+        import stynpilot.broker.executor as module
+        for label in ("marks", "settings file"):
+            with self.subTest(label):
+                payload = self.upgrade_setup()
+                self.machine.fail_install = True                       # install fails; versions come back by themselves
+                real_copy, calls = module.shutil.copy2, []
+                if label == "marks":
+                    self.machine.fail_marks = True
+                else:
+                    def flaky(src, dst, *a, **k):
+                        calls.append(1)
+                        if len(calls) >= 2:                            # first copy = backup, later = restore
+                            raise OSError("read-only filesystem")
+                        return real_copy(src, dst, *a, **k)
+                    module.shutil.copy2 = flaky
+                    self.addCleanup(setattr, module.shutil, "copy2", real_copy)
+                try:
+                    result = self.install(payload)
+                finally:
+                    module.shutil.copy2 = real_copy
+                self.assertEqual((result["ok"], result["restored_from_backup"], result["needs_owner_intervention"]),
+                                 (False, False, True))
+                self.assertEqual(self.machine.installed["libnl-3-200"], "3.6.0")       # versions matched...
+                rid = request_id(payload)[0]
+                self.assertEqual(self.executor.runs.status(rid)["state"], "needs_owner_intervention")   # ...still not claimed
+                self.assertEqual(self.executor.needs_attention(), [rid + ".json"])
+                other = dict(payload, expires_at=self.other_expiry(payload))
+                self.denied("owner_intervention_required", self.executor.challenge, other, "approve")
+
     def test_a_run_interrupted_by_a_crash_is_recorded_on_restart(self):
         payload = self.plan()
         rid = request_id(payload)[0]

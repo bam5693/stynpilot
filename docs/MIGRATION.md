@@ -20,6 +20,10 @@ Device IDs, hostnames, emails, Auth0 values and backup data are never copied.
 | `stynpilot/server/app.py` | `customer_mcp_server.py` | Read-only tools only for now; optional `[server]` extra (MCP SDK 1.x) |
 | `stynpilot/devices.py` | `auth0_pairing_adapter.PairingDeviceGrantStore`, `device_permissions.SQLiteDevicePermissions` | Reads the **existing** pairing database (schema 2) read-only with the same answers, so the upgrade keeps the pairing; unknown scopes fail closed |
 | `stynpilot/server/oidc.py` | `oidc_provider.py` | Same strict discovery checks; injectable fetch for offline tests |
+| `stynpilot/server/clients.py` | `AIClientRegistry`/`AIIdentityVerifier` checks in `src/commander_ai_endpoint.py` | Applied to every propose tool: identified + enrolled + not revoked + no review scope; per-assistant revocation |
+| `stynpilot/requests.py` | the request queue inside `commander_composition` / `submit_proposal` | Standalone private SQLite queue; request ID = plan hash; per-assistant pending cap; expiry; no AI-facing approve |
+| `stynpilot/catalog.py` | `tools/stynpilot_software_catalog.py` | Entries compile to the **general** validated plan (apt / pinned containers); Forgejo kept as a `legacy` entry; drift test with `service_status.py` |
+| `stynpilot/server/propose_tools.py` | `src/stynpilot_software_tools.py` | Same four tool names; ask-only; owner approval stays separate (G5) |
 | `stynpilot/server/run.py` | `start_health_connection`, `_serve_health_resource_metadata`, `commander_ai_endpoint` metadata helpers | Loopback-only listener, exact host names, RFC 9728 metadata, binds to the one live paired device |
 
 ## Port next (proven, needs adapting)

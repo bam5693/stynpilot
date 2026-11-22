@@ -132,21 +132,28 @@ class ClaudeCodeRunner:
             pieces.extend(("<untrusted_follow_up>", text, "</untrusted_follow_up>"))
         return "\n".join(pieces)
 
-    def _command(self, prompt: str) -> list[str]:
+    def _command(self) -> list[str]:
+        # Claude Code permission patterns use //path for absolute paths. Do not
+        # interpolate a path's leading slash after the // prefix, or the result
+        # becomes ///path and no longer denotes the intended root path.
+        home_root = self.worker_home.as_posix().lstrip("/")
         settings = {
             "permissions": {
                 "blockReadsOutsideWorkingDirectories": True,
                 "blockWritesOutsideWorkingDirectories": True,
                 "disableBypassPermissionsMode": True,
                 "deny": [
-                    "Read(//%s/.claude/**)" % self.worker_home,
-                    "Read(//%s/.claude.json)" % self.worker_home,
-                    "Read(.env)", "Read(.env.*)", "Read(secrets/**)",
+                    "Read(//%s/.claude/**)" % home_root,
+                    "Read(//%s/.claude.json)" % home_root,
+                    "Read(.env)", "Read(.env.*)",
+                    "Read(**/.env)", "Read(**/.env.*)",
+                    "Read(secrets/**)", "Read(**/secrets/**)",
                     "Read(**/*.pem)", "Read(**/*.key)",
                 ],
             },
         }
-        return [str(self.claude_executable), "--restricted", "-p", prompt,
+        # Put task data on stdin; process listings expose argv to other local users.
+        return [str(self.claude_executable), "--restricted", "-p",
                 "--permission-mode", "plan", "--tools", self._ALLOWED_TOOLS,
                 "--strict-mcp-config",
                 "--settings", json.dumps(settings, separators=(",", ":")),
@@ -167,13 +174,13 @@ class ClaudeCodeRunner:
             self.board.finish(self.client_id, task_id, lease_id, "failed", "Project has no enrolled workspace")
             return RunnerResult("failed", task_id, note="project_not_enrolled")
         prompt = self._prompt(task)
-        command = self._command(prompt)
+        command = self._command()
         if any("skip-permissions" in arg or "bypassPermissions" in arg for arg in command):
             raise RunnerConfigurationError("Permission bypass flags are prohibited")
 
         try:
             process = self._popen(command, cwd=str(workspace), env=self._environment(),
-                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT, shell=False, start_new_session=True,
                                   close_fds=True)
         except OSError:
@@ -182,19 +189,22 @@ class ClaudeCodeRunner:
 
         output = bytearray()
         selector = selectors.DefaultSelector()
-        assert process.stdout is not None
-        os.set_blocking(process.stdout.fileno(), False)
-        selector.register(process.stdout, selectors.EVENT_READ)
         started = last_report = self._clock()
         exceeded = False
         cancelled = False
+        timed_out = False
         try:
+            assert process.stdin is not None and process.stdout is not None
+            process.stdin.write(prompt.encode("utf-8"))
+            process.stdin.close()
+            os.set_blocking(process.stdout.fileno(), False)
+            selector.register(process.stdout, selectors.EVENT_READ)
             while process.poll() is None:
                 now = self._clock()
                 if now - started >= self.max_runtime:
+                    timed_out = True
                     self._stop(process)
-                    self.board.finish(self.client_id, task_id, lease_id, "failed", "Read-only session timed out")
-                    return RunnerResult("failed", task_id, process.returncode, note="timeout")
+                    break
                 for key, _ in selector.select(timeout=min(self.poll_interval, 0.25)):
                     chunk = os.read(key.fd, min(4096, self.max_output_bytes + 1 - len(output)))
                     if chunk:
@@ -219,10 +229,6 @@ class ClaudeCodeRunner:
                         self._stop(process)
                         break
                     last_report = now
-        except BaseException:
-            self._stop(process)
-            raise
-        try:
             # Drain bytes already emitted at exit, staying within the hard cap.
             if not exceeded:
                 while len(output) <= self.max_output_bytes:
@@ -234,25 +240,49 @@ class ClaudeCodeRunner:
                         break
                     output.extend(chunk)
                 exceeded = len(output) > self.max_output_bytes
+        except BaseException:
+            if process.poll() is None:
+                self._stop(process)
+            raise
         finally:
             selector.close()
-            process.stdout.close()
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            if process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
 
         decoded = bytes(output[:self.max_output_bytes]).decode("utf-8", errors="replace").strip()
         if cancelled:
             return RunnerResult("cancelled", task_id, process.returncode, decoded[-1000:], "lease_lost")
+        if timed_out:
+            if not self._finish_or_cancel(task_id, lease_id, "failed", "Read-only session timed out"):
+                return RunnerResult("cancelled", task_id, process.returncode, decoded[-1000:], "lease_lost")
+            return RunnerResult("failed", task_id, process.returncode, note="timeout")
         if exceeded:
-            self.board.finish(self.client_id, task_id, lease_id, "failed", "Read-only session exceeded output limit")
+            if not self._finish_or_cancel(task_id, lease_id, "failed", "Read-only session exceeded output limit"):
+                return RunnerResult("cancelled", task_id, process.returncode, decoded[-1000:], "lease_lost")
             return RunnerResult("failed", task_id, process.returncode, note="output_limit")
         if process.returncode == 0:
             summary = "Read-only plan completed. No files or system state were changed."
             if decoded:
                 summary += "\n" + decoded[-800:]
-            self.board.finish(self.client_id, task_id, lease_id, "done", summary)
+            if not self._finish_or_cancel(task_id, lease_id, "done", summary):
+                return RunnerResult("cancelled", task_id, process.returncode, decoded[-1000:], "lease_lost")
             return RunnerResult("done", task_id, 0, decoded)
-        self.board.finish(self.client_id, task_id, lease_id, "failed",
-                          "Read-only session failed with exit code %s" % process.returncode)
+        if not self._finish_or_cancel(task_id, lease_id, "failed",
+                                      "Read-only session failed with exit code %s" % process.returncode):
+            return RunnerResult("cancelled", task_id, process.returncode, decoded[-1000:], "lease_lost")
         return RunnerResult("failed", task_id, process.returncode, decoded[-1000:], "cli_failed")
+
+    def _finish_or_cancel(self, task_id: str, lease_id: str, outcome: str, summary: str) -> bool:
+        """A lease revoked after child exit is a normal cancellation race, not a crash."""
+        try:
+            self.board.finish(self.client_id, task_id, lease_id, outcome, summary)
+        except Denied as error:
+            if error.code == "lease_lost":
+                return False
+            raise
+        return True
 
     def _has_subscription_login(self) -> bool:
         """Refuse API-key, Console, and unknown authentication before claiming work."""

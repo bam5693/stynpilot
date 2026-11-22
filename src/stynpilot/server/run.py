@@ -14,13 +14,24 @@ public resource URL.
 """
 from __future__ import annotations
 
-import ipaddress
+import re
 import threading
 import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 READ_SCOPES = frozenset({"health.read"})
+LISTEN_ADDRESS = "127.0.0.1"   # IPv4 loopback only for now (PR #9 review); ::1 needs bracketed URLs
+# A strict DNS host name: labels of letters, digits and inner hyphens, dot-separated, no
+# user-info, port, path, query, fragment, whitespace or percent-encoding.
+_LABEL = r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+PUBLIC_HOST = re.compile(r"(?=.{1,253}\Z)%s(?:\.%s)+\Z" % (_LABEL, _LABEL))
+
+
+def check_public_host(host):
+    if type(host) is not str or not PUBLIC_HOST.fullmatch(host):
+        raise ValueError("Public host must be a plain DNS name such as computer.example.net")
+    return host.lower()
 
 
 def metadata_url(resource):
@@ -53,10 +64,9 @@ def build_app(*, router, public_host, port, scopes=READ_SCOPES):
 
     from .app import create_server
 
-    if type(public_host) is not str or not public_host or "/" in public_host or ":" in public_host:
-        raise ValueError("Exact public host name required")
+    public_host = check_public_host(public_host)
     resource = "https://%s/mcp" % public_host
-    hosts = [public_host, "127.0.0.1:%d" % port]
+    hosts = [public_host, "%s:%d" % (LISTEN_ADDRESS, port)]
     server = create_server(router=router, resource_url=resource, allowed_hosts=hosts)
     app = server.streamable_http_app()
     document = protected_resource_metadata(resource, router.tokens.issuer, scopes)
@@ -82,16 +92,13 @@ class Running:
         self.thread.join(timeout=timeout)
 
 
-def start(*, router, public_host, port, address="127.0.0.1", startup_timeout=15):
-    """Start in a background thread. Refuses any non-loopback address or privileged port."""
-    try:
-        loopback = ipaddress.ip_address(address).is_loopback
-    except ValueError:
-        loopback = False
-    if not loopback:
-        raise PermissionError("The endpoint listens on loopback only")
-    if type(port) is not int or not 1024 < port <= 65535:
+def start(*, router, public_host, port, address=LISTEN_ADDRESS, startup_timeout=15):
+    """Start in a background thread. Only 127.0.0.1, an unprivileged port and a strict host name."""
+    if address != LISTEN_ADDRESS:
+        raise PermissionError("The endpoint listens on 127.0.0.1 only")
+    if type(port) is not int or isinstance(port, bool) or not 1024 < port <= 65535:
         raise PermissionError("Unprivileged port required")
+    check_public_host(public_host)
     import uvicorn
     app = build_app(router=router, public_host=public_host, port=port)
     web = uvicorn.Server(uvicorn.Config(app, host=address, port=port, log_level="warning",

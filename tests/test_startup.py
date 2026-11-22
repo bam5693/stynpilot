@@ -135,9 +135,20 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(self.initialize(self.token(scope="openid")).status_code, 401)
 
     def test_only_loopback_and_unprivileged_ports(self):
-        for address, port in (("0.0.0.0", free_port()), ("192.0.2.1", free_port()), ("127.0.0.1", 80)):
+        for address, port in (("0.0.0.0", free_port()), ("192.0.2.1", free_port()), ("127.0.0.1", 80),
+                              ("::1", free_port()), ("127.0.0.2", free_port()), ("127.0.0.1", True)):
             with self.subTest(address=address, port=port), self.assertRaises(PermissionError):
                 run.start(router=None, public_host=HOST, port=port, address=address)
+
+
+    def test_malformed_public_hosts_fail_before_startup(self):
+        bad = ["", "evil.test@" + HOST, HOST + "?x=1", HOST + "#frag", "has space.test", HOST + ":443",
+               "a%2fb.test", "-lead.test", "trail-.test", "nodot", "x" * 64 + ".test", HOST + "/mcp",
+               "tab\tname.test", "ünicode.test", None, 7]
+        for host in bad:
+            with self.subTest(host=host), self.assertRaises((ValueError, PermissionError)):
+                run.start(router=None, public_host=host, port=free_port())
+        self.assertEqual(run.check_public_host("Computer-1.Tail0a1b2c.ts.net"), "computer-1.tail0a1b2c.ts.net")
 
 
 if __name__ == "__main__":

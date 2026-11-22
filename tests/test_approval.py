@@ -243,6 +243,60 @@ class ApprovalTests(unittest.TestCase):
         self.assertTrue(status["result"]["rollback_id"])
         self.assertIn("htop", self.machine.installed)
 
+    def test_install_succeeds_but_the_installer_cannot_save_its_result_never_reports_nothing_changed(self):
+        payload, rid = self.file()
+        shown, started, finish = self.decide(rid, "approve")
+        executor, real = self.executor, self.executor.runs.finish
+
+        def failing_save(request_id, state, result):
+            if state == "done":
+                raise OSError("disk full")                              # packages are installed; result not saved
+            return real(request_id, state, result)
+        executor.runs.finish = failing_save
+
+        class Service:                                                  # what the socket service answers
+            challenge = staticmethod(executor.challenge)
+            status = staticmethod(executor.status)
+            deny = staticmethod(executor.deny)
+            rollback = staticmethod(executor.rollback)
+
+            @staticmethod
+            def install(*args):
+                try:
+                    return executor.install(*args)
+                except Exception as error:
+                    raise SimpleNamespaceError("unexpected_%s" % type(error).__name__)
+        self.flow.broker = Service
+        self.assertEqual(self.brief(finish()), {"state": "needs_owner_intervention", "ok": False})
+        self.assertIn("htop", self.machine.installed)                  # it really did install
+        status = self.flow.status(rid)
+        self.assertEqual(status["state"], "needs_owner_intervention")
+        self.assertIsNone(status["result"]["changed_anything"])        # unknown, never False
+        self.assertTrue(status["result"]["needs_owner_intervention"])
+        self.assertTrue(self.executor.needs_attention())               # durable owner-check record at the root
+        other, other_rid = self.file(payload=dict(payload, expires_at=self.other_expiry(payload)))
+        with self.assertRaises(Exception) as refused:                  # and no new install until the owner checks
+            self.executor.challenge(other, "approve")
+        self.assertIn("owner_intervention_required", str(refused.exception) + getattr(refused.exception, "code", ""))
+
+    def test_a_refusal_code_alone_is_not_proof_when_the_installer_record_says_it_started(self):
+        payload, rid = self.file()
+        shown, started, finish = self.decide(rid, "approve")
+        executor = self.executor
+
+        class Misleading:
+            challenge = staticmethod(executor.challenge)
+            status = staticmethod(executor.status)
+            deny = staticmethod(executor.deny)
+            rollback = staticmethod(executor.rollback)
+
+            @staticmethod
+            def install(*args):
+                executor.install(*args)                                 # ran fully at the root
+                raise SimpleNamespaceError("plan_invalid_or_expired")   # but a "pre-change" looking code arrives
+        self.flow.broker = Misleading
+        self.assertEqual(self.brief(finish()), {"state": "done", "ok": True})   # the root's own record wins
+
     def test_connection_drop_when_the_root_state_is_unknown_asks_the_owner_to_verify(self):
         payload, rid = self.file()
         shown, started, finish = self.decide(rid, "approve")

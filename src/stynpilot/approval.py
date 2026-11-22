@@ -206,12 +206,16 @@ class ApprovalFlow:
         return "done" if result.get("ok") else "failed"
 
     def _after_error(self, rid, error):
-        """The installer call raised. A definite refusal (bad proof, drift...) means nothing ran. A dropped
-        connection could mean it ran: ask the installer's own record instead of guessing."""
+        """The installer call raised. A refusal code alone proves nothing (the installer may have installed
+        packages and then failed to save its result), so ask the installer's own durable record:
+        no run recorded -> verified nothing ran; a finished record -> its real result; anything else
+        (still 'running', unreachable, unknown) -> the owner must verify."""
         code = getattr(error, "code", None)
-        if code is not None and code != "installer_unavailable":
-            return {"ok": False, "stopped": code, "changed_anything": False}
-        return self._root_result(rid)
+        result = self._root_result(rid)
+        if result.get("stopped") == "installer_never_received_it":
+            stopped = code if code and code != "installer_unavailable" else "installer_never_received_it"
+            return {"ok": False, "stopped": stopped, "changed_anything": False}
+        return result
 
     def _root_result(self, rid):
         """The installer's durable record for this request, as a result; unknown means the owner must verify."""

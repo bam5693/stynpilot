@@ -63,12 +63,14 @@ def render_summary(payload):
     if payload.get("kind") == "rollback":
         return ["Roll back %s (install %s)." % (payload.get("software"), str(payload.get("rollback_id"))[:12]),
                 "Packages that install added are removed (their settings files are kept); packages it "
-                "upgraded go back to their saved earlier versions.",
+                "upgraded go back to their saved earlier versions. Application data and other changes are not restored.",
                 "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")]
     lines = ["Install %s on device ending ...%s." % (payload.get("software"), str(payload.get("device"))[-4:])]
     for step in payload.get("steps", []):
         for package in step.get("packages", []):
             lines.append("Package %s, exact version %s, from the Ubuntu archive." % (package["name"], package["version"]))
+    lines.append("Backup limits: this saves the packages it changes and their tracked settings files so they can be "
+                 "rolled back. It is not a full system snapshot: application data and other changes are not restored.")
     lines.append("Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z"))
     return lines
 

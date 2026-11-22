@@ -21,6 +21,12 @@ class FakeMachine:
         self.commands, self.fail_install = [], False
         self.removes_on_install = []                     # shows up in the simulation
         self.extra_on_install = {}                       # silently installed by the real install
+        self.also_offered_by = {}                        # name -> "Evil": same version also in a third-party source
+        self.sim_origin = {}                             # name -> origin text apt would report when simulating
+        self.config = []                                 # extra `apt-config dump` lines
+        self.bad_hash = set()                            # names whose index hash differs from the file apt fetches
+        self.ambiguous_hash = set()                      # names listed with two different hashes
+        self.config_ok = True
 
     def changes(self):
         return [c for c in self.commands if c[:2] in (["apt-get", "install"], ["apt-get", "remove"])
@@ -64,6 +70,20 @@ class FakeMachine:
             names = set(argv[argv.index("--") + 1:])
             self.manual = (self.manual | names) if argv[1] == "manual" else (self.manual - names)
             return 0, ""
+        if tool == "apt-config":
+            return (0, "".join(l + "\n" for l in ["Acquire::Languages \"none\";", *self.config])) if self.config_ok else (1, "")
+        if tool == "apt-cache" and argv[1] == "show":
+            name, _, version = argv[-1].partition("=")
+            if not self._downloadable(name, version):
+                return 100, "E: no such version\n"
+            import hashlib
+            digest = hashlib.sha256(b"deb:%s:%s" % (name.encode(), version.encode())).hexdigest()
+            if name in self.bad_hash:
+                digest = "0" * 64
+            out = "Package: %s\nVersion: %s\nSHA256: %s\n" % (name, version, digest)
+            if name in self.ambiguous_hash:
+                out += "\nPackage: %s\nVersion: %s\nSHA256: %s\n" % (name, version, "1" * 64)
+            return 0, out
         if tool == "apt-cache":
             return self._policy(argv)
         if tool != "apt-get":
@@ -109,7 +129,8 @@ class FakeMachine:
             for name, version in plan:
                 if self.installed.get(name) != version:
                     old = self.installed.get(name)
-                    lines.append("Inst %s%s (%s Ubuntu:24.04/noble [amd64])\n" % (name, " [%s]" % old if old else "", version))
+                    origin = self.sim_origin.get(name, "Ubuntu:24.04/noble")
+                    lines.append("Inst %s%s (%s %s [amd64])\n" % (name, " [%s]" % old if old else "", version, origin))
             return 0, "".join(lines) + "".join("Remv %s [1]\n" % r for r in self.removes_on_install)
         if self.fail_install:
             name, version = plan[0]
@@ -146,4 +167,7 @@ class FakeMachine:
             origin = self.origin.get(name, "Ubuntu")
             url, suite, _ = next(s for s in sources if s[2] == origin)
             out += "        500 %s %s amd64 Packages\n" % (url, suite)
+            if name in self.also_offered_by:
+                url2, suite2, _ = next(x for x in sources if x[2] == self.also_offered_by[name])
+                out += "        500 %s %s amd64 Packages\n" % (url2, suite2)
         return 0, out

@@ -28,9 +28,14 @@ _PKG = re.compile(r"[a-z0-9][a-z0-9+.-]{0,127}\Z")
 _VER = re.compile(r"[A-Za-z0-9][A-Za-z0-9:~.+-]{0,127}\Z")
 # apt-get -s lines: "Inst htop (3.3.0-4build1 Ubuntu:24.04/noble [amd64])"
 # upgrade/downgrade: "Inst libfoo [1.0-1] (1.1-1 Ubuntu:24.04/noble [amd64])"
-_INST = re.compile(r"^Inst (\S+)(?: \[(\S+)\])? \((\S+) ")
+_INST = re.compile(r"^Inst (\S+)(?: \[(\S+)\])? \((\S+) (.*?)\s*\[")
 _REMV = re.compile(r"^(Remv|Purg) (\S+)")
 _SOURCE_LINE = re.compile(r"^\s+(-?\d+) (\S+) (\S+) (\S+) Packages$")
+_BAD_CONFIG = ("allowunauthenticated", "allowinsecurerepositories", "allowdowngradetoinsecurerepositories",
+               "allowweakrepositories")
+# Always passed to apt on top of whatever the machine's config says: signatures stay on, nothing may be removed.
+SAFE_OPTS = ["-o", "APT::Get::AllowUnauthenticated=false", "-o", "Acquire::AllowInsecureRepositories=false",
+             "-o", "Acquire::AllowDowngradeToInsecureRepositories=false", "-o", "Acquire::AllowWeakRepositories=false"]
 _INSECURE = re.compile(r"trusted\s*[=:]\s*yes|allow-insecure|allow-weak|allow-downgrade-to-insecure", re.I)
 
 
@@ -60,22 +65,24 @@ def _cache_opts(cache):
 
 
 def parse_transaction(out):
-    """({package: new_version}, {package: old_version or None}, [removed]) from apt-get -s output."""
-    installs, olds, removals = {}, {}, []
+    """({package: new_version}, {package: old_version or None}, [removed], {package: [origins]}) from apt-get -s."""
+    installs, olds, removals, origins = {}, {}, [], {}
     for line in out.splitlines():
         m = _INST.match(line)
         if m:
             installs[m.group(1)] = m.group(3)
             olds[m.group(1)] = m.group(2)
+            origins[m.group(1)] = [o.strip() for o in m.group(4).split(",") if o.strip()]
             continue
         r = _REMV.match(line)
         if r:
             removals.append(r.group(2))
-    return installs, olds, removals
+    return installs, olds, removals, origins
 
 
-def simulate_install(names_or_pins, run=real_run, *, cache=None, no_download=False, allow_downgrades=False):
-    argv = ["apt-get", "-s", "-q", "-y", "--no-install-recommends", *_cache_opts(cache)]
+def simulate_install(names_or_pins, run=real_run, *, cache=None, no_download=False, allow_downgrades=False,
+                     with_origins=False):
+    argv = ["apt-get", "-s", "-q", "-y", "--no-install-recommends", *SAFE_OPTS, *_cache_opts(cache)]
     if no_download:
         argv.append("--no-download")
     if allow_downgrades:
@@ -83,8 +90,8 @@ def simulate_install(names_or_pins, run=real_run, *, cache=None, no_download=Fal
     code, out = run(argv + ["install", "--", *names_or_pins])
     if code != 0:
         raise RuntimeError("apt_simulation_failed")
-    installs, _, removals = parse_transaction(out)
-    return installs, removals
+    installs, _, removals, origins = parse_transaction(out)
+    return (installs, removals, origins) if with_origins else (installs, removals)
 
 
 def simulate_remove(names, run=real_run):
@@ -108,17 +115,54 @@ def resolve(names, run=real_run):
 
 
 def untrusted_sources(sources_root="/etc/apt"):
-    """Names of apt source files that switch off signature checking (should be empty)."""
+    """Names of apt source files that switch off signature checking OR can't be read (should be empty).
+
+    Fail closed: a source file that exists but can't be read counts as untrusted.
+    """
     root = Path(sources_root)
     found = []
-    for path in [root / "sources.list", *sorted((root / "sources.list.d").glob("*"))]:
+    try:
+        listing = sorted((root / "sources.list.d").glob("*"))
+    except OSError:
+        return ["sources.list.d"]
+    for path in [root / "sources.list", *listing]:
         try:
+            if not path.exists():
+                continue
             text = path.read_text(errors="replace")
         except OSError:
+            found.append(path.name)
             continue
         if any(_INSECURE.search(line) for line in text.splitlines() if not line.lstrip().startswith("#")):
             found.append(path.name)
     return found
+
+
+def insecure_config(run=real_run):
+    """Effective apt settings (``apt-config dump``) that weaken signature checks. Unreadable config -> refuse."""
+    code, out = run(["apt-config", "dump"])
+    if code != 0 or not out.strip():
+        return ["apt_config_unreadable"]
+    bad = []
+    for line in out.splitlines():
+        key, _, value = line.partition(" ")
+        if value.strip().strip(";").strip('"').lower() in ("true", "1", "yes", "on") \
+                and any(word in key.lower().replace("-", "") for word in _BAD_CONFIG):
+            bad.append(key)
+    return bad
+
+
+def sha256_of_version(name, version, run=real_run):
+    """The set of SHA256 values the package indexes list for this exact version (one value if unambiguous)."""
+    code, out = run(["apt-cache", "show", "--", "%s=%s" % (name, version)])
+    if code != 0:
+        return set()
+    return {line.split(":", 1)[1].strip() for line in out.splitlines() if line.startswith("SHA256:")}
+
+
+def origins_trusted(origins):
+    """True if the sources apt actually chose for a package are all the Ubuntu archive (apt-get -s 'Inst' origin)."""
+    return bool(origins) and all(o.startswith("Ubuntu:") for o in origins)
 
 
 def origin_is_ubuntu(name, version, run=real_run):
@@ -141,6 +185,7 @@ def origin_is_ubuntu(name, version, run=real_run):
     if code != 0:
         return False
     in_version = False
+    offered_by_ubuntu = False
     for line in policy.splitlines():
         parts = line.split()
         if len(parts) >= 2 and parts[-1].isdigit() and not line.startswith("        "):
@@ -151,21 +196,23 @@ def origin_is_ubuntu(name, version, run=real_run):
             if m:
                 release = releases.get((m.group(2), m.group(3)), {})
                 if release.get("o") == "Ubuntu" and release.get("l") == "Ubuntu":
-                    return True
-    return False
+                    offered_by_ubuntu = True
+                else:
+                    return False            # ambiguous: another source offers this very version
+    return offered_by_ubuntu
 
 
 def download(packages, cache, run=real_run):
     """Fetch the exact .deb files into ``cache`` (root-only); apt verifies them against the signed index."""
     Path(cache, "partial").mkdir(parents=True, exist_ok=True, mode=0o700)
-    argv = ["apt-get", "install", "-q", "-y", "--download-only", "--no-install-recommends", "--allow-downgrades",
-            *_cache_opts(cache), "--", *_pins(packages)]
+    argv = ["apt-get", "install", "-q", "-y", "--no-remove", "--download-only", "--no-install-recommends",
+            "--allow-downgrades", *SAFE_OPTS, *_cache_opts(cache), "--", *_pins(packages)]
     return run(argv)[0] == 0
 
 
 def install(packages, run=real_run, *, cache=None, no_download=False, allow_downgrades=False):
-    argv = ["apt-get", "install", "-q", "-y", "--no-install-recommends",
-            "-o", "Dpkg::Options::=--force-confold", *_cache_opts(cache)]
+    argv = ["apt-get", "install", "-q", "-y", "--no-remove", "--no-install-recommends",
+            "-o", "Dpkg::Options::=--force-confold", *SAFE_OPTS, *_cache_opts(cache)]
     if no_download:
         argv.append("--no-download")
     if allow_downgrades:

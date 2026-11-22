@@ -81,6 +81,11 @@ class BrokerTests(unittest.TestCase):
         challenge, token = self.approval(payload, **kw)
         return self.executor.install(payload, token, challenge)
 
+    @staticmethod
+    def other_expiry(payload):
+        """A different, still-valid expiry (so it is a different plan)."""
+        return payload["expires_at"][:-3] + ("30Z" if payload["expires_at"][-3:-1] != "30" else "31Z")
+
     def denied(self, code, fn, *args):
         with self.assertRaises(ExecutionDenied) as caught:
             fn(*args)
@@ -122,7 +127,7 @@ class BrokerTests(unittest.TestCase):
     def test_bad_proofs_change_nothing(self):
         payload = self.plan()
         challenge = self.executor.challenge(payload, "approve")["challenge"]
-        other = dict(payload, expires_at=payload["expires_at"][:-3] + "59Z")
+        other = dict(payload, expires_at=self.other_expiry(payload))
         cases = {
             "proof_missing": "",
             "proof_invalid": self.proof(payload, challenge, key=self.other_key),
@@ -142,7 +147,7 @@ class BrokerTests(unittest.TestCase):
         payload = self.plan()
         challenge, token = self.approval(payload)
         self.assertTrue(self.executor.install(payload, token, challenge)["ok"])
-        self.denied("already_used", self.executor.install, payload, self.proof(payload, challenge, auth_age=20), challenge)
+        self.denied("already_decided_or_used", self.executor.install, payload, self.proof(payload, challenge, auth_age=20), challenge)
         self.denied("already_decided_or_used", self.executor.challenge, payload, "approve")
         self.setUp()
         payload = self.plan()
@@ -154,7 +159,7 @@ class BrokerTests(unittest.TestCase):
     def test_a_challenge_for_one_request_or_decision_never_works_for_another(self):
         payload = self.plan()
         challenge, _ = self.approval(payload)
-        other = dict(payload, expires_at=payload["expires_at"][:-3] + "58Z")
+        other = dict(payload, expires_at=self.other_expiry(payload))
         self.denied("challenge_unknown", self.executor.install, other, self.proof(other, challenge), challenge)
         deny_challenge, deny_token = self.approval(payload, decision="deny")
         self.denied("proof_is_for_a_different_decision", self.executor.install, payload, deny_token, deny_challenge)
@@ -219,21 +224,88 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual((result["stopped"], result["changed_anything"]), ("untrusted_package_source_configured", False))
         self.assertEqual(self.machine.changes(), [])
 
-    def test_drift_or_removals_stop_before_any_change(self):
-        for label, change, codes in (
-                ("new candidate", lambda m: m.available.update({"htop": "3.4.0-1"}), ("download_failed", "package_not_from_the_ubuntu_archive")),
+    def test_extra_packages_under_a_valid_catalog_entry_are_refused_before_any_challenge(self):
+        payload = self.plan()
+        self.machine.available["nano"] = "7.2-1"
+        extra = dict(payload, steps=[{"kind": "apt", "packages": payload["steps"][0]["packages"] + [
+            {"name": "nano", "version": "7.2-1"}]}])
+        self.denied("plan_is_not_the_exact_catalog_closure", self.executor.challenge, extra, "approve")
+        fewer = dict(payload, steps=[{"kind": "apt", "packages": [p for p in payload["steps"][0]["packages"]
+                                                                   if p["name"] != "libnl-3-200"]}])
+        self.denied("plan_is_not_the_exact_catalog_closure", self.executor.challenge, fewer, "approve")
+        self.assertEqual(self.machine.changes(), [])
+        self.assertTrue(self.install(payload)["ok"])                      # the genuine closure still works
+
+    def test_drift_after_the_plan_is_refused_before_the_approval_is_spent(self):
+        for label, change, code in (
+                ("new candidate", lambda m: m.available.update({"htop": "3.4.0-1"}), "plan_is_not_the_exact_catalog_closure"),
                 ("new dependency", lambda m: m.deps.update({"htop": ["libnl-3-200", "libextra1"]}) or m.available.update({"libextra1": "1.0"}),
-                 ("drift_from_approved_plan",)),
-                ("would remove", lambda m: m.removes_on_install.append("bash"), ("would_remove_packages",))):
+                 "plan_is_not_the_exact_catalog_closure"),
+                ("would remove", lambda m: m.removes_on_install.append("bash"), "catalog_resolution_failed")):
             with self.subTest(label):
                 self.setUp()
                 payload = self.plan()
+                challenge, token = self.approval(payload)                  # owner approved the plan as shown
                 change(self.machine)
-                result = self.install(payload)
-                self.assertFalse(result["ok"])
-                self.assertIn(result["stopped"], codes)
-                self.assertIs(result["changed_anything"], False)
+                self.denied(code, self.executor.install, payload, token, challenge)
                 self.assertEqual(self.machine.changes(), [])
+                self.assertEqual(self.executor.runs.status(request_id(payload)[0])["state"], "not_started")
+
+    def test_duplicate_version_in_a_third_party_source_is_ambiguous_and_refused(self):
+        payload = self.plan()
+        self.machine.also_offered_by["htop"] = "Evil"
+        result = self.install(payload)
+        self.assertEqual((result["stopped"], result["changed_anything"]), ("package_not_from_the_ubuntu_archive", False))
+        self.assertEqual(self.machine.changes(), [])
+
+    def test_the_source_apt_actually_picks_must_be_ubuntu(self):
+        payload = self.plan()
+        self.machine.sim_origin["htop"] = "Evil:24.04/noble"
+        result = self.install(payload)
+        self.assertEqual((result["stopped"], result["changed_anything"]), ("package_not_from_the_ubuntu_archive", False))
+        self.assertEqual(self.machine.changes(), [])
+
+    def test_downloaded_file_must_match_the_index_and_the_index_must_be_unambiguous(self):
+        for label, attr, code in (("hash mismatch", "bad_hash", "downloaded_file_does_not_match_the_signed_index"),
+                                  ("two hashes", "ambiguous_hash", "package_source_ambiguous")):
+            with self.subTest(label):
+                self.setUp()
+                payload = self.plan()
+                getattr(self.machine, attr).add("htop")
+                result = self.install(payload)
+                self.assertEqual((result["stopped"], result["changed_anything"]), (code, False))
+                self.assertEqual(self.machine.changes(), [])
+
+    def test_unreadable_sources_and_weakened_apt_config_fail_closed(self):
+        def unreadable(case):
+            (case.root / "etc/apt/sources.list.d/broken.list").mkdir()        # exists but can't be read as a file
+        cases = (("unreadable source", unreadable),
+                 ("allow insecure", lambda c: c.machine.config.append('Acquire::AllowInsecureRepositories "true";')),
+                 ("allow unauthenticated", lambda c: c.machine.config.append('APT::Get::AllowUnauthenticated "true";')),
+                 ("config unreadable", lambda c: setattr(c.machine, "config_ok", False)))
+        for label, change in cases:
+            with self.subTest(label):
+                self.setUp()
+                payload = self.plan()
+                change(self)
+                result = self.install(payload)
+                self.assertEqual((result["stopped"], result["changed_anything"]),
+                                 ("untrusted_package_source_configured", False))
+                self.assertEqual(self.machine.changes(), [])
+
+    def test_install_forbids_removals_and_forces_signature_checks_on(self):
+        payload = self.plan()
+        self.assertTrue(self.install(payload)["ok"])
+        command = self.machine.changes()[0]
+        self.assertIn("--no-remove", command)
+        self.assertIn("Acquire::AllowInsecureRepositories=false", command)
+
+    def test_simulated_removal_stops_before_any_change(self):
+        payload = self.plan()
+        challenge, token = self.approval(payload)
+        self.machine.removes_on_install.append("bash")
+        self.denied("catalog_resolution_failed", self.executor.install, payload, token, challenge)
+        self.assertEqual(self.machine.changes(), [])
 
     def test_extra_change_during_install_is_caught_and_undone(self):
         payload = self.plan()
@@ -242,6 +314,16 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual((result["ok"], result["stopped"], result["restored_from_backup"]),
                          (False, "transaction_differed_from_plan", True))
         self.assertEqual(self.machine.installed, {"bash": "5.2"})
+
+    def test_an_unrelated_package_changed_during_the_install_is_reported_not_claimed_restored(self):
+        payload = self.plan()
+        self.machine.extra_on_install = {"bash": "9.9"}                     # existing package changed behind our back
+        result = self.install(payload)
+        self.assertEqual((result["ok"], result["stopped"]), (False, "transaction_differed_from_plan"))
+        self.assertIs(result["restored_from_backup"], False)
+        self.assertEqual(result["not_restored"], ["bash"])
+        self.assertIs(result["changed_anything"], True)
+        self.assertNotIn("htop", self.machine.installed)                    # what we did add is removed again
 
     def test_failed_install_is_restored_from_the_backup(self):
         payload = self.plan()
@@ -272,6 +354,21 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual((self.root / "etc/libnl.conf").read_text(), "old config\n")
         self.assertIn("libnl-3-200", self.machine.manual)
         self.assertNotIn("htop", self.machine.manual)
+
+    def test_backup_claims_are_limited_to_packages_and_tracked_settings(self):
+        payload = self.upgrade_setup()
+        shown = " ".join(self.executor.challenge(payload, "approve")["summary"])
+        self.assertIn("not a full system snapshot", shown)
+        result = self.install(self.plan())
+        self.assertEqual(result["backup_scope"], "packages_and_dpkg_tracked_settings_only")
+        for word in ("application data", "untracked files", "service state", "other packages"):
+            self.assertIn(word, result["limits"])
+        self.assertNotIn("full-state", result["limits"].replace("not a system snapshot", ""))
+        (self.root / "etc/untracked-app.conf").write_text("user data\n")      # never saved, never touched
+        back = self.rollback_payload(result)
+        challenge, token = self.approval(back)
+        self.assertTrue(self.executor.rollback(back, token, challenge)["ok"])
+        self.assertEqual((self.root / "etc/untracked-app.conf").read_text(), "user data\n")
 
     def test_install_stops_when_the_current_version_cannot_be_saved(self):
         payload = self.upgrade_setup(archive=False)
@@ -316,7 +413,7 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(self.machine.installed, {"bash": "5.2"})
         removes = [c for c in self.machine.changes() if c[1] == "remove"]
         self.assertTrue(removes and all("purge" not in c and "--purge" not in c for c in removes))     # settings kept
-        again = self.rollback_payload(result, expires_at=back["expires_at"][:-3] + "58Z")
+        again = self.rollback_payload(result, expires_at=self.other_expiry(back))
         self.denied("already_rolled_back", self.executor.challenge, again, "approve")
 
     def test_rollback_needs_a_challenge_bound_proof(self):
@@ -412,7 +509,7 @@ class BrokerSocketTests(unittest.TestCase):
         self.assertTrue(reply["ok"] and reply["result"]["ok"], reply)
         self.assertEqual(call(self.sock_path, {"op": "status", "request_id": request_id(payload)[0]})["status"]["state"], "done")
         replay = call(self.sock_path, {"op": "install", "payload": payload, "proof": token, "challenge": challenge})
-        self.assertEqual(replay, {"ok": False, "error": "already_used"})
+        self.assertEqual(replay, {"ok": False, "error": "already_decided_or_used"})
         self.assertEqual(call(self.sock_path, {"op": "approve", "request_id": "x"}), {"ok": False, "error": "unknown_op"})
         rid = reply["result"]["rollback_id"]
         ledger = BrokerLedger(str(self.sock_path))

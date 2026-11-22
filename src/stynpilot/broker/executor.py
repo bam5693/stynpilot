@@ -56,6 +56,11 @@ from . import apt
 from .proof import ProofDenied, decision_nonce, render_summary
 
 CHALLENGE_LIFETIME = 600
+BACKUP_SCOPE = "packages_and_dpkg_tracked_settings_only"
+LIMITS = ("This is a bounded package rollback, not a system snapshot. It restores the packages this install "
+          "added or upgraded, their dpkg-tracked settings files and their auto/manual marks. It does not restore "
+          "application data, untracked files, service state, changes made by package scripts outside those files, "
+          "or other packages changed while it ran.")
 
 
 class ExecutionDenied(Exception):
@@ -211,6 +216,18 @@ class Executor:
         names = {p["name"] for step in content["steps"] for p in step["packages"]}
         if entry["kind"] != "apt" or not set(entry["packages"]) <= names:
             raise ExecutionDenied("plan_does_not_match_catalog_entry")
+        if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
+            raise ExecutionDenied("already_decided_or_used")
+        # The root installer derives the allowed package set ITSELF: the catalog's packages plus
+        # exactly the dependencies apt resolves for them now. Extra packages, even real Ubuntu ones,
+        # are refused before anyone is asked to approve.
+        try:
+            allowed = {p["name"]: p["version"] for p in apt.resolve(list(entry["packages"]), self.run)}
+        except (RuntimeError, ValueError):
+            raise ExecutionDenied("catalog_resolution_failed") from None
+        wanted = {p["name"]: p["version"] for step in content["steps"] for p in step["packages"]}
+        if wanted != allowed:
+            raise ExecutionDenied("plan_is_not_the_exact_catalog_closure")
         return content
 
     def install(self, payload, proof_token, challenge, *, now=None):
@@ -229,11 +246,17 @@ class Executor:
     def _install_apt(self, rid, content):
         wanted = {p["name"]: p["version"] for step in content["steps"] for p in step["packages"]}
         pins = sorted(wanted.items())
-        if apt.untrusted_sources(self.sources_root):
+        if apt.untrusted_sources(self.sources_root) or apt.insecure_config(self.run):
             raise ExecutionDenied("untrusted_package_source_configured")
         for name, version in pins:
             if not apt.origin_is_ubuntu(name, version, self.run):
                 raise ExecutionDenied("package_not_from_the_ubuntu_archive")
+        hashes = {}
+        for name, version in pins:
+            found = apt.sha256_of_version(name, version, self.run)
+            if len(found) != 1:
+                raise ExecutionDenied("package_source_ambiguous")
+            hashes[name] = next(iter(found))
         before = apt.state(self.run)
         manual_before = apt.manual_packages(self.run)
         upgraded = sorted(n for n in wanted if n in before and before[n] != wanted[n])
@@ -241,10 +264,17 @@ class Executor:
         cache = self.dir / "downloads" / rid
         if not apt.download(pins, cache, self.run):
             raise ExecutionDenied("download_failed")
+        for name, version in pins:                                   # the file apt fetched is the indexed one
+            files = sorted(cache.glob("%s_*.deb" % name))
+            if len(files) != 1 or _sha256(files[0]) != hashes[name]:
+                raise ExecutionDenied("downloaded_file_does_not_match_the_signed_index")
         try:
-            would, removals = apt.simulate_install(apt._pins(pins), self.run, cache=cache, no_download=True)
+            would, removals, chosen = apt.simulate_install(apt._pins(pins), self.run, cache=cache, no_download=True,
+                                                           with_origins=True)
         except RuntimeError:
             raise ExecutionDenied("approved_version_no_longer_available") from None
+        if any(not apt.origins_trusted(chosen.get(n)) for n in would):
+            raise ExecutionDenied("package_not_from_the_ubuntu_archive")
         if removals:
             raise ExecutionDenied("would_remove_packages")
         if would != expected:
@@ -260,16 +290,19 @@ class Executor:
         diff = self._diff(before, after)
         if diff != expected:
             extras = sorted(n for n, v in diff.items() if v is not None and before.get(n) is None and n not in wanted)
-            restored = self._restore(manifest, extra_added=extras) and apt.state(self.run) == before
-            return {"ok": False, "stopped": "transaction_differed_from_plan", "changed_anything": not restored,
-                    "restored_from_backup": restored}
+            self._restore(manifest, extra_added=extras)
+            left = {n: v for n, v in self._diff(before, apt.state(self.run)).items()}
+            # A package that already existed and was changed behind our back is NOT in the backup:
+            # we can't put it back, so we say so plainly instead of claiming a restore.
+            return {"ok": False, "stopped": "transaction_differed_from_plan", "changed_anything": bool(left),
+                    "restored_from_backup": not left, "not_restored": sorted(left), "limits": LIMITS}
         manifest["after"] = {n: after.get(n) for n in wanted}
         self._write_manifest(rollback_id, manifest)
         self.ledger.record(rollback_id=rollback_id, software=content["software"], owner=self.owner,
                            device=self.device, request_id=rid, snapshot_id=rollback_id, snapshot_verified=True)
         shutil.rmtree(cache, ignore_errors=True)
         return {"ok": True, "installed": [{"name": n, "version": v} for n, v in pins],
-                "rollback_id": rollback_id, "backup_verified": True,
+                "rollback_id": rollback_id, "backup_verified": True, "backup_scope": BACKUP_SCOPE, "limits": LIMITS,
                 "backup": {"saved_package_files": len(manifest["debs"]), "saved_settings_files": len(manifest["files"])}}
 
     @staticmethod

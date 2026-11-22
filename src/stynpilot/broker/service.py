@@ -55,6 +55,10 @@ def _read_line(conn):
     return data.split(b"\n", 1)[0]
 
 
+READ_TIMEOUT = 15
+MAX_CONNECTIONS = 16
+
+
 class BrokerService:
     def __init__(self, *, socket_path, executor, allowed_uid):
         if type(allowed_uid) is not int or allowed_uid == 0 and os.geteuid() != 0:
@@ -72,8 +76,13 @@ class BrokerService:
                     return {"ok": False, "error": "invalid_request"}
                 return {"ok": True, "status": self.executor.runs.status(rid)}
             if op == "challenge":
-                return {"ok": True, "challenge": self.executor.challenge(message.get("payload"),
-                                                                         message.get("decision"))}
+                if not self._busy.acquire(blocking=False):
+                    return {"ok": False, "error": "busy"}          # no new decisions while a change is running
+                try:
+                    return {"ok": True, "challenge": self.executor.challenge(message.get("payload"),
+                                                                             message.get("decision"))}
+                finally:
+                    self._busy.release()
             if op == "rollbackable":
                 if message.get("owner") != self.executor.owner or message.get("device") != self.executor.device:
                     return {"ok": False, "error": "unknown_rollback_id"}
@@ -123,7 +132,9 @@ class BrokerService:
                 if peer_uid(conn) != self.allowed_uid:
                     conn.sendall(json.dumps({"ok": False, "error": "caller_not_enrolled_owner"}).encode() + b"\n")
                     return
+                conn.settimeout(READ_TIMEOUT)             # a slow or silent client can't hold a worker
                 line = _read_line(conn)
+                conn.settimeout(None)                     # the work itself (an install) may take a long time
                 try:
                     message = json.loads(line.decode("utf-8"))
                 except (ValueError, UnicodeError):
@@ -135,10 +146,28 @@ class BrokerService:
             conn.sendall(json.dumps(reply, sort_keys=True).encode() + b"\n")
 
     def serve_forever(self):
+        """One thread per connection (bounded). Read-only status checks stay available while an install
+        runs; the ``_busy`` lock still allows only ONE change (and no new decisions) at a time."""
         sock = self._sock or self.bind()
+        slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         while True:
-            conn, _ = sock.accept()
-            self.serve_one(conn)
+            try:
+                conn, _ = sock.accept()
+            except OSError:
+                return
+            if not slots.acquire(blocking=False):
+                with conn:
+                    conn.sendall(b'{"error": "too_many_connections", "ok": false}\n')
+                continue
+
+            def work(conn=conn):
+                try:
+                    self.serve_one(conn)
+                except Exception:
+                    pass
+                finally:
+                    slots.release()
+            threading.Thread(target=work, name="stynpilot-broker-conn", daemon=True).start()
 
 
 class BrokerLedger:
@@ -166,3 +195,40 @@ def call(socket_path, message, timeout=1800):
         conn.connect(str(socket_path))
         conn.sendall(json.dumps(message).encode() + b"\n")
         return json.loads(_read_line(conn).decode("utf-8"))
+
+
+class BrokerRefused(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+class BrokerClient:
+    """What the owner-side approval flow uses to talk to the root installer over its socket."""
+
+    def __init__(self, socket_path):
+        self.socket_path = str(socket_path)
+
+    def _ask(self, message, timeout=1800):
+        try:
+            reply = call(self.socket_path, message, timeout=timeout)
+        except (OSError, ValueError):
+            raise BrokerRefused("installer_unavailable") from None
+        if not reply.get("ok"):
+            raise BrokerRefused(str(reply.get("error", "installer_refused")))
+        return reply
+
+    def status(self, request_id):
+        return self._ask({"op": "status", "request_id": request_id}, 30)["status"]
+
+    def challenge(self, payload, decision):
+        return self._ask({"op": "challenge", "payload": payload, "decision": decision}, 30)["challenge"]
+
+    def install(self, payload, proof, challenge):
+        return self._ask({"op": "install", "payload": payload, "proof": proof, "challenge": challenge})["result"]
+
+    def rollback(self, payload, proof, challenge):
+        return self._ask({"op": "rollback", "payload": payload, "proof": proof, "challenge": challenge})["result"]
+
+    def deny(self, payload, proof, challenge):
+        return self._ask({"op": "deny", "payload": payload, "proof": proof, "challenge": challenge}, 60)["result"]

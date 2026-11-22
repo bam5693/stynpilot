@@ -117,7 +117,7 @@ class ProposeToolTests(unittest.TestCase):
         receipt = filed["result"]
         self.assertEqual((receipt["state"], receipt["requested_by"], receipt["approved_by_ai"]),
                          ("pending", "chatgpt", False))
-        self.assertEqual(receipt["owner_approval_url"], "https://ryzen.example.test/app")
+        self.assertEqual(receipt["owner_approval_url"], "https://ryzen.example.test/app/approve/" + receipt["request_id"])
         self.assertIn("Package htop, exact version 3.3.0-4build1.", receipt["summary"])
         status = self.call("commander_software_install_status",
                            {"device_id": DEVICE, "request_id": receipt["request_id"]}, "claude")

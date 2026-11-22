@@ -120,6 +120,46 @@ def start(*, router, public_host, port, address=LISTEN_ADDRESS, startup_timeout=
     return Running(web, thread, "http://%s:%d/mcp" % (address, port))
 
 
+def check_approval_host(host):
+    """The approval page's public name as the browser (through the HTTPS proxy) sends it: DNS name, optional :port."""
+    if type(host) is not str:
+        raise ValueError("Approval host must be a DNS name with an optional port")
+    name, _, port = host.partition(":")
+    check_public_host(name)
+    if port and not (port.isdigit() and 1 <= int(port) <= 65535 and str(int(port)) == port):
+        raise ValueError("Approval host port is invalid")
+    return host.lower()
+
+
+def start_approval(*, flow, public_host, port, address=LISTEN_ADDRESS, startup_timeout=15):
+    """The owner's approval page, as its OWN loopback listener in the owner-side service.
+
+    Never part of the AI-facing MCP app (different app, different port; the MCP app has no /approve routes).
+    It listens on 127.0.0.1 only; the owner's HTTPS proxy (tailscale serve, an owner-approved step) forwards to
+    it, and the page only answers to ``public_host``. It never touches Auth0 settings: the sign-in values come
+    in through ``flow.authorize``.
+    """
+    from ..approval_web import build_app as build_approval_app
+    if address != LISTEN_ADDRESS:
+        raise PermissionError("The approval page listens on 127.0.0.1 only")
+    if type(port) is not int or isinstance(port, bool) or not 1024 < port <= 65535:
+        raise PermissionError("Unprivileged port required")
+    host = check_approval_host(public_host)
+    import uvicorn
+    app = build_approval_app(flow=flow, public_host=host, secure_cookie=True)
+    web = uvicorn.Server(uvicorn.Config(app, host=address, port=port, log_level="warning",
+                                        proxy_headers=False, server_header=False))
+    thread = threading.Thread(target=web.run, name="stynpilot-approval", daemon=True)
+    thread.start()
+    deadline = time.monotonic() + startup_timeout
+    while not web.started:
+        if not thread.is_alive() or time.monotonic() > deadline:
+            web.should_exit = True
+            raise RuntimeError("Approval page did not start (port in use?)")
+        time.sleep(0.05)
+    return Running(web, thread, "http://%s:%d/approve" % (address, port))
+
+
 def router_for_paired_device(*, tokens, grants, read_health, read_service_status=None):
     """Bind the router to the one live paired owner/device in the pairing database."""
     from .router import LocalOwnership, ReadRouter

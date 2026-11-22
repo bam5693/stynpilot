@@ -276,8 +276,23 @@ class Executor:
             result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__, "changed_anything": False}
         state = ("needs_owner_intervention" if result.get("needs_owner_intervention")
                  else "done" if result.get("ok") else "failed")
-        self.runs.finish(rid, state, result)
+        self._record_result(rid, state, result)
         return result
+
+    def _record_result(self, rid, state, result):
+        """Save the outcome. If that fails after the machine may have changed, leave a durable owner-must-check
+        record (new installs are refused) and let the failure surface: the run row stays 'running', which
+        reconciliation reports as unknown, never as 'nothing changed'."""
+        try:
+            self.runs.finish(rid, state, result)
+        except Exception as error:
+            if result.get("changed_anything") is not False:
+                try:
+                    self._attention(rid, result.get("rollback_id"), "result_not_recorded_%s" % type(error).__name__,
+                                    "the run finished but its result could not be saved")
+                except Exception:
+                    pass
+            raise
 
     def _install_apt(self, rid, content):
         wanted = {p["name"]: p["version"] for step in content["steps"] for p in step["packages"]}
@@ -505,7 +520,7 @@ class Executor:
                 result = {"ok": False, "stopped": reason, "changed_anything": True, "needs_owner_intervention": True}
         state = ("needs_owner_intervention" if result.get("needs_owner_intervention")
                  else "done" if result["ok"] else "failed")
-        self.runs.finish(rid, state, result)
+        self._record_result(rid, state, result)
         return result
 
     def _rollback_preflight(self, manifest):

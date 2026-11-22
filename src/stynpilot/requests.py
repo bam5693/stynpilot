@@ -28,7 +28,12 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-STATES = ("pending", "approved", "denied", "expired", "running", "done", "failed")
+STATES = ("pending", "approved", "denied", "expired", "running", "done", "failed", "needs_owner_intervention")
+# The only legal moves. Owner-side code only: there is no AI-facing way to call transition().
+_MOVES = {"pending": ("approved", "denied"), "approved": ("running", "needs_owner_intervention"),
+          "running": ("done", "failed", "needs_owner_intervention")}
+_SAFE_RESULT = ("ok", "stopped", "installed", "rollback_id", "restored", "restored_from_backup", "changed_anything",
+                "not_restored", "needs_owner_intervention", "denied_by_owner", "backup_scope", "limits")
 KINDS = ("install", "rollback")
 MAX_PENDING_PER_CLIENT = 5
 _REQUEST_ID = re.compile(r"[a-f0-9]{64}\Z")
@@ -135,6 +140,42 @@ class RequestStore:
         if row is None or row["owner"] != owner or row["device"] != device:
             raise RequestError("unknown_request")      # never reveal another owner's requests
         return self._receipt(row)
+
+    def transition(self, request_id_value, from_state, to_state, *, result=None):
+        """Owner-side compare-and-set. True if the move happened; False if the request was not in
+        ``from_state`` (so two clicks or a replay can never decide twice). Illegal moves raise."""
+        if type(request_id_value) is not str or not _REQUEST_ID.fullmatch(request_id_value):
+            raise RequestError("unknown_request")
+        if to_state not in _MOVES.get(from_state, ()):
+            raise RequestError("illegal_transition")
+        safe = None if result is None else json.dumps({k: result[k] for k in _SAFE_RESULT if k in result},
+                                                      sort_keys=True)
+        with self._tx() as db:
+            self._expire(db)
+            row = db.execute("SELECT state FROM requests WHERE request_id=?", (request_id_value,)).fetchone()
+            if row is None:
+                raise RequestError("unknown_request")
+            if row["state"] != from_state:
+                return False
+            db.execute("UPDATE requests SET state=?, decided=COALESCE(decided, ?), result=COALESCE(?, result) "
+                       "WHERE request_id=?", (to_state, self.clock(), safe, request_id_value))
+            return True
+
+    def in_flight(self):
+        with self._tx() as db:
+            return [r["request_id"] for r in db.execute(
+                "SELECT request_id FROM requests WHERE state IN ('approved','running') ORDER BY created")]
+
+    def recover_interrupted(self):
+        """After a restart: anything approved or running may have changed the machine, so it is marked
+        for the owner instead of being retried or silently reported as pending/running."""
+        with self._tx() as db:
+            rows = db.execute("SELECT request_id FROM requests WHERE state IN ('approved','running')").fetchall()
+            for row in rows:
+                db.execute("UPDATE requests SET state='needs_owner_intervention', result=? WHERE request_id=?",
+                           (json.dumps({"ok": False, "stopped": "interrupted_by_restart_or_crash",
+                                        "needs_owner_intervention": True}), row["request_id"]))
+            return [row["request_id"] for row in rows]
 
     @staticmethod
     def _receipt(row):

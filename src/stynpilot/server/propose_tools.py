@@ -74,8 +74,8 @@ def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt
             raise ClientDenied("device_unavailable_or_not_authorized") from None
 
     def receipt(result):
-        if approval_url:
-            result["owner_approval_url"] = approval_url
+        if approval_url:               # a link to THIS request's approval page; it carries no secret and decides nothing
+            result["owner_approval_url"] = approval_url.rstrip("/") + "/approve/" + result["request_id"]
         result["next"] = ("The owner reviews and approves this on his phone. "
                           "Check progress with commander_software_install_status.")
         return {"ok": True, "result": result}

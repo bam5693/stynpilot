@@ -26,8 +26,28 @@ Development roles: a technical implementation lead, an independent code reviewer
 
 Do not grant AI clients owner-review credentials, privileged command execution, or unrestricted Docker access. Maintain authorization checks in the actual operating-system and service boundaries rather than relying on assistant instructions.
 
+## What works so far
+
+The core is standard-library Python (3.11+) under `src/stynpilot/`:
+
+- `policy.py`: the GREEN / YELLOW / BLACK classifier. Fails closed, and BLACK always wins.
+- `board.py`: the shared task board for ChatGPT, Claude and local workers. It handles leases, recovery, cancellation, independent reviews and bounded debate.
+- `plan.py`: validation of immutable install plans. Approval is one plan, one hash.
+
+None of these modules executes system changes or approves anything. See `docs/MIGRATION.md` for what comes over from the GitLab prototype next.
+
+## Running the tests
+
+```sh
+./scripts/check.sh
+```
+
+The tests run offline, with no root and no paid services. Run them before every push.
+
 ## Contributing
 
-Development procedures, test commands, and contribution guidelines will be added as the architecture and first independently tested implementation are established.
+- Make one focused change per pull request, with tests.
+- Security-sensitive changes (anything about authorization, approval, execution or secrets) need a review from the other assistant before merging.
+- Push finished work in batches, not as many tiny commits.
 
 No license has yet been selected. Publicly viewable source code is not automatically permission to reuse or redistribute it.

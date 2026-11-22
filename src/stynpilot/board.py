@@ -12,9 +12,11 @@ cannot enroll or reinstate anyone. The board records who works on what:
 * revoking one identity blocks its tasks and releases its claims without touching others.
 
 Review flow (new in this repository):
-* a ``review`` task points at a FINISHED parent task and an exact ``commit:<sha>``; new commits
-  need a new review;
-* the reviewer must be a different assistant from both the parent's creator and assignee;
+* a ``review`` task points at a FINISHED parent task and a ``commit:<sha>``; new commits need
+  a new review. The board checks only the shape of that SHA, not that it is the PR head or
+  who wrote it, so a verdict is a record of what the reviewer says they checked;
+* the assistant that did the work cannot review it under any of its identities; the
+  coordinator that only wrote the task can;
 * a review finishes with a verdict (approve, approve-with-changes or object) and evidence;
 * reviews are ADVISORY records for the owner. Nothing in StyNpilot treats a verdict as an
   approval or as permission to merge or run anything; the owner decides;
@@ -324,15 +326,16 @@ class Board:
             raise Denied("review_needs_finished_work")
         if not (type(ref) is str and COMMIT_REF.fullmatch(ref)):
             raise Denied("review_needs_exact_commit_ref")
-        # Whoever wrote the task and whoever did it are both authors. Neither they nor another
-        # identity of the same assistant (for example the Claude app and the Claude runner)
-        # is an independent reviewer.
-        authors = (parent["assignee"], parent["creator"])
-        if target_id in authors:
+        # The assistant that did the work may not review it, under any of its identities (for
+        # example the Claude app and the Claude runner). The task's creator MAY review: a
+        # coordinator that wrote the task and wrote no code is a valid independent reviewer.
+        # The board cannot see real Git authorship, so this is a sanity rule on board roles,
+        # not proof of authorship. Verdicts stay advisory (see module docstring).
+        if target_id == parent["assignee"]:
             raise Denied("reviewer_must_differ_from_author")
-        kinds = dict(db.execute("SELECT client_id,kind FROM assistants WHERE client_id IN (?,?,?)",
-                                (target_id, *authors)).fetchall())
-        if kinds.get(target_id) in (kinds.get(authors[0]), kinds.get(authors[1])):
+        kinds = dict(db.execute("SELECT client_id,kind FROM assistants WHERE client_id IN (?,?)",
+                                (target_id, parent["assignee"])).fetchall())
+        if kinds.get(target_id) == kinds.get(parent["assignee"]):
             raise Denied("reviewer_must_be_a_different_assistant")
         rounds = db.execute("SELECT COUNT(*) FROM tasks WHERE parent_task_id=? AND task_kind='review'",
                             (parent_task_id,)).fetchone()[0]

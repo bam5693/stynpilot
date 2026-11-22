@@ -410,13 +410,17 @@ class ReviewTests(BoardCase):
         # claude-client is a second Claude identity; it cannot review claude-runner's work.
         self.denied("reviewer_must_be_a_different_assistant", self.review, reviewer="claude-client")
 
-    def test_whoever_wrote_the_task_cannot_review_it(self):
-        # ChatGPT writes a task, hands it to Claude, then tries to review the result.
+    def test_coordinator_that_wrote_the_task_can_review_the_builders_work(self):
+        # The owner's workflow: ChatGPT writes the task, Claude builds it, ChatGPT reviews it.
         task = self.make(title="ChatGPT spec, Claude builds", assignee="claude-runner", claims=())
         claimed = self.board.claim("claude-runner")
         self.board.finish("claude-runner", claimed["task_id"], claimed["lease_id"], "done", "built")
-        self.denied("reviewer_must_differ_from_author", self.board.create, "claude-runner", "stynpilot", "Review it",
-                    assignee="chatgpt-client", kind="review", parent_task_id=task["task_id"], ref=COMMIT)
+        review = self.board.create("claude-runner", "stynpilot", "Review it", assignee="chatgpt-client",
+                                   kind="review", parent_task_id=task["task_id"], ref=COMMIT)
+        self.assertEqual(review["review_round"], 1)
+        # but the builder still cannot review its own result
+        self.denied("reviewer_must_differ_from_author", self.board.create, "chatgpt-client", "stynpilot",
+                    "Self review", assignee="claude-runner", kind="review", parent_task_id=task["task_id"], ref=COMMIT)
 
     def test_review_needs_finished_work_and_an_exact_commit(self):
         unfinished = self.board.create("claude-runner", "stynpilot", "Still going", claims=())

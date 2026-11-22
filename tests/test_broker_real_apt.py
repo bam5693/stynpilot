@@ -22,7 +22,8 @@ class RealAptTests(unittest.TestCase):
         from stynpilot import catalog
         from stynpilot.broker import apt
         from stynpilot.broker.executor import Executor
-        from stynpilot.broker.proof import ProofVerifier, approval_nonce
+        from stynpilot.broker.executor import ExecutionDenied
+        from stynpilot.broker.proof import ProofVerifier, decision_nonce
         from stynpilot.identity import account_id
         from stynpilot.requests import request_id
 
@@ -37,26 +38,35 @@ class RealAptTests(unittest.TestCase):
         executor = Executor(state_dir=Path(tmp.name) / "broker", owner=owner, device=device,
                             verifier=ProofVerifier(issuer=iss, approval_client_id=app, jwks={"keys": [public]}))
 
-        def proof(payload):
+        def approval(payload, nonce=None):
             rid, _ = request_id(payload)
+            challenge = executor.challenge(payload, "approve")
             now = int(time.time())
-            return jwt.encode({"iss": iss, "aud": app, "sub": sub, "iat": now, "exp": now + 300, "auth_time": now,
-                               "nonce": approval_nonce(rid, rid)}, key, algorithm="RS256", headers={"kid": "k1"})
+            token = jwt.encode({"iss": iss, "aud": app, "sub": sub, "iat": now, "exp": now + 300, "auth_time": now,
+                                "nonce": nonce or decision_nonce("approve", rid, rid, challenge["challenge"])},
+                               key, algorithm="RS256", headers={"kid": "k1"})
+            return challenge["challenge"], token
 
         plan, summary = catalog.install_plan("htop", owner=owner, device=device, resolve_apt=apt.resolve)
         payload = plan.content()
         print("\nPlan the owner would approve:\n  " + "\n  ".join(summary))
-        result = executor.install(payload, proof(payload), software="htop")
+        challenge, generic = approval(payload, nonce="a-plain-login-token")        # a login alone is not approval
+        with self.assertRaises(ExecutionDenied):
+            executor.install(payload, generic, challenge)
+        self.assertIsNone(apt.installed_versions(["htop"])["htop"])
+        challenge, token = approval(payload)
+        result = executor.install(payload, token, challenge)
         print("Install result:", result)
         self.assertTrue(result["ok"], result)
-        self.assertTrue(result["rollback_verified"])
+        self.assertTrue(result["backup_verified"])
         out = subprocess.run(["dpkg-query", "-W", "-f", "${Version}", "htop"], capture_output=True, text=True)
         self.assertEqual(out.stdout, next(p["version"] for p in payload["steps"][0]["packages"] if p["name"] == "htop"))
 
         expires = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         back = {"kind": "rollback", "software": "htop", "rollback_id": result["rollback_id"], "request_id": request_id(payload)[0],
                 "snapshot_id": result["rollback_id"], "owner": owner, "device": device, "expires_at": expires}
-        undone = executor.rollback(back, proof(back))
+        challenge, token = approval(back)
+        undone = executor.rollback(back, token, challenge)
         print("Rollback result:", undone)
         self.assertTrue(undone["ok"], undone)
         for name in [p["name"] for p in payload["steps"][0]["packages"]]:

@@ -1,19 +1,25 @@
-"""The owner's approval proof: an Auth0-signed ID token bound to ONE exact plan.
+"""The owner's decision proof: an Auth0-signed ID token bound to ONE root-issued challenge.
 
-Why a signed token and not a database row: the StyNpilot service that talks to
-ChatGPT and Claude runs as the owner's normal user. If it were compromised, it could
-write any file that user can write, including a fake "approved" row. It cannot
-produce Auth0's signature. So the root installer accepts only this proof:
+What this proves, precisely (and what it does not):
+- The root installer issues a random, single-use **challenge** for one request and one
+  decision ("approve" or "deny"), and renders the plain-English summary of the exact plan
+  itself (``render_summary``). The approval page (G5) must show that root-rendered text.
+- The owner then signs in to his Auth0 tenant with
+  ``nonce = decision_nonce(decision, request_id, plan_sha256, challenge)``. Auth0 signs an
+  ID token carrying that nonce.
+- The installer accepts the token only if it's signed by the trusted Auth0 keys, for the
+  approval app, for the owner's account, with a sign-in under 5 minutes old, and its
+  nonce matches a challenge the installer issued, unexpired and unused, for this exact
+  request, plan and decision.
 
-- an ID token signed by the owner's Auth0 tenant (RS256, a key from the trusted JWKS),
-- issued to the StyNpilot approval app (``aud`` = its client ID),
-- for the owner's own account (``sub`` maps to the request's owner account),
-- recent (``auth_time`` within a few minutes), so a stale sign-in can't approve,
-- whose ``nonce`` equals ``approval_nonce(request_id, plan_sha256)``. The approval page
-  (G5) starts the sign-in with that nonce, so the signature covers this exact plan.
+So a token proves that the owner freshly authenticated *for this specific decision on
+this specific plan*, through a flow the installer started. It does NOT by itself prove
+what the owner's screen showed. That depends on the G5 page displaying the
+root-rendered summary from a component the AI-facing service can't alter. G5 must meet
+that requirement (see MASTER_PLAN G5). A generic Auth0 sign-in, a sign-in without a
+root-issued challenge, or a replayed one is never accepted.
 
-The installer also remembers every proof it has used (root-owned), so a proof works
-only once. Needs PyJWT with cryptography (Ubuntu: python3-jwt, python3-cryptography).
+Needs PyJWT with cryptography (Ubuntu: python3-jwt, python3-cryptography).
 """
 from __future__ import annotations
 
@@ -27,7 +33,8 @@ import jwt
 from ..identity import account_id
 
 _HEX64 = re.compile(r"[a-f0-9]{64}\Z")
-MAX_AUTH_AGE = 300            # seconds between the owner's sign-in and the approval
+DECISIONS = ("approve", "deny")
+MAX_AUTH_AGE = 300            # seconds between the owner's sign-in and the decision
 MAX_TOKEN_BYTES = 8192
 
 
@@ -37,16 +44,33 @@ class ProofDenied(Exception):
         self.code = code
 
 
-def approval_nonce(request_id, plan_sha256):
-    """What the owner's sign-in must carry to approve exactly this request and plan."""
-    for value in (request_id, plan_sha256):
+def decision_nonce(decision, request_id, plan_sha256, challenge):
+    if decision not in DECISIONS:
+        raise ProofDenied("invalid_decision")
+    for value in (request_id, plan_sha256, challenge):
         if type(value) is not str or not _HEX64.fullmatch(value):
             raise ProofDenied("invalid_request")
-    return hashlib.sha256(("stynpilot-approve-v1|%s|%s" % (request_id, plan_sha256)).encode()).hexdigest()
+    text = "stynpilot-decision-v2|%s|%s|%s|%s" % (decision, request_id, plan_sha256, challenge)
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def proof_fingerprint(id_token):
     return hashlib.sha256(id_token.encode("ascii", "replace")).hexdigest()
+
+
+def render_summary(payload):
+    """Plain-English text of an install or rollback payload, produced by the root installer itself."""
+    if payload.get("kind") == "rollback":
+        return ["Roll back %s (install %s)." % (payload.get("software"), str(payload.get("rollback_id"))[:12]),
+                "Packages that install added are removed (their settings files are kept); packages it "
+                "upgraded go back to their saved earlier versions.",
+                "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")]
+    lines = ["Install %s on device ending ...%s." % (payload.get("software"), str(payload.get("device"))[-4:])]
+    for step in payload.get("steps", []):
+        for package in step.get("packages", []):
+            lines.append("Package %s, exact version %s, from the Ubuntu archive." % (package["name"], package["version"]))
+    lines.append("Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z"))
+    return lines
 
 
 class ProofVerifier:
@@ -59,11 +83,10 @@ class ProofVerifier:
         self.issuer, self.client_id, self.clock = issuer, approval_client_id, clock
         self.keys = _load_keys(jwks)
 
-    def verify(self, id_token, *, request_id, plan_sha256, owner):
-        """Return the proof fingerprint if this token approves exactly this plan for this owner."""
+    def verify(self, id_token, *, expected_nonce, owner):
+        """Return the proof fingerprint if this token carries exactly ``expected_nonce`` for the owner."""
         if type(id_token) is not str or not 20 <= len(id_token) <= MAX_TOKEN_BYTES:
             raise ProofDenied("proof_missing")
-        expected = approval_nonce(request_id, plan_sha256)
         try:
             header = jwt.get_unverified_header(id_token)
             if header.get("alg") != "RS256" or "jku" in header or "x5u" in header:
@@ -78,8 +101,8 @@ class ProofVerifier:
             raise
         except (jwt.PyJWTError, TypeError, ValueError):
             raise ProofDenied("proof_invalid") from None
-        if not hmac.compare_digest(str(claims.get("nonce")), expected):
-            raise ProofDenied("proof_is_for_a_different_plan")
+        if not hmac.compare_digest(str(claims.get("nonce")), expected_nonce):
+            raise ProofDenied("proof_is_for_a_different_decision")
         auth_time = claims.get("auth_time")
         if type(auth_time) is not int or not 0 <= self.clock() - auth_time <= MAX_AUTH_AGE:
             raise ProofDenied("owner_sign_in_not_recent")

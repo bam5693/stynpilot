@@ -1,15 +1,30 @@
-"""A tiny fake Ubuntu machine: answers the exact apt-get / dpkg-query commands the installer uses."""
+"""A small fake Ubuntu machine: answers the exact apt-get / apt-cache / apt-mark / dpkg-query commands the installer uses.
+
+Models what the safety checks depend on: package origins, a download cache that ``--no-download``
+must honour, old versions that may or may not still be downloadable, conffiles on disk,
+auto/manual marks, and packages that depend on others (so removing could cascade).
+"""
+from pathlib import Path
 
 
 class FakeMachine:
-    def __init__(self, installed=None, available=None, deps=None):
+    def __init__(self, installed=None, available=None, deps=None, *, file_root=None):
         self.installed = dict(installed or {})          # name -> version
         self.available = dict(available or {})          # name -> candidate version
         self.deps = dict(deps or {})                     # name -> [dependency names]
-        self.commands, self.fail_install, self.removes_on_install = [], False, []
+        self.archive = {}                                # name -> {older versions still downloadable}
+        self.origin = {}                                 # name -> "Evil" for a non-Ubuntu source (default Ubuntu)
+        self.conffiles = {}                              # name -> [absolute paths]
+        self.rdeps = {}                                  # name -> [installed packages that need it]
+        self.manual = set(self.installed)
+        self.file_root = Path(file_root) if file_root else None
+        self.commands, self.fail_install = [], False
+        self.removes_on_install = []                     # shows up in the simulation
+        self.extra_on_install = {}                       # silently installed by the real install
 
     def changes(self):
-        return [c for c in self.commands if c[:2] in (["apt-get", "install"], ["apt-get", "remove"])]
+        return [c for c in self.commands if c[:2] in (["apt-get", "install"], ["apt-get", "remove"])
+                and "-s" not in c and "--download-only" not in c]
 
     def _closure(self, names):
         out, todo = [], list(names)
@@ -20,40 +35,115 @@ class FakeMachine:
                 todo.extend(self.deps.get(name, []))
         return out
 
+    @staticmethod
+    def _cache(argv):
+        for i, a in enumerate(argv):
+            if a == "-o" and argv[i + 1].startswith("Dir::Cache::archives="):
+                return Path(argv[i + 1].split("=", 1)[1])
+        return None
+
+    def _downloadable(self, name, version):
+        return version in (self.available.get(name),) or version in self.archive.get(name, ())
+
+    def _plan(self, targets):
+        pins = {t.split("=")[0]: (t.split("=", 1)[1] if "=" in t else None) for t in targets}
+        order = self._closure(pins)
+        return [(n, pins.get(n) or self.available.get(n)) for n in order]
+
     def __call__(self, argv):
         self.commands.append(list(argv))
-        args = [a for a in argv if not a.startswith("-") and a != "--"]
-        if argv[0] == "dpkg-query":
-            names = argv[argv.index("--") + 1:]
-            return 0, "".join("%s\t%s\tii \n" % (n, self.installed[n]) for n in names if n in self.installed)
-        if argv[:2] == ["apt-get", "-s"]:
-            verb = "install" if "install" in argv else "remove"
-            targets = argv[argv.index("--") + 1:]
-            if verb == "remove":
-                return 0, "".join("Remv %s [%s]\n" % (t, self.installed[t]) for t in targets if t in self.installed)
-            lines = []
-            for target in self._closure([t.split("=")[0] for t in targets]):
-                pin = next((t.split("=", 1)[1] for t in targets if "=" in t and t.split("=")[0] == target), None)
-                version = pin or self.available.get(target)
-                if version is None or (pin and pin not in (self.available.get(target), self.installed.get(target))
-                                       and "--allow-downgrades" not in argv):
-                    return 100, "E: Version not found\n"
-                if self.installed.get(target) != version:
-                    old = self.installed.get(target)
-                    lines.append("Inst %s%s (%s Ubuntu:24.04/noble [amd64])\n" % (target, " [%s]" % old if old else "", version))
-            lines += ["Remv %s [1]\n" % r for r in self.removes_on_install]
-            return 0, "".join(lines)
-        if argv[:2] == ["apt-get", "install"]:
-            if self.fail_install:
-                first = argv[argv.index("--") + 1].split("=")
-                self.installed[first[0]] = first[1]               # half-done install
-                return 100, "E: dpkg was interrupted\n"
-            for target in argv[argv.index("--") + 1:]:
-                name, version = target.split("=")
-                self.installed[name] = version
+        tool = argv[0]
+        if tool == "dpkg-query":
+            if "--" in argv:
+                name = argv[argv.index("--") + 1]
+                return 0, "".join(" %s abcdef\n" % p for p in self.conffiles.get(name, []))
+            return 0, "".join("%s\t%s\tii \n" % (n, v) for n, v in sorted(self.installed.items()))
+        if tool == "apt-mark":
+            if argv[1] == "showmanual":
+                return 0, "".join(n + "\n" for n in sorted(self.manual & set(self.installed)))
+            names = set(argv[argv.index("--") + 1:])
+            self.manual = (self.manual | names) if argv[1] == "manual" else (self.manual - names)
             return 0, ""
-        if argv[:2] == ["apt-get", "remove"]:
-            for name in argv[argv.index("--") + 1:]:
+        if tool == "apt-cache":
+            return self._policy(argv)
+        if tool != "apt-get":
+            return 127, ""
+        targets = argv[argv.index("--") + 1:] if "--" in argv else []
+        cache, simulate = self._cache(argv), "-s" in argv
+        verb = "remove" if "remove" in argv else "install"
+        if verb == "remove":
+            names = list(targets)
+            todo = list(names)
+            while todo:                                   # dependents go too
+                for dependent in self.rdeps.get(todo.pop(), []):
+                    if dependent in self.installed and dependent not in names:
+                        names.append(dependent)
+                        todo.append(dependent)
+            if simulate:
+                return 0, "".join("Remv %s [%s]\n" % (t, self.installed[t]) for t in names if t in self.installed)
+            for name in names:
                 self.installed.pop(name, None)
+                self.manual.discard(name)
             return 0, ""
-        return 127, ""
+        plan = self._plan(targets)
+        for name, version in plan:
+            pinned = any(t.split("=")[0] == name and "=" in t for t in targets)
+            if version is None or (pinned and not self._downloadable(name, version)
+                                   and version != self.installed.get(name)):
+                return 100, "E: Version not found\n"
+            if pinned and self.installed.get(name) and self.installed[name] != version and "--allow-downgrades" not in argv \
+                    and version != self.available.get(name):
+                return 100, "E: Packages were downgraded and -y was used without --allow-downgrades.\n"
+        if "--download-only" in argv:
+            if any(not self._downloadable(n, v) for n, v in plan):
+                return 100, "E: Version not found (not in any archive)\n"
+            for name, version in plan:
+                (cache / ("%s_%s_amd64.deb" % (name, version.replace(":", "%3a")))).write_bytes(b"deb:%s:%s" % (name.encode(), version.encode()))
+            return 0, ""
+        if "--no-download" in argv:
+            for name, version in plan:
+                if self.installed.get(name) != version and not (cache and (cache / ("%s_%s_amd64.deb" % (name, version))).exists()):
+                    return 100, "E: Can't download %s (no-download)\n" % name
+        if simulate:
+            lines = []
+            for name, version in plan:
+                if self.installed.get(name) != version:
+                    old = self.installed.get(name)
+                    lines.append("Inst %s%s (%s Ubuntu:24.04/noble [amd64])\n" % (name, " [%s]" % old if old else "", version))
+            return 0, "".join(lines) + "".join("Remv %s [1]\n" % r for r in self.removes_on_install)
+        if self.fail_install:
+            name, version = plan[0]
+            self.installed[name] = version                    # half-done install
+            return 100, "E: dpkg was interrupted\n"
+        for name, version in plan:
+            if self.installed.get(name) != version:
+                if name not in self.installed:
+                    self.manual.add(name)
+                self.installed[name] = version
+                if self.file_root:                             # dpkg replaces the package's settings files
+                    for path in self.conffiles.get(name, []):
+                        target = self.file_root / path.lstrip("/")
+                        if target.exists():
+                            target.write_text("config from %s\n" % version)
+        self.installed.update(self.extra_on_install)
+        return 0, ""
+
+    def _policy(self, argv):
+        sources = [("http://archive.ubuntu.com/ubuntu", "noble/main", "Ubuntu"),
+                   ("http://ppa.example.test/evil", "noble/main", "Evil")]
+        if len(argv) == 2:
+            out = "Package files:\n"
+            for url, suite, origin in sources:
+                out += " 500 %s %s amd64 Packages\n     release v=24.04,o=%s,a=noble,n=noble,l=%s,c=main,b=amd64\n" % (
+                    url, suite, origin, origin)
+            return 0, out
+        name = argv[-1]
+        versions = {self.available.get(name), self.installed.get(name), *self.archive.get(name, ())} - {None}
+        out = "%s:\n  Installed: %s\n  Candidate: %s\n  Version table:\n" % (
+            name, self.installed.get(name, "(none)"), self.available.get(name, "(none)"))
+        for version in sorted(versions):
+            out += "     %s 500\n" % version
+            origin = self.origin.get(name, "Ubuntu")
+            url, suite, _ = next(s for s in sources if s[2] == origin)
+            out += "        500 %s %s amd64 Packages\n" % (url, suite)
+        return 0, out

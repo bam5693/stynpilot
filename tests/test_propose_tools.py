@@ -164,7 +164,8 @@ class ProposeToolTests(unittest.TestCase):
         filed = self.rollback("ab" * 16)
         self.assertTrue(filed["ok"], filed)
         self.assertEqual((filed["result"]["kind"], filed["result"]["state"]), ("rollback", "pending"))
-        self.assertIn("verified backup", filed["result"]["summary"][0])
+        self.assertIn("Roll back htop", filed["result"]["summary"][0])
+        self.assertNotIn("verified restorable", " ".join(filed["result"]["summary"]))
         cases = {
             "invalid_rollback_id": ("", "../x", "AB" * 16, "short"),
             "unknown_rollback_id": ("99" * 16, "ef" * 16),            # nonexistent; another owner's install

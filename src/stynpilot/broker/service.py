@@ -1,11 +1,18 @@
 """The root installer's local door: a private UNIX socket that only the owner's account can use.
 
 The owner's StyNpilot service (which talks to ChatGPT and Claude) runs as his normal user.
-It forwards an approved request here as one JSON line:
+It talks to the installer with one JSON line per call:
 
-  {"op": "install",  "payload": {...exact plan...}, "proof": "<Auth0 ID token>", "software": "htop"}
-  {"op": "rollback", "payload": {...rollback request...}, "proof": "<Auth0 ID token>"}
-  {"op": "status",   "request_id": "<64 hex>"}
+  {"op": "challenge",    "payload": {...}, "decision": "approve"|"deny"}   -> challenge, nonce, summary
+  {"op": "install",      "payload": {...}, "proof": "<ID token>", "challenge": "<64 hex>"}
+  {"op": "rollback",     "payload": {...}, "proof": "<ID token>", "challenge": "<64 hex>"}
+  {"op": "deny",         "payload": {...}, "proof": "<ID token>", "challenge": "<64 hex>"}
+  {"op": "status",       "request_id": "<64 hex>"}
+  {"op": "rollbackable", "rollback_id": "<hex>", "software": "<catalog id>"}
+
+The software name always comes from inside the hashed plan, never from the caller.
+``rollbackable`` is the narrow, read-only view G3 needs: yes, or a refusal code. It never
+returns the root ledger's contents.
 
 The caller is identified by the kernel (SO_PEERCRED), not by anything it says: only the
 enrolled owner UID is served. The installer trusts nothing in the message beyond what it
@@ -24,6 +31,7 @@ import struct
 import threading
 from pathlib import Path
 
+from ..ledger import LedgerError
 from .executor import ExecutionDenied
 
 MAX_MESSAGE = 256 * 1024
@@ -63,15 +71,26 @@ class BrokerService:
                 if type(rid) is not str or not _HEX64.fullmatch(rid):
                     return {"ok": False, "error": "invalid_request"}
                 return {"ok": True, "status": self.executor.runs.status(rid)}
-            if op in ("install", "rollback"):
+            if op == "challenge":
+                return {"ok": True, "challenge": self.executor.challenge(message.get("payload"),
+                                                                         message.get("decision"))}
+            if op == "rollbackable":
+                if message.get("owner") != self.executor.owner or message.get("device") != self.executor.device:
+                    return {"ok": False, "error": "unknown_rollback_id"}
+                try:
+                    entry = self.executor.ledger.rollbackable(message.get("rollback_id"),
+                                                              software=message.get("software"),
+                                                              owner=self.executor.owner, device=self.executor.device)
+                except LedgerError as refused:
+                    return {"ok": False, "error": refused.code}
+                return {"ok": True, "request_id": entry["request_id"], "snapshot_id": entry["snapshot_id"]}
+            if op in ("install", "rollback", "deny"):
                 if not self._busy.acquire(blocking=False):
                     return {"ok": False, "error": "busy"}          # one change at a time
                 try:
-                    if op == "install":
-                        result = self.executor.install(message.get("payload"), message.get("proof"),
-                                                       software=message.get("software"))
-                    else:
-                        result = self.executor.rollback(message.get("payload"), message.get("proof"))
+                    method = {"install": self.executor.install, "rollback": self.executor.rollback,
+                              "deny": self.executor.deny}[op]
+                    result = method(message.get("payload"), message.get("proof"), message.get("challenge"))
                 finally:
                     self._busy.release()
                 return {"ok": True, "result": result}
@@ -120,6 +139,24 @@ class BrokerService:
         while True:
             conn, _ = sock.accept()
             self.serve_one(conn)
+
+
+class BrokerLedger:
+    """G3's view of the root ledger: asks the installer, never reads root files."""
+
+    def __init__(self, socket_path):
+        self.socket_path = socket_path
+
+    def rollbackable(self, rollback_id, *, software, owner, device):
+        try:
+            reply = call(self.socket_path, {"op": "rollbackable", "rollback_id": rollback_id, "software": software,
+                                            "owner": owner, "device": device}, timeout=10)
+        except (OSError, ValueError):
+            raise LedgerError("installer_unavailable") from None
+        if not reply.get("ok"):
+            raise LedgerError(str(reply.get("error", "unknown_rollback_id")))
+        return {"rollback_id": rollback_id, "software": software,
+                "request_id": reply["request_id"], "snapshot_id": reply["snapshot_id"]}
 
 
 def call(socket_path, message, timeout=1800):

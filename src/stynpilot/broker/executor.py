@@ -1,27 +1,37 @@
 """The installer (runs as root): executes ONLY an owner-approved, unchanged, exact plan.
 
-For an install request it does, in order, and stops at the first failure:
-1. **Same plan:** recompute the plan's SHA-256 from the exact payload; it must equal
-   the request ID the owner approved. Re-validate it against the owner and device this
-   installer was enrolled for (never values from the request).
-2. **Owner approved it:** verify the Auth0-signed proof (see proof.py). It must be for
-   this owner, recent, and bound to this exact plan.
-3. **Only once:** record the proof and request as used, before doing anything. A second
-   attempt with the same proof or request is refused (one live attempt per approval).
-4. **No drift:** ask apt what it would install right now. It must be exactly the
-   approved packages and versions, and nothing may be removed.
-5. **Backup first:** record every affected package's current version in a root-only
-   snapshot file, then read it back and check its hash.
-6. **Install** exactly the pinned versions, then check dpkg shows exactly those versions.
-7. **Verify the way back:** simulate the rollback. Only if that works is the install
-   recorded as having a *verified* backup, and only then can a rollback be requested.
-If the install fails part-way, it restores the snapshot at once and reports that.
+Install, stopping at the first failure:
+1. **Same plan, right software.** Re-hash the payload (the request ID the owner decided on),
+   re-validate it against the owner and device this installer was enrolled for, and take
+   the software name from inside the hashed plan, checked against the catalog. The
+   caller's opinion is never used.
+2. **The owner approved it.** A root-issued, single-use challenge for (approve, request,
+   plan) must exist, and the Auth0-signed proof must carry its nonce (see proof.py).
+   Challenge and proof are consumed before anything changes: one attempt per approval.
+3. **Trusted source.** No apt source may switch off signature checks, and every planned
+   version must come from a signed source whose Release says Origin/Label Ubuntu.
+4. **Exact transaction.** Download exactly the planned .deb files into a root-only folder,
+   then simulate with ``--no-download``. apt must install exactly the planned set at the
+   planned versions and remove nothing. The install itself runs ``--no-download`` from
+   that folder, so the archive changing in between can't add anything.
+5. **Real backup.** For every planned package that is already installed (an upgrade), its
+   current .deb is saved and its settings files are copied, together with the auto/manual
+   marks. Each saved file is hashed and read back. If an upgraded package's current
+   version can't be saved, the install stops (fail closed).
+6. **Install, then prove nothing else changed.** The full dpkg state before and after
+   must differ in exactly the planned packages and versions. Otherwise it restores
+   automatically and reports failure.
 
-Rollback (separately approved): the install must be in the root ledger for this owner,
-device and software, not rolled back yet, with a verified backup. Packages that were
-not installed before are removed with their settings files kept (retire, don't purge).
-Packages that were at another version go back to it.
-
+Rollback (separately approved, same challenge rules):
+- The ledger entry must exist for this owner, device and software, not be rolled back,
+  and have a verified backup. The backup files are re-hashed.
+- Every affected package must still be at the version the install left. Otherwise it
+  refuses ("changed_since_install").
+- Simulate removing the added packages: apt must remove exactly those and nothing else.
+  If something installed later depends on them, it refuses. The downgrades are simulated
+  from the saved .deb files with no download and no removals.
+- Then it executes, restores the settings files and marks, and verifies the final state
+  against the backup.
 Containers are refused until their own reviewed executor exists.
 """
 from __future__ import annotations
@@ -30,6 +40,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
@@ -37,11 +48,14 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .. import catalog
 from ..ledger import InstallLedger, LedgerError
 from ..plan import PlanError, validate_plan
 from ..requests import request_id as payload_hash
 from . import apt
-from .proof import ProofDenied
+from .proof import ProofDenied, decision_nonce, render_summary
+
+CHALLENGE_LIFETIME = 600
 
 
 class ExecutionDenied(Exception):
@@ -51,14 +65,17 @@ class ExecutionDenied(Exception):
 
 
 class Runs:
-    """Root-only record of used proofs and of every run's outcome."""
+    """Root-only: issued challenges, used proofs, decisions and every run's outcome."""
 
-    def __init__(self, path):
-        self.path, self._lock = str(path), threading.Lock()
+    def __init__(self, path, clock=time.time):
+        self.path, self.clock, self._lock = str(path), clock, threading.Lock()
         with self._tx() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS runs (
                 request_id TEXT PRIMARY KEY, proof TEXT UNIQUE NOT NULL, kind TEXT NOT NULL,
                 state TEXT NOT NULL, result TEXT, started REAL NOT NULL, finished REAL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS challenges (
+                challenge TEXT PRIMARY KEY, request_id TEXT NOT NULL, decision TEXT NOT NULL,
+                expires REAL NOT NULL, used REAL)""")
 
     @contextmanager
     def _tx(self):
@@ -76,18 +93,37 @@ class Runs:
             finally:
                 db.close()
 
-    def claim(self, request_id, proof, kind):
+    def issue(self, request_id, decision):
+        challenge = secrets.token_hex(32)
+        with self._tx() as db:
+            if db.execute("SELECT 1 FROM runs WHERE request_id=?", (request_id,)).fetchone():
+                raise ExecutionDenied("already_decided_or_used")
+            db.execute("INSERT INTO challenges VALUES (?,?,?,?,NULL)",
+                       (challenge, request_id, decision, self.clock() + CHALLENGE_LIFETIME))
+        return challenge
+
+    def consume(self, *, challenge, request_id, decision, proof, kind):
+        """Atomically: the challenge is ours, fresh, unused and matches; record the run. Else refuse."""
         try:
             with self._tx() as db:
+                row = db.execute("SELECT * FROM challenges WHERE challenge=?",
+                                 (challenge if type(challenge) is str else "",)).fetchone()
+                if row is None or row["request_id"] != request_id or row["decision"] != decision:
+                    raise ExecutionDenied("challenge_unknown")
+                if row["used"] is not None:
+                    raise ExecutionDenied("already_used")
+                if row["expires"] <= self.clock():
+                    raise ExecutionDenied("challenge_expired")
+                db.execute("UPDATE challenges SET used=? WHERE challenge=?", (self.clock(), challenge))
                 db.execute("INSERT INTO runs (request_id, proof, kind, state, started) VALUES (?,?,?,?,?)",
-                           (request_id, proof, kind, "running", time.time()))
+                           (request_id, proof, kind, "denied" if decision == "deny" else "running", self.clock()))
         except sqlite3.IntegrityError:
             raise ExecutionDenied("already_used") from None
 
     def finish(self, request_id, state, result):
         with self._tx() as db:
             db.execute("UPDATE runs SET state=?, result=?, finished=? WHERE request_id=?",
-                       (state, json.dumps(result, sort_keys=True), time.time(), request_id))
+                       (state, json.dumps(result, sort_keys=True), self.clock(), request_id))
 
     def status(self, request_id):
         with self._tx() as db:
@@ -97,8 +133,13 @@ class Runs:
         return {"state": row["state"], "result": json.loads(row["result"]) if row["result"] else None}
 
 
+def _sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 class Executor:
-    def __init__(self, *, state_dir, owner, device, verifier, run=apt.real_run, require_root=True):
+    def __init__(self, *, state_dir, owner, device, verifier, run=apt.real_run, require_root=True,
+                 sources_root="/etc/apt", file_root="/"):
         self.dir = Path(state_dir)
         if require_root and not apt.is_root():
             raise ExecutionDenied("installer_must_run_as_root")
@@ -107,73 +148,77 @@ class Executor:
         if self.dir.is_symlink() or info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise ExecutionDenied("installer_state_not_private")
         self.owner, self.device, self.verifier, self.run = owner, device, verifier, run
+        self.sources_root, self.file_root = sources_root, Path(file_root)
         self.runs = Runs(self.dir / "runs.sqlite3")
         self.ledger = InstallLedger(self.dir / "installs.sqlite3")
-        (self.dir / "snapshots").mkdir(exist_ok=True, mode=0o700)
+        for sub in ("snapshots", "downloads"):
+            (self.dir / sub).mkdir(exist_ok=True, mode=0o700)
 
-    # -- shared checks ----------------------------------------------------------------------
-    def _approved(self, payload, proof_token, kind):
+    # -- decisions ----------------------------------------------------------------------------
+    def challenge(self, payload, decision):
+        """Start the owner's decision: a root challenge plus the root-rendered summary to show."""
+        if decision not in ("approve", "deny"):
+            raise ExecutionDenied("invalid_decision")
+        self._check_payload(payload)
         rid, _ = payload_hash(payload)
+        challenge = self.runs.issue(rid, decision)
+        return {"request_id": rid, "decision": decision, "challenge": challenge,
+                "nonce": decision_nonce(decision, rid, rid, challenge),
+                "summary": render_summary(payload), "expires_in": CHALLENGE_LIFETIME}
+
+    def _check_payload(self, payload):
+        if type(payload) is not dict:
+            raise ExecutionDenied("plan_invalid_or_expired")
+        if payload.get("kind") == "rollback":
+            return self._check_rollback_payload(payload)
+        return self._check_install_payload(payload)
+
+    def _decide(self, payload, proof_token, challenge, decision, kind):
+        rid, _ = payload_hash(payload)
+        if type(challenge) is not str or len(challenge) != 64:
+            raise ExecutionDenied("challenge_unknown")
         try:
-            self.verifier.verify(proof_token, request_id=rid, plan_sha256=rid, owner=self.owner)
+            nonce = decision_nonce(decision, rid, rid, challenge)
+            fingerprint = self.verifier.verify(proof_token, owner=self.owner, expected_nonce=nonce)
         except ProofDenied as denied:
             raise ExecutionDenied(denied.code) from None
-        from .proof import proof_fingerprint
-        self.runs.claim(rid, proof_fingerprint(proof_token), kind)
+        self.runs.consume(challenge=challenge, request_id=rid, decision=decision, proof=fingerprint, kind=kind)
         return rid
 
-    def _snapshot(self, rollback_id, before):
-        path = self.dir / "snapshots" / (rollback_id + ".json")
-        data = json.dumps({"rollback_id": rollback_id, "before": before}, sort_keys=True).encode()
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        if hashlib.sha256(path.read_bytes()).hexdigest() != hashlib.sha256(data).hexdigest():
-            raise ExecutionDenied("backup_not_verified")
-        return path
+    def deny(self, payload, proof_token, challenge):
+        """The owner said no. Recorded; this request can never be approved afterwards."""
+        self._check_payload(payload)
+        rid = self._decide(payload, proof_token, challenge, "deny", payload.get("kind", "install"))
+        self.runs.finish(rid, "denied", {"ok": True, "denied_by_owner": True})
+        return {"ok": True, "denied_by_owner": True}
 
-    def _restore(self, before):
-        """Put every package back to its recorded state. Returns True if dpkg then agrees."""
-        newly = sorted(name for name, version in before.items() if version is None)
-        older = [(name, version) for name, version in sorted(before.items()) if version is not None]
-        ok = True
-        if newly:
-            ok = apt.remove(newly, self.run) and ok
-        if older:
-            ok = self.run(["apt-get", "install", "-q", "-y", "--allow-downgrades", "--no-install-recommends",
-                           "-o", "Dpkg::Options::=--force-confold", "--",
-                           *apt._pins(older)])[0] == 0 and ok
-        return ok and apt.installed_versions(sorted(before), self.run) == before
-
-    def _rollback_simulates(self, before):
-        newly = sorted(name for name, version in before.items() if version is None)
-        older = [(name, version) for name, version in sorted(before.items()) if version is not None]
-        if newly and not apt.simulate_remove(newly, self.run):
-            return False
-        if older:
-            return self.run(["apt-get", "-s", "-q", "-y", "--allow-downgrades", "install", "--",
-                             *apt._pins(older)])[0] == 0
-        return True
-
-    # -- install ----------------------------------------------------------------------------
-    def install(self, payload, proof_token, *, software, now=None):
-        """Execute an approved install. Returns a result dict; raises ExecutionDenied before any change."""
+    # -- install ------------------------------------------------------------------------------
+    def _check_install_payload(self, payload, now=None):
         try:
             plan = validate_plan(payload, expected_owner=self.owner, expected_device=self.device,
                                  now=now or datetime.now(timezone.utc))
         except PlanError:
             raise ExecutionDenied("plan_invalid_or_expired") from None
-        content = plan.content()
         if plan.plan_sha256 != payload_hash(payload)[0]:
             raise ExecutionDenied("plan_hash_mismatch")
+        content = plan.content()
         if any(step["kind"] != "apt" for step in content["steps"]):
             raise ExecutionDenied("step_kind_not_supported_yet")
-        rid = self._approved(payload, proof_token, "install")
         try:
-            result = self._install_apt(rid, content, software)
+            entry = catalog.entry(content.get("software"))
+        except catalog.CatalogError:
+            raise ExecutionDenied("software_not_in_plan_or_catalog") from None
+        names = {p["name"] for step in content["steps"] for p in step["packages"]}
+        if entry["kind"] != "apt" or not set(entry["packages"]) <= names:
+            raise ExecutionDenied("plan_does_not_match_catalog_entry")
+        return content
+
+    def install(self, payload, proof_token, challenge, *, now=None):
+        """Execute an approved install. Raises ExecutionDenied before any change; else returns a result."""
+        content = self._check_install_payload(payload, now)
+        rid = self._decide(payload, proof_token, challenge, "approve", "install")
+        try:
+            result = self._install_apt(rid, content)
         except ExecutionDenied as stopped:
             result = {"ok": False, "stopped": stopped.code, "changed_anything": False}
         except Exception as error:
@@ -181,37 +226,143 @@ class Executor:
         self.runs.finish(rid, "done" if result.get("ok") else "failed", result)
         return result
 
-    def _install_apt(self, rid, content, software):
+    def _install_apt(self, rid, content):
         wanted = {p["name"]: p["version"] for step in content["steps"] for p in step["packages"]}
         pins = sorted(wanted.items())
+        if apt.untrusted_sources(self.sources_root):
+            raise ExecutionDenied("untrusted_package_source_configured")
+        for name, version in pins:
+            if not apt.origin_is_ubuntu(name, version, self.run):
+                raise ExecutionDenied("package_not_from_the_ubuntu_archive")
+        before = apt.state(self.run)
+        manual_before = apt.manual_packages(self.run)
+        upgraded = sorted(n for n in wanted if n in before and before[n] != wanted[n])
+        expected = {n: v for n, v in wanted.items() if before.get(n) != v}
+        cache = self.dir / "downloads" / rid
+        if not apt.download(pins, cache, self.run):
+            raise ExecutionDenied("download_failed")
         try:
-            would, removals = apt.simulate_install(apt._pins(pins), self.run)
+            would, removals = apt.simulate_install(apt._pins(pins), self.run, cache=cache, no_download=True)
         except RuntimeError:
-            raise ExecutionDenied("approved_version_no_longer_available") from None   # e.g. archive moved on
+            raise ExecutionDenied("approved_version_no_longer_available") from None
         if removals:
             raise ExecutionDenied("would_remove_packages")
-        before = apt.installed_versions(sorted(wanted), self.run)
-        # Drift: apt may install nothing outside the plan, only the approved versions, and every
-        # planned package it would NOT touch must already be at its approved version.
-        if (not set(would) <= set(wanted) or any(would[n] != wanted[n] for n in would)
-                or any(before[n] != wanted[n] for n in wanted if n not in would)):
+        if would != expected:
             raise ExecutionDenied("drift_from_approved_plan")
+
         rollback_id = secrets.token_hex(16)
-        self._snapshot(rollback_id, before)
-        if not apt.install(pins, self.run) or apt.installed_versions(sorted(wanted), self.run) != wanted:
-            restored = self._restore(before)
+        manifest = self._backup(rollback_id, before, manual_before, upgraded, wanted)
+        if not apt.install(pins, self.run, cache=cache, no_download=True):
+            restored = self._restore(manifest)
             return {"ok": False, "stopped": "install_failed", "changed_anything": not restored,
                     "restored_from_backup": restored}
-        verified = self._rollback_simulates(before)
-        self.ledger.record(rollback_id=rollback_id, software=software, owner=self.owner, device=self.device,
-                           request_id=rid, snapshot_id=rollback_id, snapshot_verified=verified)
+        after = apt.state(self.run)
+        diff = self._diff(before, after)
+        if diff != expected:
+            extras = sorted(n for n, v in diff.items() if v is not None and before.get(n) is None and n not in wanted)
+            restored = self._restore(manifest, extra_added=extras) and apt.state(self.run) == before
+            return {"ok": False, "stopped": "transaction_differed_from_plan", "changed_anything": not restored,
+                    "restored_from_backup": restored}
+        manifest["after"] = {n: after.get(n) for n in wanted}
+        self._write_manifest(rollback_id, manifest)
+        self.ledger.record(rollback_id=rollback_id, software=content["software"], owner=self.owner,
+                           device=self.device, request_id=rid, snapshot_id=rollback_id, snapshot_verified=True)
+        shutil.rmtree(cache, ignore_errors=True)
         return {"ok": True, "installed": [{"name": n, "version": v} for n, v in pins],
-                "rollback_id": rollback_id, "rollback_verified": verified}
+                "rollback_id": rollback_id, "backup_verified": True,
+                "backup": {"saved_package_files": len(manifest["debs"]), "saved_settings_files": len(manifest["files"])}}
 
-    # -- rollback ---------------------------------------------------------------------------
-    def rollback(self, payload, proof_token):
-        if (type(payload) is not dict or payload.get("kind") != "rollback"
-                or payload.get("owner") != self.owner or payload.get("device") != self.device):
+    @staticmethod
+    def _diff(before, after):
+        changed = {n: v for n, v in after.items() if before.get(n) != v}
+        for n in before:
+            if n not in after:
+                changed[n] = None
+        return changed
+
+    # -- backup ---------------------------------------------------------------------------------
+    def _backup(self, rollback_id, before, manual_before, upgraded, wanted):
+        root = self.dir / "snapshots" / rollback_id
+        (root / "debs").mkdir(parents=True, mode=0o700)
+        (root / "files").mkdir(mode=0o700)
+        debs = {}
+        if upgraded:
+            old = [(n, before[n]) for n in upgraded]
+            if not apt.download(old, root / "debs", self.run):
+                raise ExecutionDenied("backup_not_possible_current_version_unavailable")
+            for name, version in old:
+                matches = sorted((root / "debs").glob("%s_*.deb" % name))
+                if len(matches) != 1:
+                    raise ExecutionDenied("backup_not_possible_current_version_unavailable")
+                debs[name] = {"version": version, "file": matches[0].name, "sha256": _sha256(matches[0])}
+        files = {}
+        for path in (apt.conffiles(upgraded, self.run) if upgraded else []):
+            source = self.file_root / path.lstrip("/")
+            if source.is_file() and not source.is_symlink():
+                target = root / "files" / hashlib.sha256(path.encode()).hexdigest()
+                shutil.copy2(source, target)
+                files[path] = {"copy": target.name, "sha256": _sha256(target), "mode": source.stat().st_mode & 0o7777}
+        manifest = {"rollback_id": rollback_id, "before": {n: before.get(n) for n in wanted},
+                    "manual_before": sorted(n for n in wanted if n in manual_before),
+                    "debs": debs, "files": files, "after": None}
+        self._write_manifest(rollback_id, manifest)
+        self._verify_backup(rollback_id)
+        return manifest
+
+    def _write_manifest(self, rollback_id, manifest):
+        path = self.dir / "snapshots" / rollback_id / "manifest.json"
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, json.dumps(manifest, sort_keys=True).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+
+    def _verify_backup(self, rollback_id):
+        """Every saved file is still there with its recorded hash. Returns the manifest."""
+        root = self.dir / "snapshots" / rollback_id
+        try:
+            manifest = json.loads((root / "manifest.json").read_text())
+            for item in manifest["debs"].values():
+                if _sha256(root / "debs" / item["file"]) != item["sha256"]:
+                    raise ExecutionDenied("backup_damaged")
+            for item in manifest["files"].values():
+                if _sha256(root / "files" / item["copy"]) != item["sha256"]:
+                    raise ExecutionDenied("backup_damaged")
+        except (OSError, ValueError, KeyError):
+            raise ExecutionDenied("backup_damaged") from None
+        return manifest
+
+    def _restore(self, manifest, extra_added=()):
+        """Put the affected packages, settings files and marks back. True if dpkg agrees afterwards."""
+        root = self.dir / "snapshots" / manifest["rollback_id"]
+        before = manifest["before"]
+        current = apt.installed_versions(sorted(before), self.run)
+        added = sorted({n for n, v in before.items() if v is None and current[n] is not None} | set(extra_added))
+        ok = True
+        if added:
+            ok = apt.remove(added, self.run) and ok
+        olds = sorted((n, item["version"]) for n, item in manifest["debs"].items())
+        if olds:
+            ok = apt.install(olds, self.run, cache=root / "debs", no_download=True, allow_downgrades=True) and ok
+        for path, item in manifest["files"].items():
+            target = self.file_root / path.lstrip("/")
+            try:
+                shutil.copy2(root / "files" / item["copy"], target)
+                os.chmod(target, item["mode"])
+            except OSError:
+                ok = False
+        manual = set(manifest["manual_before"])
+        present = [n for n, v in before.items() if v is not None]
+        ok = apt.set_marks(manual & set(present), set(present) - manual, self.run) and ok
+        return ok and apt.installed_versions(sorted(before), self.run) == before
+
+    # -- rollback -------------------------------------------------------------------------------
+    def _check_rollback_payload(self, payload):
+        if (payload.get("kind") != "rollback" or payload.get("owner") != self.owner
+                or payload.get("device") != self.device):
             raise ExecutionDenied("rollback_request_invalid")
         try:
             expires = datetime.strptime(payload["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -224,14 +375,47 @@ class Executor:
                                              owner=self.owner, device=self.device)
         except LedgerError as refused:
             raise ExecutionDenied(refused.code) from None
-        rid = self._approved(payload, proof_token, "rollback")
+        if payload.get("request_id") != entry["request_id"] or payload.get("snapshot_id") != entry["snapshot_id"]:
+            raise ExecutionDenied("rollback_request_invalid")
+        return entry
+
+    def rollback(self, payload, proof_token, challenge):
+        entry = self._check_rollback_payload(payload)
+        manifest = self._verify_backup(entry["snapshot_id"])
+        self._rollback_preflight(manifest)                      # refuses before the approval is consumed
+        rid = self._decide(payload, proof_token, challenge, "approve", "rollback")
         try:
-            before = json.loads((self.dir / "snapshots" / (entry["snapshot_id"] + ".json")).read_text())["before"]
-            ok = self._restore(before)
+            self._rollback_preflight(manifest)                  # and again, right before acting
+            ok = self._restore(manifest)
             if ok:
                 self.ledger.mark_rolled_back(entry["rollback_id"])
-            result = {"ok": ok, "restored": before} if ok else {"ok": False, "stopped": "restore_incomplete"}
+            result = {"ok": ok, "restored": manifest["before"]} if ok else {"ok": False, "stopped": "restore_incomplete"}
+        except ExecutionDenied as stopped:
+            result = {"ok": False, "stopped": stopped.code, "changed_anything": False}
         except Exception as error:
             result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__}
         self.runs.finish(rid, "done" if result["ok"] else "failed", result)
         return result
+
+    def _rollback_preflight(self, manifest):
+        after, before = manifest["after"], manifest["before"]
+        if after is None or apt.installed_versions(sorted(after), self.run) != after:
+            raise ExecutionDenied("changed_since_install")
+        added = sorted(n for n, v in before.items() if v is None)
+        if added:
+            try:
+                removals = apt.simulate_remove(added, self.run)
+            except RuntimeError:
+                raise ExecutionDenied("rollback_simulation_failed") from None
+            if set(removals) != set(added):
+                raise ExecutionDenied("rollback_would_affect_other_packages")
+        olds = sorted((n, item["version"]) for n, item in manifest["debs"].items())
+        if olds:
+            root = self.dir / "snapshots" / manifest["rollback_id"] / "debs"
+            try:
+                would, removals = apt.simulate_install(apt._pins(olds), self.run, cache=root, no_download=True,
+                                                       allow_downgrades=True)
+            except RuntimeError:
+                raise ExecutionDenied("rollback_simulation_failed") from None
+            if removals or would != dict(olds):
+                raise ExecutionDenied("rollback_would_affect_other_packages")

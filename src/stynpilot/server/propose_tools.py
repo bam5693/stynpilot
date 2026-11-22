@@ -141,8 +141,10 @@ def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt
             payload = {"kind": "rollback", "software": software, "rollback_id": rollback_id,
                        "request_id": install["request_id"], "snapshot_id": install["snapshot_id"],
                        "owner": owner, "device": device_id, "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
-            summary = ["Roll back %s to the verified backup taken before install %s." % (item["title"], rollback_id[:12]),
-                       "That backup was verified restorable when it was taken; it is checked again before restoring.",
+            summary = ["Roll back %s (install %s)." % (item["title"], rollback_id[:12]),
+                       "Packages that install added are removed (their settings files are kept); packages it "
+                       "upgraded go back to their saved earlier versions. The installer re-checks everything first "
+                       "and refuses if anything else would be affected.",
                        "Expires %s UTC if not approved." % payload["expires_at"].replace("T", " ").rstrip("Z")]
             result, _ = store.submit(kind="rollback", software=software, device=device_id, owner=owner,
                                      proposer=proposer, payload=payload, summary=summary,

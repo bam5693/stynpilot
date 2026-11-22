@@ -53,7 +53,10 @@ _LOCAL_NETS = tuple(ipaddress.ip_network(x) for x in (
     "100.64.0.0/10",                                   # Tailscale
     "127.0.0.0/8", "::1/128", "fc00::/7",              # loopback, IPv6 private
 ))
-_PLAN_FIELDS = {"schema", "owner", "device", "steps", "backup", "rollback", "expires_at"}
+_PLAN_FIELDS = {"schema", "owner", "device", "steps", "backup", "rollback", "expires_at", "software"}
+# "software" (the catalog id) is optional for this validator, but the root executor
+# requires it: it is hashed with the plan, so the recorded software name is the approved one.
+_REQUIRED_PLAN_FIELDS = _PLAN_FIELDS - {"software"}
 _STEP_FIELDS = {"kind", "packages", "app", "image", "bind_ip", "host_port", "container_port", "data_subdir"}
 _CONTAINER_FIELDS = {"kind", "app", "image", "bind_ip", "host_port", "container_port", "data_subdir"}
 
@@ -129,7 +132,9 @@ def validate_plan(raw: Mapping[str, Any], *, expected_owner: str, expected_devic
     expected_owner and expected_device MUST come from a trusted verifier (the owner's
     verified token and the enrolled device record), never from AI-supplied fields.
     """
-    plan = _only(raw, _PLAN_FIELDS, _PLAN_FIELDS, "plan")
+    plan = _only(raw, _PLAN_FIELDS, _REQUIRED_PLAN_FIELDS, "plan")
+    if "software" in plan:
+        _match(plan["software"], _SLUG, "software (catalog id)")
     if type(plan["schema"]) is not int or plan["schema"] != SCHEMA:
         raise PlanError("unsupported plan schema")
     for trusted in (expected_owner, expected_device):

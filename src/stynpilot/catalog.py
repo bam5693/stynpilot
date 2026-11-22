@@ -90,7 +90,8 @@ def install_plan(software, *, owner, device, resolve_apt, now=None):
             or not all(type(p) is dict and set(p) == {"name", "version"} for p in packages)
             or not set(item["packages"]) <= {p["name"] for p in packages}):
         raise CatalogError("package_not_available")
-    raw = {"schema": 1, "owner": owner, "device": device, "steps": [{"kind": "apt", "packages": packages}],
+    raw = {"schema": 1, "owner": owner, "device": device, "software": software,
+           "steps": [{"kind": "apt", "packages": packages}],
            "backup": BACKUP, "rollback": ROLLBACK, "expires_at": _expiry(now)}
     validated = validate_plan(raw, expected_owner=owner, expected_device=device, now=now)
     summary = ["Install %s from the Ubuntu archive." % item["title"]]

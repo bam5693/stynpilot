@@ -12,5 +12,9 @@ requires-python = ">=3.11"
 # nothing to download on the Ryzen or the Pi before the core can run.
 dependencies = []
 
+[project.optional-dependencies]
+# Only the MCP endpoint (src/stynpilot/server/tokens.py and app.py) needs these.
+server = ["mcp>=1.26,<2", "PyJWT[crypto]>=2.10"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

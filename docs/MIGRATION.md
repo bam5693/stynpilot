@@ -12,13 +12,19 @@ Device IDs, hostnames, emails, Auth0 values and backup data are never copied.
 | `stynpilot/policy.py` | `tools/commander_policy.py` | One table validator; the owner's four "always ask me" rules added as YELLOW |
 | `stynpilot/board.py` | `src/commander_coordination.py` | Review tasks (different reviewer, verdict, 3-round cap), nesting limit, `pr:` claims, cancellation signal |
 | `stynpilot/plan.py` | ChatGPT's commit `0e81d7b1` | Validated content travels with the hash; cross-step package duplicates; one expiry spelling |
+| `stynpilot/health.py` | `src/stynpilot_system_status.py` | Only the five AI-facing metrics, already bounded; no hostname, no systemctl |
+| `stynpilot/service_status.py` | `src/stynpilot_service_status.py` (MR !29) | Fails closed: only Forgejo's own health/version/installer answers count; exact loopback and any-address listener matching; catalog drift test returns with the catalog |
+| `stynpilot/identity.py` | `customer_identity.py`, `session_revocation.py` | One module; revocation table renamed (fresh start, no data carried over) |
+| `stynpilot/server/tokens.py` | `mcp_token_verifier.py` | Same checks; optional `[server]` extra (PyJWT) |
+| `stynpilot/server/router.py` | `mcp_read_router.py` + `_LocalOwnership` | Health and status share one two-layer check, before and after each read |
+| `stynpilot/server/app.py` | `customer_mcp_server.py` | Read-only tools only for now; optional `[server]` extra (MCP SDK 1.x) |
 
 ## Port next (proven, needs adapting)
 
 Ordered by what the Ryzen needs first.
 
 1. `tools/stynpilot_remote_broker.py`: root broker on a private UNIX socket, single-use owner tokens. Generalize from the Forgejo recipe to executing a `ValidatedPlan`.
-2. `src/commander_health_connection.py`, `mcp_token_verifier.py`, `mcp_read_router.py`: the MCP endpoint and token checks ChatGPT already uses on the Ryzen.
+2. `src/commander_health_connection.py` (startup, protected-resource metadata, loopback listener) plus `oidc_provider.py`, `owner_proposal_grants.py` and the pairing store: the remaining pieces needed to *run* the endpoint. Tokens, router and tools are done.
 3. `src/stynpilot_files.py`, `stynpilot_file_tools.py`, `stynpilot_file_changes.py`: enrolled folders and USB with path and symlink safety.
 4. `src/commander_phone_bridge.py`, `commander_approval_api.py`, `stynpilot_phone_assets.py`: the phone approval page.
 5. `tools/commander_activation_attestation.py`: root-signed activation. This was the fix for the systemd user-namespace issue.

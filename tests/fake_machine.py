@@ -27,6 +27,8 @@ class FakeMachine:
         self.bad_hash = set()                            # names whose index hash differs from the file apt fetches
         self.ambiguous_hash = set()                      # names listed with two different hashes
         self.config_ok = True
+        self.fail_state_while_installed = None           # name: the full dpkg listing fails while it is installed
+        self.fail_remove = False
 
     def changes(self):
         return [c for c in self.commands if c[:2] in (["apt-get", "install"], ["apt-get", "remove"])
@@ -60,9 +62,15 @@ class FakeMachine:
         self.commands.append(list(argv))
         tool = argv[0]
         if tool == "dpkg-query":
-            if "--" in argv:
+            if "--" in argv and "${Conffiles}\\n" in argv:
                 name = argv[argv.index("--") + 1]
                 return 0, "".join(" %s abcdef\n" % p for p in self.conffiles.get(name, []))
+            if "--" in argv:                                   # per-package query: only these, installed ones
+                names = argv[argv.index("--") + 1:]
+                return (0 if all(n in self.installed for n in names) else 1,
+                        "".join("%s\t%s\tii \n" % (n, self.installed[n]) for n in names if n in self.installed))
+            if self.fail_state_while_installed in self.installed:
+                return 2, ""
             return 0, "".join("%s\t%s\tii \n" % (n, v) for n, v in sorted(self.installed.items()))
         if tool == "apt-mark":
             if argv[1] == "showmanual":
@@ -99,6 +107,8 @@ class FakeMachine:
                     if dependent in self.installed and dependent not in names:
                         names.append(dependent)
                         todo.append(dependent)
+            if self.fail_remove and not simulate:
+                return 100, "E: remove failed\n"
             if simulate:
                 return 0, "".join("Remv %s [%s]\n" % (t, self.installed[t]) for t in names if t in self.installed)
             for name in names:

@@ -78,7 +78,9 @@ class ProposeToolTests(unittest.TestCase):
         self.state = Path(tmp.name) / "state"
         self.enrolled = [{"client_id": "chatgpt-connector", "name": "chatgpt", "kind": "chatgpt"},
                          {"client_id": "claude-connector", "name": "claude", "kind": "claude"}]
-        self.clients = EnrolledClients(self.enrolled, revocations=RevocationFile(self.state / "revoked-clients.json"))
+        revocations = RevocationFile(self.state / "revoked-clients.json")
+        revocations.provision()
+        self.clients = EnrolledClients(self.enrolled, revocations=revocations)
         self.now = [datetime(2026, 11, 22, 17, 0, 5, tzinfo=timezone.utc)]
         self.store = RequestStore(self.state / "requests.sqlite3", clock=lambda: self.now[0].timestamp())
         self.ledger = InstallLedger(self.state / "installs.sqlite3", clock=lambda: self.now[0].timestamp())
@@ -211,6 +213,28 @@ class ProposeToolTests(unittest.TestCase):
         self.assertEqual(self.call("commander_software_install_status", args, "claude"),
                          {"ok": False, "error": "client_not_enrolled_or_revoked"})
 
+    def test_deleting_the_revocation_file_never_restores_a_revoked_client(self):
+        from stynpilot.server.clients import ClientDenied
+        path = self.state / "revoked-clients.json"
+        self.clients.revoke("claude-connector")
+        os.unlink(path)                                              # attacker/accident deletes the list
+        for registry in (self.clients, EnrolledClients(self.enrolled, revocations=RevocationFile(path))):   # live and after restart
+            for who in ("claude", "chatgpt"):                        # everyone refused, nobody silently restored
+                with self.assertRaises(ClientDenied) as caught:
+                    registry.proposer(Tokens.valid[who])
+                self.assertEqual(caught.exception.code, "client_state_unreadable")
+        self.assertEqual(self.call("commander_software_install_status", {"device_id": DEVICE, "request_id": "a" * 64}, "claude"),
+                         {"ok": False, "error": "client_state_unreadable"})
+        self.assertFalse(path.exists())                              # a refused check must not re-create it
+        # Owner recovery: provision again, then the revocation has to be made again on purpose.
+        fresh = RevocationFile(path)
+        self.assertTrue(fresh.provision())
+        self.assertFalse(fresh.provision())                          # never overwrites an existing list
+        registry = EnrolledClients(self.enrolled, revocations=fresh)
+        self.assertEqual(registry.proposer(Tokens.valid["claude"]).name, "claude")
+        registry.revoke("claude-connector")
+        self.assertEqual(RevocationFile(path).revoked(), frozenset({"claude-connector"}))
+
     # --- PR #10 review: revocation survives a restart and fails closed ---------------------
     def test_revocation_survives_restart_and_bad_state_refuses_everyone(self):
         self.clients.revoke("claude-connector")
@@ -237,6 +261,7 @@ class ProposeToolTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "client_state_unreadable")
                 self.assertEqual(self.install("chatgpt"), {"ok": False, "error": "client_state_unreadable"})
         path.unlink()
+        restarted.revocations.provision()                              # explicit owner recovery step
         restarted.reinstate("claude-connector")
         self.assertEqual(restarted.proposer(claude).name, "claude")
 

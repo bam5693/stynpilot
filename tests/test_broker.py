@@ -333,6 +333,88 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(self.machine.installed, {"bash": "5.2"})
         self.assertEqual(self.executor.runs.status(request_id(payload)[0])["state"], "failed")
 
+    # --- ChatGPT round 3: failures AFTER packages changed must recover or leave a durable record ---------
+    def test_failure_to_verify_state_after_install_is_recovered_automatically(self):
+        payload = self.plan()
+        self.machine.fail_state_while_installed = "htop"           # dpkg listing breaks once htop is in
+        result = self.install(payload)
+        self.assertEqual((result["ok"], result["restored_from_backup"], result["changed_anything"]), (False, True, False))
+        self.assertTrue(result["stopped"].startswith("post_change_failure_"))
+        self.assertEqual(self.machine.installed, {"bash": "5.2"})
+        self.assertEqual(self.executor.needs_attention(), [])
+        self.assertEqual(self.executor.runs.status(request_id(payload)[0])["state"], "failed")
+
+    def test_manifest_write_failure_after_install_is_recovered_automatically(self):
+        payload = self.plan()
+        real, calls = self.executor._write_manifest, []
+
+        def flaky(rollback_id, manifest):
+            calls.append(1)
+            if len(calls) == 2:                                    # first call = the pre-change backup manifest
+                raise OSError("disk full")
+            return real(rollback_id, manifest)
+        self.executor._write_manifest = flaky
+        result = self.install(payload)
+        self.assertEqual((result["ok"], result["restored_from_backup"]), (False, True))
+        self.assertEqual(self.machine.installed, {"bash": "5.2"})
+        self.assertEqual(self.executor.needs_attention(), [])
+
+    def test_ledger_failure_after_install_is_recovered_automatically(self):
+        payload = self.plan()
+
+        def broken(**kwargs):
+            raise OSError("ledger unwritable")
+        self.executor.ledger.record = broken
+        result = self.install(payload)
+        self.assertEqual((result["ok"], result["restored_from_backup"]), (False, True))
+        self.assertEqual(self.machine.installed, {"bash": "5.2"})
+
+    def test_when_recovery_itself_fails_the_owner_is_told_durably_and_installs_stop(self):
+        payload = self.plan()
+        self.machine.fail_state_while_installed = "htop"
+        self.machine.fail_remove = True                            # we can't take it out again
+        result = self.install(payload)
+        self.assertEqual((result["ok"], result["changed_anything"], result["restored_from_backup"],
+                          result["needs_owner_intervention"]), (False, True, False, True))
+        rid = request_id(payload)[0]
+        self.assertEqual(self.executor.runs.status(rid)["state"], "needs_owner_intervention")
+        self.assertEqual(self.executor.needs_attention(), [rid + ".json"])
+        record = (self.executor.dir / "attention" / (rid + ".json"))
+        self.assertEqual(os.stat(record).st_mode & 0o777, 0o600)
+        # durable: a restarted installer still knows, and refuses new installs
+        self.machine.fail_remove, self.machine.fail_state_while_installed = False, None
+        restarted = Executor(state_dir=self.executor.dir, owner=OWNER, device=DEVICE, verifier=self.verifier,
+                             run=self.machine, require_root=False, sources_root=self.root / "etc/apt", file_root=self.root)
+        self.assertEqual(restarted.needs_attention(), [rid + ".json"])
+        other = dict(payload, expires_at=self.other_expiry(payload))
+        self.denied("owner_intervention_required", restarted.challenge, other, "approve")
+
+    def test_a_run_interrupted_by_a_crash_is_recorded_on_restart(self):
+        payload = self.plan()
+        rid = request_id(payload)[0]
+        challenge = self.executor.challenge(payload, "approve")["challenge"]
+        self.executor.runs.consume(challenge=challenge, request_id=rid, decision="approve", proof="p" * 64, kind="install")
+        self.assertEqual(self.executor.runs.status(rid)["state"], "running")        # ...and the installer dies here
+        restarted = Executor(state_dir=self.executor.dir, owner=OWNER, device=DEVICE, verifier=self.verifier,
+                             run=self.machine, require_root=False, sources_root=self.root / "etc/apt", file_root=self.root)
+        status = restarted.runs.status(rid)
+        self.assertEqual(status["state"], "needs_owner_intervention")
+        self.assertEqual(status["result"]["stopped"], "interrupted_by_restart_or_crash")
+        self.assertEqual(restarted.needs_attention(), [rid + ".json"])
+
+    def test_rollback_failures_after_it_started_are_recorded_not_hidden(self):
+        result = self.installed_ok()
+        back = self.rollback_payload(result)
+        challenge, token = self.approval(back)
+
+        def broken(rollback_id):
+            raise OSError("ledger unwritable")
+        self.executor.ledger.mark_rolled_back = broken
+        undone = self.executor.rollback(back, token, challenge)
+        self.assertEqual((undone["ok"], undone["needs_owner_intervention"]), (False, True))
+        self.assertEqual(self.executor.runs.status(request_id(back)[0])["state"], "needs_owner_intervention")
+        self.assertEqual(len(self.executor.needs_attention()), 1)
+
     # --- G4 blocker 2: a real backup, not a version list ---------------------------------------------
     def upgrade_setup(self, archive=True):
         self.setUp(installed={"bash": "5.2", "libnl-3-200": "3.6.0"}, archive={"libnl-3-200": {"3.6.0"}} if archive else {})

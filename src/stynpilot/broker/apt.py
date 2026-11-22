@@ -239,8 +239,16 @@ def state(run=real_run):
 
 
 def installed_versions(names, run=real_run):
-    current = state(run)
-    return {name: current.get(name) for name in names}
+    """{name: version or None} for just these packages. Doesn't depend on the full listing working
+    (recovery must still work if that listing is what broke); a missing package is simply absent."""
+    code, out = run(["dpkg-query", "-W", "-f", "${Package}\\t${Version}\\t${db:Status-Abbrev}\\n", "--",
+                     *_check_names(names)])
+    found = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[2].strip().startswith("ii"):
+            found[parts[0]] = parts[1]
+    return {name: found.get(name) for name in names}
 
 
 def manual_packages(run=real_run):

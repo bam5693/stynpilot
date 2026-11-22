@@ -130,6 +130,10 @@ class Runs:
             db.execute("UPDATE runs SET state=?, result=?, finished=? WHERE request_id=?",
                        (state, json.dumps(result, sort_keys=True), self.clock(), request_id))
 
+    def running(self):
+        with self._tx() as db:
+            return [r["request_id"] for r in db.execute("SELECT request_id FROM runs WHERE state='running'")]
+
     def status(self, request_id):
         with self._tx() as db:
             row = db.execute("SELECT state, result FROM runs WHERE request_id=?", (request_id,)).fetchone()
@@ -156,8 +160,31 @@ class Executor:
         self.sources_root, self.file_root = sources_root, Path(file_root)
         self.runs = Runs(self.dir / "runs.sqlite3")
         self.ledger = InstallLedger(self.dir / "installs.sqlite3")
-        for sub in ("snapshots", "downloads"):
+        for sub in ("snapshots", "downloads", "attention"):
             (self.dir / sub).mkdir(exist_ok=True, mode=0o700)
+        # A run still marked "running" means the installer died mid-change. We can't know what state
+        # the machine is in, so record that durably and refuse new installs until the owner looks.
+        for rid in self.runs.running():
+            self._attention(rid, None, "interrupted_by_restart_or_crash", None)
+            self.runs.finish(rid, "needs_owner_intervention", {"ok": False, "stopped": "interrupted_by_restart_or_crash",
+                                                               "needs_owner_intervention": True})
+
+    def needs_attention(self):
+        """Durable records of runs that may have left the machine changed. New installs are refused while any exist."""
+        return sorted(p.name for p in (self.dir / "attention").glob("*.json"))
+
+    def _attention(self, rid, rollback_id, reason, detail):
+        record = {"request_id": rid, "rollback_id": rollback_id, "reason": reason, "detail": detail,
+                  "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "what_to_do": "Owner: check the package state before any further install; clear this record "
+                                "only after checking."}
+        path = self.dir / "attention" / ("%s.json" % rid)
+        fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, json.dumps(record, sort_keys=True).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     # -- decisions ----------------------------------------------------------------------------
     def challenge(self, payload, decision):
@@ -206,6 +233,8 @@ class Executor:
             raise ExecutionDenied("plan_invalid_or_expired") from None
         if plan.plan_sha256 != payload_hash(payload)[0]:
             raise ExecutionDenied("plan_hash_mismatch")
+        if self.needs_attention():
+            raise ExecutionDenied("owner_intervention_required")
         content = plan.content()
         if any(step["kind"] != "apt" for step in content["steps"]):
             raise ExecutionDenied("step_kind_not_supported_yet")
@@ -239,8 +268,10 @@ class Executor:
         except ExecutionDenied as stopped:
             result = {"ok": False, "stopped": stopped.code, "changed_anything": False}
         except Exception as error:
-            result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__, "changed_anything": None}
-        self.runs.finish(rid, "done" if result.get("ok") else "failed", result)
+            result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__, "changed_anything": False}
+        state = ("needs_owner_intervention" if result.get("needs_owner_intervention")
+                 else "done" if result.get("ok") else "failed")
+        self.runs.finish(rid, state, result)
         return result
 
     def _install_apt(self, rid, content):
@@ -282,20 +313,22 @@ class Executor:
 
         rollback_id = secrets.token_hex(16)
         manifest = self._backup(rollback_id, before, manual_before, upgraded, wanted)
+        # From here on the machine may change. Any failure, including in our own bookkeeping, must
+        # either restore from the backup or leave a durable "owner must check" record.
+        try:
+            return self._change_and_record(rid, rollback_id, manifest, pins, wanted, expected, before, cache, content)
+        except Exception as error:
+            return self._recover(rid, rollback_id, manifest, before, "post_change_failure_%s" % type(error).__name__)
+
+    def _change_and_record(self, rid, rollback_id, manifest, pins, wanted, expected, before, cache, content):
         if not apt.install(pins, self.run, cache=cache, no_download=True):
-            restored = self._restore(manifest)
-            return {"ok": False, "stopped": "install_failed", "changed_anything": not restored,
-                    "restored_from_backup": restored}
+            return self._recover(rid, rollback_id, manifest, before, "install_failed")
         after = apt.state(self.run)
         diff = self._diff(before, after)
         if diff != expected:
-            extras = sorted(n for n, v in diff.items() if v is not None and before.get(n) is None and n not in wanted)
-            self._restore(manifest, extra_added=extras)
-            left = {n: v for n, v in self._diff(before, apt.state(self.run)).items()}
-            # A package that already existed and was changed behind our back is NOT in the backup:
-            # we can't put it back, so we say so plainly instead of claiming a restore.
-            return {"ok": False, "stopped": "transaction_differed_from_plan", "changed_anything": bool(left),
-                    "restored_from_backup": not left, "not_restored": sorted(left), "limits": LIMITS}
+            return self._recover(rid, rollback_id, manifest, before, "transaction_differed_from_plan",
+                                 extra_added=sorted(n for n, v in diff.items()
+                                                    if v is not None and before.get(n) is None and n not in wanted))
         manifest["after"] = {n: after.get(n) for n in wanted}
         self._write_manifest(rollback_id, manifest)
         self.ledger.record(rollback_id=rollback_id, software=content["software"], owner=self.owner,
@@ -304,6 +337,27 @@ class Executor:
         return {"ok": True, "installed": [{"name": n, "version": v} for n, v in pins],
                 "rollback_id": rollback_id, "backup_verified": True, "backup_scope": BACKUP_SCOPE, "limits": LIMITS,
                 "backup": {"saved_package_files": len(manifest["debs"]), "saved_settings_files": len(manifest["files"])}}
+
+    def _recover(self, rid, rollback_id, manifest, before, reason, extra_added=()):
+        """Put the machine back from the backup. If we can't PROVE it is back, record that durably."""
+        left, detail = None, None
+        try:
+            try:
+                if not extra_added:                               # find packages that appeared that we didn't plan
+                    now = apt.state(self.run)
+                    extra_added = sorted(n for n, v in now.items() if before.get(n) is None and n not in manifest["before"])
+            except Exception:
+                extra_added = ()
+            self._restore(manifest, extra_added=extra_added)
+            left = self._diff(before, apt.state(self.run))
+        except Exception as error:
+            detail = "recovery_failed_%s" % type(error).__name__
+        if left == {}:
+            return {"ok": False, "stopped": reason, "changed_anything": False, "restored_from_backup": True}
+        detail = detail or "not_restored: %s" % ", ".join(sorted(left))
+        self._attention(rid, rollback_id, reason, detail)
+        return {"ok": False, "stopped": reason, "changed_anything": True, "restored_from_backup": False,
+                "not_restored": sorted(left or []), "needs_owner_intervention": True, "limits": LIMITS}
 
     @staticmethod
     def _diff(before, after):
@@ -419,15 +473,30 @@ class Executor:
         rid = self._decide(payload, proof_token, challenge, "approve", "rollback")
         try:
             self._rollback_preflight(manifest)                  # and again, right before acting
-            ok = self._restore(manifest)
-            if ok:
-                self.ledger.mark_rolled_back(entry["rollback_id"])
-            result = {"ok": ok, "restored": manifest["before"]} if ok else {"ok": False, "stopped": "restore_incomplete"}
         except ExecutionDenied as stopped:
             result = {"ok": False, "stopped": stopped.code, "changed_anything": False}
         except Exception as error:
-            result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__}
-        self.runs.finish(rid, "done" if result["ok"] else "failed", result)
+            result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__, "changed_anything": False}
+        else:
+            try:                                                # from here the machine changes
+                ok = self._restore(manifest)
+                if ok:
+                    self.ledger.mark_rolled_back(entry["rollback_id"])
+                    result = {"ok": True, "restored": manifest["before"], "limits": LIMITS}
+                else:
+                    self._attention(rid, entry["rollback_id"], "rollback_restore_incomplete", None)
+                    result = {"ok": False, "stopped": "restore_incomplete", "changed_anything": True,
+                              "needs_owner_intervention": True, "limits": LIMITS}
+            except Exception as error:
+                reason = "rollback_failed_%s" % type(error).__name__
+                try:
+                    self._attention(rid, entry["rollback_id"], reason, None)
+                except Exception:
+                    pass
+                result = {"ok": False, "stopped": reason, "changed_anything": True, "needs_owner_intervention": True}
+        state = ("needs_owner_intervention" if result.get("needs_owner_intervention")
+                 else "done" if result["ok"] else "failed")
+        self.runs.finish(rid, state, result)
         return result
 
     def _rollback_preflight(self, manifest):

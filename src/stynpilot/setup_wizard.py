@@ -13,6 +13,7 @@ database or the existing Preview26 service.
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import html
 import json
@@ -25,6 +26,7 @@ from pathlib import Path
 from .service import ConfigError, InstallerConfig, OwnerConfig, provision_owner_state
 
 ROOT_CONFIG = Path("/etc/stynpilot/installer.json")
+RECEIPT_NAME = "setup-receipt.json"
 ROOT_HELPER = "/usr/libexec/stynpilot/root-helper"
 APPROVAL_PORT, MCP_PORT = 18444, 18443
 FIELDS = ("issuer", "approval_client_id", "approval_public_host", "mcp_public_host", "pairing_db",
@@ -73,12 +75,17 @@ def owner_config_from_form(form, home):
     return data
 
 
+def canonical_bytes(data):
+    """The one byte layout used for every settings file we write, so a hash of it is reproducible."""
+    return json.dumps(data, indent=2, sort_keys=True).encode()
+
+
 def write_new_private(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        json.dump(data, handle, indent=2, sort_keys=True)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(canonical_bytes(data))
 
 
 def installer_proposal(owner_data, uid):
@@ -133,23 +140,41 @@ def setup_status(home, uid, root_config=ROOT_CONFIG):
     return out
 
 
-ROOT_UID = 0                                             # who must own the installed system settings (tests override)
+ROOT_UID = 0                                             # who must own the system files (tests override)
+
+
+def _lstat_ok(path, *, kind, forbidden_mode):
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not kind(info.st_mode) or info.st_uid != ROOT_UID or info.st_mode & forbidden_mode:
+        raise ValueError("unsafe")
+    return info
 
 
 def _system_state(root_config, paths, config, uid):
-    """"done" only when the file at /etc/stynpilot/installer.json is OUR settings: a plain root-owned private file whose
-    contents are exactly what this owner's setup proposed. An unrelated, different or loose file is "mismatch"."""
-    path = Path(root_config)
-    if not (path.exists() or path.is_symlink()):
+    """Did the privileged step finish FOR THIS OWNER with THESE settings?  The normal-user wizard cannot (and must
+    not) read the root-only 0600 settings file, so root leaves a small public RECEIPT next to it (root-owned, not
+    writable by anyone else) holding the owner's uid and the SHA-256 of the exact settings bytes it installed. The
+    wizard compares that hash with the settings this owner's setup proposed, and checks only the metadata of the real
+    file (root-owned, private, regular). "done" needs all of it; anything else is "mismatch"; nothing there (or the
+    settings file there without a receipt: root will finish it if identical, refuse otherwise) is "pending"."""
+    cfg = Path(root_config)
+    receipt = cfg.with_name(RECEIPT_NAME)
+    have_cfg, have_receipt = os.path.lexists(cfg), os.path.lexists(receipt)
+    if not have_receipt:
         return "pending"
+    if not have_cfg or config is None:
+        return "mismatch"
     try:
-        info = os.lstat(path)
-        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != ROOT_UID
-                or info.st_mode & 0o077 or config is None):
+        _lstat_ok(cfg.parent, kind=stat.S_ISDIR, forbidden_mode=0o022)
+        _lstat_ok(cfg, kind=stat.S_ISREG, forbidden_mode=0o077)                 # metadata only: contents are root-only
+        info = _lstat_ok(receipt, kind=stat.S_ISREG, forbidden_mode=0o022)
+        if info.st_size > 4096:
             return "mismatch"
-        installed = json.loads(path.read_text())
-        wanted = installer_proposal(_read_private(paths["config"]), uid)
-        return "done" if installed == wanted else "mismatch"
+        record = json.loads(receipt.read_text())
+        if type(record) is not dict or set(record) != {"schema", "owner_uid", "config_sha256"} or record["schema"] != 1:
+            return "mismatch"
+        wanted = hashlib.sha256(canonical_bytes(installer_proposal(_read_private(paths["config"]), uid))).hexdigest()
+        return "done" if record["owner_uid"] == uid and record["config_sha256"] == wanted else "mismatch"
     except Exception:
         return "mismatch"
 
@@ -225,8 +250,39 @@ def root_setup(source, *, dest=ROOT_CONFIG, invoking_uid=None, geteuid=os.geteui
         raise ConfigError("paths_must_be_the_packaged_ones")
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-    write_new_private(dest, data)                             # O_EXCL: never replaces an existing config
+    receipt = dest.with_name(RECEIPT_NAME)
+    wanted = canonical_bytes(data)
+    if os.path.lexists(dest):
+        if os.path.lexists(receipt):
+            raise FileExistsError(str(dest))                  # finished before: never replaced
+        # Died between writing the settings and the receipt: finish ONLY if the file is exactly what we'd write.
+        fd = os.open(dest, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            same = (stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077
+                    and os.read(fd, len(wanted) + 1) == wanted)
+        finally:
+            os.close(fd)
+        if not same:
+            raise ConfigError("a_different_system_settings_file_is_already_there_not_replacing_it")
+    else:
+        write_new_private(dest, data)                         # O_EXCL: never replaces an existing config
+    _write_receipt(receipt, uid, hashlib.sha256(wanted).hexdigest())
     return str(dest)
+
+
+def _write_receipt(path, uid, digest):
+    """Public (0644) proof that the privileged step finished: no secrets, only the owner uid and a hash."""
+    tmp = path.with_name(".%s.tmp" % path.name)
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(canonical_bytes({"schema": 1, "owner_uid": uid, "config_sha256": digest}))
+        handle.flush()
+        os.fchmod(handle.fileno(), 0o644)
+        os.fsync(handle.fileno())
+    os.rename(tmp, path)
 
 
 # ------------------------------------------------------------------------------------------------- web page
@@ -354,8 +410,9 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
         result = runner(str(default_paths(home)["proposed"]))
         status = setup_status(home, uid, root_config)
         if getattr(result, "returncode", 1) != 0 or status["system"] != "done":
+            why = html.escape(str(getattr(result, "stderr", "") or "")[:300])
             return next_step(status, "<p><b>The system step did not finish</b> (cancelled or refused). Nothing was "
-                                     "started. You can try again.</p>")
+                                     "started. You can try again.</p>%s" % ("<p><small>%s</small></p>" % why if why else ""))
         mark_complete(home)
         return next_step(setup_status(home, uid, root_config))
     return Starlette(routes=[Route("/setup/{token}", enter), Route("/setup", home_page),

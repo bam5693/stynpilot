@@ -80,6 +80,31 @@ assert_refused "a second root step must be refused" helper root-setup --from "$H
 assert_said "FileExistsError" "second root step refusal reason"
 assert_refused "root helper refuses an unknown job" helper rm-rf /
 
+say "4b. cross-user: root wrote a 0600 file the owner cannot read; the owner's wizard still verifies completion"
+inject receipt_private && chmod 600 /etc/stynpilot/setup-receipt.json
+[ "$(stat -c %a /etc/stynpilot/setup-receipt.json 2>/dev/null)" ] || fail "root step must leave a receipt"
+if as_user cat /etc/stynpilot/installer.json >/dev/null 2>&1; then fail "the owner must NOT be able to read the root-only settings"; fi
+setup_state() { as_user python3 -IB -c "
+import sys; sys.path[:0] = ['/usr/lib/stynpilot/lib', '/usr/lib/stynpilot/vendor']
+from pathlib import Path
+from stynpilot import setup_wizard
+s = setup_wizard.setup_status(Path('$H'), $UIDN); print(s['system'], s['complete'])"; }
+[ "$(setup_state)" = "done True" ] || fail "wizard must report setup complete after the root step (got: $(setup_state))"
+R=/etc/stynpilot/setup-receipt.json; cp $R /tmp/receipt.good
+python3 -IB -c "
+import json; r = json.load(open('$R')); r['config_sha256'] = '1' * 64; json.dump(r, open('$R', 'w'))"
+[ "$(setup_state)" = "mismatch False" ] || fail "tampered receipt (wrong hash) must be refused (got: $(setup_state))"
+python3 -IB -c "
+import json; r = json.load(open('/tmp/receipt.good')); r['owner_uid'] = $UIDN + 1; json.dump(r, open('$R', 'w'))"
+[ "$(setup_state)" = "mismatch False" ] || fail "receipt for another owner must be refused (got: $(setup_state))"
+cp /tmp/receipt.good $R; chmod 644 $R; chmod 666 $R
+[ "$(setup_state)" = "mismatch False" ] || fail "receipt writable by others must be refused (got: $(setup_state))"
+chmod 644 $R; chmod 644 /etc/stynpilot/installer.json
+[ "$(setup_state)" = "mismatch False" ] || fail "settings readable by others must be refused (got: $(setup_state))"
+chmod 600 /etc/stynpilot/installer.json
+[ "$(setup_state)" = "done True" ] || fail "restored files must verify again (got: $(setup_state))"
+rm -f /tmp/receipt.good
+
 say "5. doctor after setup"
 assert_ok "doctor runs after setup" as_user /usr/bin/stynpilot doctor --config "$H/.config/stynpilot/owner.json"
 assert_said "owner state files" "doctor sees the state"

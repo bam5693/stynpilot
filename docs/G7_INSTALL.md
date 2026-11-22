@@ -49,3 +49,12 @@ on purpose (`enable_unit`, `etc_created`, `allow_overwrite`, `keep_state`, `remo
 - Setup only counts as finished when `/etc/stynpilot/installer.json` is a root-owned private file with exactly the
   settings this owner's setup proposed. The password prompt names the one operation being approved (one polkit action
   per job: root-setup, root-backup, root-restore).
+
+## How the setup wizard knows the root step finished
+
+`/etc/stynpilot/installer.json` stays root-owned, mode 0600, so the normal-user wizard cannot read it. After writing it,
+the root helper writes a small public receipt `/etc/stynpilot/setup-receipt.json` (0644, root-owned): the owner's uid and
+the SHA-256 of the exact settings bytes installed. The wizard recomputes the hash from the settings this owner's setup
+proposed, checks the receipt is root-owned and not writable by others, and checks only the metadata of the settings file
+(root-owned, regular, private). Wrong owner, wrong hash, loose permissions or a missing file are all "mismatch". If the
+helper died between the two writes, re-running it finishes the receipt only when the existing file is byte-identical.

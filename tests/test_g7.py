@@ -463,18 +463,23 @@ class SetupTests(unittest.TestCase):
         make_pairing_db(self.home / ".local/state/stynpilot-owner", [(ts.DEVICE, ts.OWNER, time.time() + 3600, None, ["workspace.propose"])])
         self.pairing = self.home / ".local/state/stynpilot-owner/pairing.sqlite3"
         self.form = dict(FORM, pairing_db=str(self.pairing))
-        self.uid = 1000
+        self.uid = os.geteuid()
         self.root_config = self.home / "etc-installer.json"            # stands in for /etc/stynpilot/installer.json
         self.paths = setup_wizard.default_paths(self.home)
         real_uid = setup_wizard.ROOT_UID
         setup_wizard.ROOT_UID = os.geteuid()                              # stands in for "owned by root" in this test
         self.addCleanup(setattr, setup_wizard, "ROOT_UID", real_uid)
 
-    def install_root_config(self, content=None):
-        """What the root step leaves behind: a private file holding exactly the proposed settings."""
-        data = content if content is not None else json.loads(self.paths["proposed"].read_text())
-        self.root_config.write_text(json.dumps(data))
-        os.chmod(self.root_config, 0o600)
+    def install_root_config(self):
+        """The real privileged step (root_setup), as pkexec would run it: settings file 0600 + public receipt."""
+        setup_wizard.root_setup(self.paths["proposed"], dest=self.root_config, geteuid=lambda: 0, invoking_uid=self.uid)
+
+    @property
+    def receipt(self):
+        return self.root_config.with_name(setup_wizard.RECEIPT_NAME)
+
+    def status(self):
+        return setup_wizard.setup_status(self.home, self.uid, self.root_config)
 
     def resume(self, form="form", **kw):
         return setup_wizard.resume_setup(self.form if form == "form" else form, self.home, self.uid, self.root_config)
@@ -492,7 +497,7 @@ class SetupTests(unittest.TestCase):
                          ("ok", "ok", "complete", "pending"))
         self.assertEqual(self.paths["config"].stat().st_mode & 0o777, 0o600)
         proposal = json.loads(self.paths["proposed"].read_text())
-        self.assertEqual((proposal["owner"], proposal["device"], proposal["owner_uid"]), (ts.OWNER, ts.DEVICE, 1000))
+        self.assertEqual((proposal["owner"], proposal["device"], proposal["owner_uid"]), (ts.OWNER, ts.DEVICE, self.uid))
         self.assertEqual(service.OwnerConfig.from_file(self.paths["config"]).issuer, "https://tenant.example.auth/")
 
     def test_running_setup_again_with_the_same_answers_is_a_safe_resume_that_changes_nothing(self):
@@ -566,34 +571,145 @@ class SetupTests(unittest.TestCase):
             self.resume(None)
         self.assertEqual(setup_wizard.setup_status(self.home, self.uid, self.root_config)["config"], "invalid")
 
-    def test_an_unrelated_or_loose_root_config_file_does_not_count_as_setup_done(self):
+    def test_the_root_step_leaves_a_public_receipt_and_a_private_config_and_setup_checks_only_the_receipt(self):
         self.resume()
-        for label, content in (("empty", {}), ("other owner", dict(json.loads(self.paths["proposed"].read_text()), owner="x"))):
-            self.install_root_config(content)
-            status = setup_wizard.setup_status(self.home, self.uid, self.root_config)
-            self.assertEqual((status["system"], status["complete"]), ("mismatch", False), label)
         self.install_root_config()
-        self.assertTrue(setup_wizard.setup_status(self.home, self.uid, self.root_config)["complete"])
-        os.chmod(self.root_config, 0o644)                                           # loose permissions
-        self.assertEqual(setup_wizard.setup_status(self.home, self.uid, self.root_config)["system"], "mismatch")
+        self.assertEqual(self.root_config.stat().st_mode & 0o777, 0o600)            # the settings stay private
+        self.assertEqual(self.receipt.stat().st_mode & 0o777, 0o644)                # the receipt carries no secrets
+        record = json.loads(self.receipt.read_text())
+        self.assertEqual(set(record), {"schema", "owner_uid", "config_sha256"})
+        self.assertEqual(record["owner_uid"], self.uid)
+        self.assertTrue(self.status()["complete"])
+        os.chmod(self.root_config, 0)                                               # unreadable even to us: still "done"
+        self.assertEqual(self.status()["system"], "done")
+        os.chmod(self.root_config, 0o600)
+
+    def test_wrong_or_tampered_receipts_and_loose_files_are_refused(self):
+        self.resume()
+        self.install_root_config()
+        good = self.receipt.read_text()
+
+        def put(**changes):
+            os.chmod(self.receipt, 0o644)
+            self.receipt.write_text(json.dumps(dict(json.loads(good), **changes)))
+        for label, change in (("other owner", dict(owner_uid=self.uid + 1)), ("other settings", dict(config_sha256="0" * 64)),
+                              ("future schema", dict(schema=2)), ("extra field", dict(extra=1))):
+            put(**change)
+            status = self.status()
+            self.assertEqual((status["system"], status["complete"]), ("mismatch", False), label)
+        self.receipt.write_text("not json")
+        self.assertEqual(self.status()["system"], "mismatch")
+        self.receipt.write_text(good)
+        self.assertEqual(self.status()["system"], "done")
+        os.chmod(self.receipt, 0o666)                                               # writable by others
+        self.assertEqual(self.status()["system"], "mismatch")
+        os.chmod(self.receipt, 0o644)
+        os.chmod(self.root_config, 0o644)                                           # settings made readable by others
+        self.assertEqual(self.status()["system"], "mismatch")
         os.chmod(self.root_config, 0o600)
         setup_wizard.ROOT_UID = os.geteuid() + 1                                    # not owned by root
-        self.assertEqual(setup_wizard.setup_status(self.home, self.uid, self.root_config)["system"], "mismatch")
-        # a stray done-marker alone never makes setup complete either
-        self.root_config.unlink()
-        self.paths["done"].write_text("{}")
-        status = setup_wizard.setup_status(self.home, self.uid, self.root_config)
-        self.assertEqual((status["system"], status["complete"]), ("pending", False))
+        self.assertEqual(self.status()["system"], "mismatch")
+        setup_wizard.ROOT_UID = os.geteuid()
+        self.root_config.unlink()                                                   # receipt without settings
+        self.assertEqual(self.status()["system"], "mismatch")
+        self.receipt.unlink()
+        self.assertEqual((self.status()["system"], self.status()["complete"]), ("pending", False))
 
-    def test_the_page_for_an_unrelated_root_file_offers_no_button_and_says_nothing_was_changed(self):
+    def test_a_receipt_for_different_settings_does_not_count_after_the_owner_settings_change(self):
         self.resume()
-        self.install_root_config({})
-        c = self.client(lambda src: SimpleNamespace(returncode=0))
+        self.install_root_config()
+        data = json.loads(self.paths["proposed"].read_text())
+        os.chmod(self.paths["proposed"], 0o600)
+        self.paths["proposed"].write_text(json.dumps(dict(data, device="dtdev_other")))
+        os.chmod(self.paths["config"], 0o600)
+        cfg = json.loads(self.paths["config"].read_text())
+        self.paths["config"].write_text(json.dumps(dict(cfg, device="dtdev_other")))
+        self.assertEqual(self.status()["system"], "mismatch")                       # hash of the old settings != the new ones
+
+    def test_an_unrelated_settings_file_without_a_receipt_is_never_adopted_and_never_replaced(self):
+        self.resume()
+        self.root_config.write_text("{}")                                           # someone else's / unrelated file
+        os.chmod(self.root_config, 0o600)
+        status = self.status()
+        self.assertEqual((status["system"], status["complete"]), ("pending", False))   # not done
+        with self.assertRaises(ConfigError) as refused:
+            self.install_root_config()
+        self.assertIn("different_system_settings_file", str(refused.exception))
+        self.assertEqual(self.root_config.read_text(), "{}")                         # untouched
+        self.assertFalse(self.receipt.exists())
+
+    def test_an_interrupted_root_step_is_finished_only_for_identical_settings(self):
+        self.resume()
+        self.install_root_config()
+        self.receipt.unlink()                                                       # died between the two writes
+        self.assertEqual(self.status()["system"], "pending")
+        self.install_root_config()                                                  # finishes; settings are identical
+        self.assertEqual(self.status()["system"], "done")
+        with self.assertRaises(FileExistsError):                                    # a finished setup is never redone
+            self.install_root_config()
+
+    def test_real_root_writes_and_a_different_unprivileged_user_verifies(self):
+        """The actual Linux situation: root-owned 0600 settings, a normal account checking completion."""
+        if os.geteuid() != 0 or shutil.which("setpriv") is None:
+            self.skipTest("needs root (run as root in the disposable sandbox / the acceptance script)")
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        os.chmod(base, 0o755)
+        nobody = 65534
+        home = base / "home"
+        home.mkdir()
+        os.chown(home, nobody, nobody)
+        os.chmod(home, 0o700)
+        make_pairing_db(base / "pair", [(ts.DEVICE, ts.OWNER, time.time() + 3600, None, ["workspace.propose"])])
+        pairing = next((base / "pair").iterdir())
+        for path in ((base / "pair"), pairing):
+            os.chown(path, nobody, nobody)
+        os.chmod(base / "pair", 0o700)
+        os.chmod(pairing, 0o600)
+        form = dict(self.form, pairing_db=str(pairing))
+        config = base / "etc" / "installer.json"
+        code = (
+            "import sys, json\nsys.path[:0] = [%r, %r]\nfrom pathlib import Path\nfrom stynpilot import setup_wizard\n"
+            "home = Path(%r); form = json.loads(%r)\n"
+            "step = sys.argv[1]\n"
+            "if step == 'prepare': setup_wizard.resume_setup(form, home, %d, Path(%r))\n"
+            "else:\n s = setup_wizard.setup_status(home, %d, Path(%r)); print(s['system'], s['complete'])\n"
+        ) % (str(ROOT / "src"), str(ROOT / "tests"), str(home), json.dumps(form), nobody, str(config), nobody, str(config))
+
+        def as_nobody(step):
+            return subprocess.run(["setpriv", "--reuid=%d" % nobody, "--regid=65534", "--clear-groups", "env",
+                                   "HOME=%s" % home, "python3", "-I", "-c", code, step],
+                                  capture_output=True, text=True, cwd="/")
+        prepared = as_nobody("prepare")
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        proposed = home / ".config/stynpilot/installer.proposed.json"
+        self.assertEqual(as_nobody("check").stdout.split(), ["pending", "False"])
+        setup_wizard.root_setup(proposed, dest=config, geteuid=os.geteuid, invoking_uid=nobody)   # root writes
+        info = config.stat()
+        self.assertEqual((info.st_uid, info.st_mode & 0o777), (0, 0o600))
+        unreadable = subprocess.run(["setpriv", "--reuid=%d" % nobody, "--regid=65534", "--clear-groups", "cat", str(config)],
+                                    capture_output=True)
+        self.assertNotEqual(unreadable.returncode, 0)                                # the user really can't read it
+        self.assertEqual(as_nobody("check").stdout.split(), ["done", "True"])
+        record = json.loads(config.with_name(setup_wizard.RECEIPT_NAME).read_text())
+        record["config_sha256"] = "1" * 64                                           # root-side tamper
+        config.with_name(setup_wizard.RECEIPT_NAME).write_text(json.dumps(record))
+        self.assertEqual(as_nobody("check").stdout.split(), ["mismatch", "False"])
+        os.chmod(config, 0o644)
+        os.unlink(config.with_name(setup_wizard.RECEIPT_NAME))
+        self.assertEqual(as_nobody("check").stdout.split(), ["pending", "False"])
+
+    def test_the_page_for_a_refused_system_step_shows_why_and_offers_another_try(self):
+        self.resume()
+        self.root_config.write_text("{}")
+        os.chmod(self.root_config, 0o600)
+        refusal = SimpleNamespace(returncode=1, stderr="stynpilot-root-helper: ConfigError: a_different_system_settings_file_is_already_there")
+        c = self.client(lambda src: refusal)
         c.get("/setup/tok123", headers=self.H)
-        page = c.get("/setup", headers=self.H)
-        self.assertIn("different system settings file", page.text)
+        page = c.post("/setup/system", data={"go": "1"}, headers=self.HP)
+        self.assertIn("did not finish", page.text)
+        self.assertIn("a_different_system_settings_file", page.text)
         self.assertNotIn("Setup is finished", page.text)
-        self.assertNotIn("/setup/system", page.text)
 
     def test_the_password_prompt_texts_name_exactly_what_is_being_approved(self):
         import xml.dom.minidom as minidom
@@ -610,13 +726,10 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(annotations["org.freedesktop.policykit.exec.path"], "/usr/libexec/stynpilot/root-helper")
             for w in words:
                 self.assertIn(w, message)
-        page = setup_wizard.build_app(home=self.home, uid=self.uid, token="t", port=1, root_runner=lambda s: None,
-                                      root_config=self.root_config)
         self.resume()
-        from starlette.testclient import TestClient
-        c = TestClient(page, base_url="http://127.0.0.1:1", follow_redirects=False)
-        c.get("/setup/t", headers={"host": "127.0.0.1:1"})
-        text = c.get("/setup", headers={"host": "127.0.0.1:1"}).text
+        c = self.client(lambda s: None)
+        c.get("/setup/tok123", headers=self.H)
+        text = c.get("/setup", headers=self.H).text
         self.assertIn("approves ONE thing", text)
         self.assertIn("/etc/stynpilot/installer.json", text)
 
@@ -769,7 +882,7 @@ class ScriptAndPolicyTests(unittest.TestCase):
         for bad in ("|| true", "&& echo", "|| echo", "tail -1 ||"):
             self.assertNotIn(bad, text, bad)
         self.assertIn("RESULT: PASS", text)
-        for name in ("enable_unit", "etc_created", "allow_overwrite", "keep_state", "remove_config", "no_lock"):
+        for name in ("enable_unit", "etc_created", "allow_overwrite", "keep_state", "remove_config", "no_lock", "receipt_private"):
             self.assertIn("inject %s" % name, text)                                   # each invariant has a self-test hook
         r = subprocess.run(["sh", "-n", str(ROOT / "tools/isolated_install_check.sh")], capture_output=True)
         self.assertEqual(r.returncode, 0)

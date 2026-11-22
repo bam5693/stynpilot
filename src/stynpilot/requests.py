@@ -161,6 +161,11 @@ class RequestStore:
                        "WHERE request_id=?", (to_state, self.clock(), safe, request_id_value))
             return True
 
+    def in_flight(self):
+        with self._tx() as db:
+            return [r["request_id"] for r in db.execute(
+                "SELECT request_id FROM requests WHERE state IN ('approved','running') ORDER BY created")]
+
     def recover_interrupted(self):
         """After a restart: anything approved or running may have changed the machine, so it is marked
         for the owner instead of being retried or silently reported as pending/running."""

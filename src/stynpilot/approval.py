@@ -25,6 +25,7 @@ import secrets
 import threading
 import time
 
+from .broker.proof import summary_hash
 from .requests import RequestError
 
 VIEW_LIFETIME = 600
@@ -79,6 +80,11 @@ class ApprovalFlow:
             deny = self.broker.challenge(payload, "deny")
         except Exception as error:
             raise ApprovalError("installer_refused_%s" % getattr(error, "code", "unavailable")) from None
+        for challenge in (approve, deny):                       # the text must be exactly what the root produced
+            if summary_hash(list(challenge.get("summary", []))) != challenge.get("summary_sha256"):
+                raise ApprovalError("summary_altered_in_transit")
+        if approve["summary"] != deny["summary"]:
+            raise ApprovalError("summary_altered_in_transit")
         view, csrf = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
         with self._lock:
             self._sweep()
@@ -87,7 +93,8 @@ class ApprovalFlow:
             self._views[view] = {"request_id": request_id, "csrf": csrf, "challenges": {"approve": approve, "deny": deny},
                                  "used": False, "expires": self.clock() + VIEW_LIFETIME}
         return {"view": view, "csrf": csrf, "request_id": request_id, "kind": payload.get("kind", "install"),
-                "summary": list(approve["summary"]), "choices": ["approve", "deny"],
+                "summary": list(approve["summary"]), "summary_sha256": approve["summary_sha256"],
+                "fingerprint": request_id[:12], "choices": ["approve", "deny"],
                 "expires_in": VIEW_LIFETIME}
 
     # -- 2. the owner picks Approve or Deny: start a fresh Auth0 sign-in for exactly that choice --------
@@ -106,7 +113,7 @@ class ApprovalFlow:
             item["used"] = True
             state, verifier = secrets.token_urlsafe(24), secrets.token_urlsafe(48)
             challenge = item["challenges"][decision]
-            self._states[state] = {"request_id": item["request_id"], "decision": decision, "verifier": verifier,
+            self._states[state] = {"view": view, "request_id": item["request_id"], "decision": decision, "verifier": verifier,
                                    "challenge": challenge["challenge"], "expires": self.clock() + VIEW_LIFETIME}
         return {"url": self.authorize["endpoint"],
                 "params": {"response_type": "code", "client_id": self.authorize["client_id"],
@@ -115,11 +122,12 @@ class ApprovalFlow:
                            "code_challenge_method": "S256", "prompt": "login", "max_age": "0"}}
 
     # -- 3. Auth0 sends the owner back: record the decision, then act on it exactly once ---------------
-    def finish(self, state, code):
+    def finish(self, state, code, view=None):
+        """``view``: the browser session cookie from the page, when the web layer has one; it must match."""
         with self._lock:
             self._sweep()
             item = self._states.pop(state if type(state) is str else "", None)      # single use
-        if item is None:
+        if item is None or (view is not None and not hmac.compare_digest(str(view), item["view"])):
             raise ApprovalError("unknown_or_used_state")
         rid, decision = item["request_id"], item["decision"]
         payload = self.store.payload(rid)
@@ -145,16 +153,51 @@ class ApprovalFlow:
         try:
             result = method(payload, id_token, item["challenge"])
         except Exception as error:
-            code_ = getattr(error, "code", "installer_unavailable")
-            # Refused before anything changed (bad proof, expired, drift...): failed, nothing ran.
-            result = {"ok": False, "stopped": code_, "changed_anything": False}
-        if result.get("needs_owner_intervention"):
-            state_ = "needs_owner_intervention"
-        else:
-            state_ = "done" if result.get("ok") else "failed"
+            result = self._after_error(rid, error)
+        state_ = self._state_for(result)
         self.store.transition(rid, "running", state_, result=result)
         return {"state": state_, "ok": bool(result.get("ok"))}
 
+    @staticmethod
+    def _state_for(result):
+        if result.get("needs_owner_intervention"):
+            return "needs_owner_intervention"
+        return "done" if result.get("ok") else "failed"
+
+    def _after_error(self, rid, error):
+        """The installer call raised. A definite refusal (bad proof, drift...) means nothing ran. A dropped
+        connection could mean it ran: ask the installer's own record instead of guessing."""
+        code = getattr(error, "code", None)
+        if code is not None and code != "installer_unavailable":
+            return {"ok": False, "stopped": code, "changed_anything": False}
+        return self._root_result(rid)
+
+    def _root_result(self, rid):
+        """The installer's durable record for this request, as a result; unknown means the owner must verify."""
+        try:
+            record = self.broker.status(rid)
+        except Exception:
+            return {"ok": False, "stopped": "installer_unreachable_owner_must_verify", "changed_anything": None,
+                    "needs_owner_intervention": True}
+        state = record.get("state")
+        result = record.get("result") or {}
+        if state in ("done", "failed", "needs_owner_intervention") and isinstance(result, dict) and "ok" in result:
+            return dict(result)
+        if state == "denied":
+            return {"ok": False, "stopped": "denied_by_owner", "changed_anything": False}
+        if state == "not_started":
+            return {"ok": False, "stopped": "installer_never_received_it", "changed_anything": False}
+        return {"ok": False, "stopped": "installer_state_unknown_owner_must_verify", "changed_anything": None,
+                "needs_owner_intervention": True}
+
     def recover(self):
-        """Call once at startup: runs interrupted by a crash are marked for the owner, never retried."""
-        return self.store.recover_interrupted()
+        """Call once at startup. Every request left approved/running is reconciled with the installer's own
+        record (never retried): finished runs get their real result, unknown ones are marked for the owner."""
+        settled = []
+        for rid in self.store.in_flight():
+            result = self._root_result(rid)
+            if self.store.transition(rid, "approved", "running") is False:
+                pass                                           # was already running
+            self.store.transition(rid, "running", self._state_for(result), result=result)
+            settled.append(rid)
+        return settled

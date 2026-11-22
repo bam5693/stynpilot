@@ -20,6 +20,12 @@ from test_broker import APP, DEVICE, ISS, OWNER, SUB
 from stynpilot.requests import RequestStore, request_id
 
 
+class SimpleNamespaceError(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
 @unittest.skipIf(jwt is None, "PyJWT/cryptography not installed")
 class ApprovalTests(unittest.TestCase):
     setUpClass = classmethod(tb.BrokerTests.setUpClass.__func__)
@@ -205,16 +211,139 @@ class ApprovalTests(unittest.TestCase):
         status = self.store.status(rid, owner=OWNER, device=DEVICE)
         self.assertEqual((status["state"], status["result"]["changed_anything"]), ("failed", False))
 
-    def test_restart_marks_interrupted_requests_for_the_owner_instead_of_retrying(self):
+    # --- reconciliation with the installer's own record -----------------------------------------------
+    def drop_connection_after(self, method):
+        """A broker whose call completes at the root but whose reply never arrives."""
+        executor = self.executor
+
+        class Dropping:
+            challenge = staticmethod(executor.challenge)
+            status = staticmethod(executor.status)
+            deny = staticmethod(executor.deny)
+            rollback = staticmethod(executor.rollback)
+            install = staticmethod(executor.install)
+
+        def dropped(*args, **kwargs):
+            getattr(executor, method)(*args, **kwargs)                 # it ran at the root...
+            raise SimpleNamespaceError("installer_unavailable")        # ...but we never heard back
+        setattr(Dropping, method, staticmethod(dropped))
+        self.flow.broker = Dropping
+
+    def test_connection_drop_after_the_root_finished_is_reconciled_not_reported_as_nothing_changed(self):
         payload, rid = self.file()
+        shown, started, finish = self.decide(rid, "approve")
+        self.drop_connection_after("install")
+        self.assertEqual(finish(), {"state": "done", "ok": True})
+        status = self.store.status(rid, owner=OWNER, device=DEVICE)
+        self.assertEqual(status["state"], "done")
+        self.assertTrue(status["result"]["rollback_id"])
+        self.assertIn("htop", self.machine.installed)
+
+    def test_connection_drop_when_the_root_state_is_unknown_asks_the_owner_to_verify(self):
+        payload, rid = self.file()
+        shown, started, finish = self.decide(rid, "approve")
+
+        class Gone:
+            @staticmethod
+            def install(*a):
+                raise SimpleNamespaceError("installer_unavailable")
+
+            @staticmethod
+            def status(*a):
+                raise SimpleNamespaceError("installer_unavailable")
+        self.flow.broker = Gone
+        self.assertEqual(finish(), {"state": "needs_owner_intervention", "ok": False})
+        result = self.store.status(rid, owner=OWNER, device=DEVICE)["result"]
+        self.assertEqual((result["stopped"], result["changed_anything"]), ("installer_unreachable_owner_must_verify", None))
+
+    def test_connection_drop_before_the_root_received_it_is_reported_as_nothing_ran(self):
+        payload, rid = self.file()
+        shown, started, finish = self.decide(rid, "approve")
+        executor = self.executor
+
+        class NeverArrived:
+            status = staticmethod(executor.status)
+
+            @staticmethod
+            def install(*a):
+                raise SimpleNamespaceError("installer_unavailable")
+        self.flow.broker = NeverArrived
+        self.assertEqual(finish(), {"state": "failed", "ok": False})
+        result = self.store.status(rid, owner=OWNER, device=DEVICE)["result"]
+        self.assertEqual((result["stopped"], result["changed_anything"]), ("installer_never_received_it", False))
+
+    def in_flight(self, rid):
         self.store.transition(rid, "pending", "approved")
-        self.store.transition(rid, "approved", "running")                     # ...crash here
+        self.store.transition(rid, "approved", "running")
+
+    def test_restart_reconciles_a_run_the_root_finished_while_the_owner_service_was_down(self):
+        payload, rid = self.file()
+        challenge, token = self.approval_for(payload)
+        self.assertTrue(self.executor.install(payload, token, challenge)["ok"])           # root completed
+        self.in_flight(rid)                                                              # owner service died before noting it
         restarted = self.make_flow(RequestStore(self.tmp / "state" / "requests.sqlite3"))
         self.assertEqual(restarted.recover(), [rid])
         status = restarted.store.status(rid, owner=OWNER, device=DEVICE)
-        self.assertEqual(status["state"], "needs_owner_intervention")
-        self.assertEqual(status["result"]["stopped"], "interrupted_by_restart_or_crash")
+        self.assertEqual(status["state"], "done")
+        self.assertTrue(status["result"]["rollback_id"])
         self.assertEqual(restarted.recover(), [])
+
+    def approval_for(self, payload):
+        challenge = self.executor.challenge(payload, "approve")["challenge"]
+        return challenge, self.proof(payload, challenge)
+
+    def test_restart_marks_a_run_the_root_never_saw_as_failed_and_an_unknown_one_for_the_owner(self):
+        payload, rid = self.file()
+        self.in_flight(rid)                                                              # root has no record at all
+        restarted = self.make_flow(RequestStore(self.tmp / "state" / "requests.sqlite3"))
+        self.assertEqual(restarted.recover(), [rid])
+        status = restarted.store.status(rid, owner=OWNER, device=DEVICE)
+        self.assertEqual((status["state"], status["result"]["stopped"]), ("failed", "installer_never_received_it"))
+        self.setUp()
+        payload, rid = self.file()
+        challenge, _ = self.approval_for(payload)
+        self.executor.runs.consume(challenge=challenge, request_id=rid, decision="approve", proof="p" * 64, kind="install")
+        self.in_flight(rid)                                                              # root says "running": crashed mid-way
+        restarted = self.make_flow(RequestStore(self.tmp / "state" / "requests.sqlite3"))
+        restarted.recover()
+        self.assertEqual(restarted.store.status(rid, owner=OWNER, device=DEVICE)["state"], "needs_owner_intervention")
+
+    def test_restart_with_the_installer_unreachable_marks_requests_for_the_owner(self):
+        payload, rid = self.file()
+        self.in_flight(rid)
+        flow = self.make_flow()
+
+        class Gone:
+            @staticmethod
+            def status(*a):
+                raise SimpleNamespaceError("installer_unavailable")
+        flow.broker = Gone
+        flow.recover()
+        self.assertEqual(self.store.status(rid, owner=OWNER, device=DEVICE)["state"], "needs_owner_intervention")
+
+    # --- the summary is the root's, and tampering in transit is detected ------------------------------------
+    def test_a_summary_altered_in_transit_is_not_shown(self):
+        payload, rid = self.file()
+        real = self.executor
+
+        class Tampering:
+            @staticmethod
+            def challenge(payload, decision):
+                reply = dict(real.challenge(payload, decision))
+                reply["summary"] = ["Install a harmless clock widget."] + reply["summary"][1:]
+                return reply
+        self.flow.broker = Tampering
+        with self.assertRaises(ApprovalError) as caught:
+            self.flow.page(rid)
+        self.assertEqual(caught.exception.code, "summary_altered_in_transit")
+
+    def test_the_ai_facing_service_has_no_way_to_approve_or_render_the_page(self):
+        root = Path(__file__).resolve().parent.parent / "src" / "stynpilot" / "server"
+        for source in root.glob("*.py"):
+            text = source.read_text()
+            for forbidden in ("import approval", "..approval", "stynpilot.approval", "approval_web", "BrokerClient",
+                              "broker.service", ".transition(", "ApprovalFlow"):
+                self.assertNotIn(forbidden, text, "%s mentions %s" % (source.name, forbidden))
 
     def test_illegal_state_moves_are_refused(self):
         payload, rid = self.file()

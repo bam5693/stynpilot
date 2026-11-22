@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=StyNpilot Setup
+Comment=First-time setup for StyNpilot
+Exec=/usr/bin/stynpilot setup
+Icon=preferences-system
+Categories=System;Settings;
+Terminal=false

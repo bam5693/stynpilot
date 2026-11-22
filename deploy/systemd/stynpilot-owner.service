@@ -6,13 +6,13 @@ Description=StyNpilot owner service (approval page and request store)
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -m stynpilot.service owner --config %h/.config/stynpilot/owner.json
+ExecStart=/usr/bin/stynpilot service owner --config %h/.config/stynpilot/owner.json
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=%h/.local/state/stynpilot
+ReadWritePaths=-%h/.local/state/stynpilot
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]

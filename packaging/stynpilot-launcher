@@ -1,0 +1,6 @@
+#!/usr/bin/python3 -IB
+import sys
+sys.path[:0] = ["/usr/lib/stynpilot/lib"]
+sys.path.append("/usr/lib/stynpilot/vendor")     # last: Ubuntu's own packages win
+from stynpilot.cli import main
+raise SystemExit(main())

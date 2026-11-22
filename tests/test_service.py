@@ -164,6 +164,15 @@ class OwnerServiceTests(unittest.TestCase):
                                   payload=self.plan(), summary=["ask"], expires=time.time() + 3000)
         return store, receipt["request_id"]
 
+    def file2(self):
+        store = RequestStore(self.config.state_dir / "requests.sqlite3")
+        payload = self.plan()
+        payload = dict(payload, expires_at=tb.BrokerTests.other_expiry(payload))
+        receipt, _ = store.submit(kind="install", software="htop", device=DEVICE, owner=OWNER,
+                                  proposer=SimpleNamespace(client="claude-connector", name="claude"),
+                                  payload=payload, summary=["ask"], expires=time.time() + 3000)
+        return store, receipt["request_id"]
+
     def state(self, rid):
         return RequestStore(self.config.state_dir / "requests.sqlite3").status(rid, owner=OWNER, device=DEVICE)
 
@@ -254,11 +263,54 @@ class OwnerServiceTests(unittest.TestCase):
         store, rid = self.file()
         store.transition(rid, "pending", "approved")
         svc = self.start(self.broker(OSError("down")))
-        self.assertEqual(service.reconcile_waiting(svc, expired=True), [])
+        self.assertEqual(service.reconcile_waiting(svc, now=1000.0), [rid])        # outage clock starts
+        self.assertEqual(self.state(rid)["state"], "approved")
+        self.assertEqual(service.reconcile_waiting(svc, now=1599.0), [rid])        # not yet ten minutes
+        self.assertEqual(service.reconcile_waiting(svc, now=1600.0), [])
         status = self.state(rid)
         self.assertEqual(status["state"], "needs_owner_intervention")
         self.assertIsNone(status["result"]["changed_anything"])
         self.assertEqual(status["result"]["stopped"], "installer_unreachable_owner_must_verify")
+
+    def test_a_legitimately_running_install_longer_than_ten_minutes_is_monitored_until_it_finishes(self):
+        self.provision()
+        store, rid = self.file()
+        store.transition(rid, "pending", "approved")
+        store.transition(rid, "approved", "running")
+        answer = {"v": {"state": "running"}}
+        svc = self.start(self.broker(lambda: answer["v"]))
+        for minute in (1, 5, 11, 30, 90):                                           # reachable and running throughout
+            self.assertEqual(service.reconcile_waiting(svc, now=1000.0 + minute * 60), [rid])
+            self.assertEqual(self.state(rid)["state"], "running")                   # never an outage, never intervention
+        answer["v"] = {"state": "done", "result": {"ok": True, "rollback_id": "r9"}}
+        self.assertEqual(service.reconcile_waiting(svc, now=1000.0 + 95 * 60), [])
+        self.assertEqual((self.state(rid)["state"], self.state(rid)["result"]["rollback_id"]), ("done", "r9"))
+        # same for a failure the installer reports
+        store2, rid2 = self.file2()
+        store2.transition(rid2, "pending", "approved")
+        store2.transition(rid2, "approved", "running")
+        answer["v"] = {"state": "running"}
+        svc.waiting.append(rid2)
+        service.reconcile_waiting(svc, now=9000.0)
+        answer["v"] = {"state": "failed", "result": {"ok": False, "stopped": "install_failed", "changed_anything": False}}
+        service.reconcile_waiting(svc, now=99999.0)
+        self.assertEqual(self.state(rid2)["state"], "failed")
+
+    def test_the_outage_clock_restarts_when_the_installer_answers_in_between(self):
+        self.provision()
+        store, rid = self.file()
+        store.transition(rid, "pending", "approved")
+        store.transition(rid, "approved", "running")
+        answer = {"v": OSError("down")}
+        svc = self.start(self.broker(lambda: answer["v"]))
+        service.reconcile_waiting(svc, now=0.0)
+        answer["v"] = {"state": "running"}
+        service.reconcile_waiting(svc, now=500.0)                                   # reachable: clock reset
+        answer["v"] = OSError("down again")
+        service.reconcile_waiting(svc, now=1000.0)                                  # new outage starts here
+        self.assertEqual(service.reconcile_waiting(svc, now=1500.0), [rid])         # only 500s of outage
+        self.assertEqual(service.reconcile_waiting(svc, now=1600.0), [])            # 600s: now honestly reported
+        self.assertEqual(self.state(rid)["state"], "needs_owner_intervention")
 
     def test_the_installer_saying_it_never_saw_the_request_settles_it_as_unchanged(self):
         self.provision()

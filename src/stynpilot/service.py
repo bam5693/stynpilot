@@ -136,6 +136,10 @@ class OwnerService:
     waiting: list
     _stop: object = None
     _thread: object = None
+    unreachable_since: dict = None
+
+    def __post_init__(self):
+        self.unreachable_since = {}
 
     def stop(self):
         if self._stop is not None:
@@ -232,28 +236,39 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
         raise
     if waiting:
         stop, thread = threading.Event(), None
-        began = monotonic()
 
         def keep_trying():
             while service.waiting and not stop.wait(reconcile_interval):
-                reconcile_waiting(service, expired=monotonic() - began >= give_up_after)
+                try:
+                    reconcile_waiting(service, now=monotonic(), give_up_after=give_up_after)
+                except Exception:
+                    pass                                         # a bad pass must not end the monitoring
         service._stop = stop
         service._thread = thread = threading.Thread(target=keep_trying, name="stynpilot-reconcile", daemon=True)
         thread.start()
     return service
 
 
-def reconcile_waiting(service, *, expired=False):
-    """One more try at requests whose installer record wasn't available at startup. After ``expired`` the
-    owner is told honestly that the installer never answered; nothing is ever re-run."""
-    flow = service.flow
+def reconcile_waiting(service, *, now=None, give_up_after=600.0):
+    """One more try at requests whose installer record wasn't available at startup.
+
+    A reachable installer that says "running" is a legitimate long install: keep watching it, however long
+    it takes (if the installer itself crashes, its own restart marks the run for the owner, which we then
+    report). Only an UNREACHABLE installer is an outage, and only after it has been unreachable continuously
+    for ``give_up_after`` seconds is the owner told, honestly, to verify. Nothing is ever re-run."""
+    flow, now = service.flow, (time.monotonic() if now is None else now)
     for rid in list(service.waiting):
         kind, record = flow._root_record(rid)
-        if kind == "unreachable" or (kind == "record" and (record or {}).get("state") == "running"):
-            if expired:
+        if kind == "unreachable":
+            began = service.unreachable_since.setdefault(rid, now)
+            if now - began >= give_up_after:
                 flow.give_up_waiting([rid])
                 service.waiting.remove(rid)
+                service.unreachable_since.pop(rid, None)
             continue
+        service.unreachable_since.pop(rid, None)                 # reachable again: the outage clock restarts
+        if kind == "record" and (record or {}).get("state") == "running":
+            continue                                             # still legitimately running: keep monitoring
         flow._settle_from_root(rid)
         service.waiting.remove(rid)
         service.recovered.append(rid)

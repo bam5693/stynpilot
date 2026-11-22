@@ -39,8 +39,10 @@ You should see a version number and `API key: not set (good)`. An API key would 
 ## 3. Make the workspace
 
 ```bash
-mkdir -p ~/dev && cd ~/dev && git clone https://github.com/bam5693/stynpilot.git && cd stynpilot
+mkdir -p ~/dev && cd ~/dev && git clone https://github.com/bam5693/stynpilot.git && cd stynpilot && git checkout claude/foundation
 ```
+
+The last part switches to the branch that has the tests, until PR #2 is merged.
 
 ## 4. Sign in, and turn on phone notifications
 

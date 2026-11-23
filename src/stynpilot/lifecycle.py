@@ -21,7 +21,9 @@ SOCKET = "/run/stynpilot/installer.sock"
 
 
 def _run(argv, **kw):
-    return subprocess.run(argv, capture_output=True, text=True, timeout=kw.pop("timeout", 120), **kw)
+    from .setup_wizard import pkexec_run
+    call = pkexec_run if argv and argv[0] == "pkexec" else subprocess.run      # pkexec gets the owner's text agent
+    return call(argv, capture_output=True, text=True, timeout=kw.pop("timeout", 120), **kw)
 
 
 def _active(unit, user):

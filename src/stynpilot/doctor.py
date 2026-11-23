@@ -127,6 +127,45 @@ def check_units(unit_paths=UNIT_FILES, packaged=None):
     return out
 
 
+def check_authorization(*, run=None, environ=None, exists=os.path.exists, stat=os.stat):
+    """Read-only look at why a password step might not work from THIS login. Changes nothing."""
+    import subprocess
+    run = run or (lambda argv: subprocess.run(argv, capture_output=True, text=True, timeout=30))
+    environ = os.environ if environ is None else environ
+    checks = []
+
+    def out(argv):
+        try:
+            result = run(argv)
+            return result.returncode, (result.stdout or "").strip()
+        except (OSError, subprocess.SubprocessError):
+            return None, ""
+    sid = environ.get("XDG_SESSION_ID")
+    code, text = out(["loginctl", "show-session", sid, "-p", "Remote", "-p", "Seat"]) if sid else (None, "")
+    remote = "Remote=yes" in text
+    checks.append(("this login", OK, ("remote (SSH) session, no seat" if remote else "local session") if code == 0
+                   else "session type unknown"))
+    code, _ = out(["/usr/bin/pkcheck", "--action-id", "org.stynpilot.root-setup", "--process", str(os.getpid())])
+    checks.append(("polkit decision", {0: OK, 2: OK, 1: FAIL}.get(code, WARN),
+                   {0: "already allowed", 2: "will ask for the administrator password",
+                    1: "polkit says NO for this login: install the current StyNpilot package (remote logins were refused "
+                       "by older policy)"}.get(code, "could not ask polkit")))
+    agent = exists("/usr/bin/pkttyagent")
+    checks.append(("terminal password agent", OK if agent else WARN,
+                   "pkttyagent present" if agent else "pkttyagent missing: install polkitd, or the password step can fail"))
+    try:
+        setuid = bool(stat("/usr/lib/polkit-1/polkit-agent-helper-1").st_mode & 0o4000)
+    except OSError:
+        setuid = None
+    code, sock = out(["systemctl", "is-active", "polkit-agent-helper.socket"])
+    if sock == "active" and setuid is False:
+        checks.append(("polkit password helper", OK, "socket-activated (polkit 127). pkexec's own prompt is refused with "
+                       "'No session for cookie' (polkit bug #686); StyNpilot runs its own agent as you, so this is handled"))
+    else:
+        checks.append(("polkit password helper", OK, "classic setuid helper" if setuid else "standard"))
+    return checks
+
+
 def check_legacy(search=("/etc/systemd/system", "/usr/lib/systemd/system", "/usr/lib/systemd/user")):
     found = [h for d in search for h in LEGACY_HINTS if (Path(d) / h).exists()]
     return ("existing Preview26 service", OK, ("found and left untouched: " + ", ".join(found)) if found

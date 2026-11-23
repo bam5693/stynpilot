@@ -23,3 +23,24 @@ for a password. No authentication agent (pkttyagent, pkexec's own text agent, KD
 `docs/evidence/vm-run-remote.txt` (19 checks over a real sshd login, real polkit): wrong password, Ctrl-D, Ctrl-C,
 correct password, repeat, another account with the correct admin password, remote start/stop.
 Unit tests: `RemoteAuthTests` in `tests/test_g7.py`.
+
+## Second problem: "No session for cookie" (polkit 127 bug, upstream polkit issue #686)
+After the policy fix the prompt appears but a correct password is refused. Ubuntu 26.04's polkit 127 checks the
+password in a socket-activated helper that reads the caller's *effective* uid. pkexec's built-in text agent is setuid
+root, so the helper answers as root while polkitd knows the session by the owner's real uid: "No session for cookie".
+It hits any `pkexec` typed in a terminal or SSH login that has no desktop agent.
+
+Reproduced on a 26.04 VM with polkitd 127-2ubuntu1.1 and the socket-activated, non-setuid helper (the Ryzen's setup):
+* plain `pkexec ...`: FAILS. `exec pkexec ...` (same PID): FAILS the same way. Not a workaround.
+* `pkttyagent --process <pid>` run **as the owner**, in a second terminal or the same shell: WORKS.
+* the same agent started with `sudo` (root): FAILS. The agent must run as the owner.
+* Warning: in an interactive shell a background (`&`) agent is stopped by the terminal and your typed password is
+  echoed. Use two terminals, or let StyNpilot do it.
+
+Fix: `terminal_agent` (setup_wizard.py) starts `pkttyagent --process <own pid> --fallback` as the owner for the duration
+of every StyNpilot pkexec call (setup-system, the page button, start, stop), only when a person is at a terminal, and
+never replaces a desktop agent. If it cannot start, pkexec behaves as before. Same password, same polkit decision, same
+root helper checks; nothing is bypassed.
+
+`stynpilot auth-check` (read-only) shows: remote or local login, what polkit would do for the setup action, whether the
+terminal agent exists, and whether the socket-activated helper (the bug) is in use.

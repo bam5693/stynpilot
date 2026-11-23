@@ -29,6 +29,7 @@ ROOT_CONFIG = Path("/etc/stynpilot/installer.json")
 RECEIPT_NAME = "setup-receipt.json"
 ROOT_HELPER = "/usr/libexec/stynpilot/root-helper"
 PKCHECK = "/usr/bin/pkcheck"
+PKTTYAGENT = "/usr/bin/pkttyagent"
 APPROVAL_PORT, MCP_PORT = 18444, 18443
 FIELDS = ("issuer", "approval_client_id", "approval_public_host", "mcp_public_host", "pairing_db",
           "chatgpt_client_id", "claude_client_id")
@@ -273,6 +274,58 @@ def root_setup(source, *, dest=ROOT_CONFIG, invoking_uid=None, geteuid=os.geteui
 
 
 # ------------------------------------------------------------------------------- finishing from a terminal (SSH)
+class terminal_agent:
+    """Keep polkit's text agent running, AS THE OWNER, while a pkexec call is in flight.
+
+    polkit 127's socket-activated password helper rejects the answer of pkexec's own built-in agent (that agent is
+    setuid root) with "No session for cookie" (polkit issue #686), so a pkexec typed in a bare terminal or SSH login can
+    never succeed. An agent that runs as the owner works. Used only when a person is at a terminal; --fallback never
+    replaces a desktop agent that already exists; any problem starting it just means pkexec behaves as before."""
+
+    def __init__(self, *, pid=None, path=PKTTYAGENT, interactive=None, popen=None, wait=5.0):
+        self.pid, self.path, self.wait, self.proc = pid or os.getpid(), path, wait, None
+        self.interactive, self.popen = interactive, popen or subprocess.Popen
+
+    def __enter__(self):
+        import select
+        import sys
+        interactive = sys.stdin.isatty() if self.interactive is None else self.interactive
+        if not interactive or not os.path.exists(self.path):
+            return self
+        ready, write = os.pipe()
+        try:
+            self.proc = self.popen([self.path, "--process", str(self.pid), "--fallback", "--notify-fd", str(write)],
+                                   pass_fds=(write,))
+        except OSError:
+            self.proc = None
+        finally:
+            os.close(write)
+        try:
+            if self.proc is not None:
+                select.select([ready], [], [], self.wait)             # closed once registered (or if the agent exits)
+        finally:
+            os.close(ready)
+        return self
+
+    def __exit__(self, *exc):
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+        return False
+
+
+def pkexec_run(argv, **kw):
+    """subprocess.run for a pkexec command, with the owner's own text agent alongside it (see terminal_agent)."""
+    with terminal_agent():
+        return subprocess.run(argv, **kw)
+
+
 def pkexec_reason(returncode, text=""):
     """Plain words for how a pkexec run ended. pkexec: 126 = the prompt was dismissed, 127 = not authorized / failed."""
     if returncode == 0:
@@ -322,7 +375,7 @@ def finish_system(home, uid, root_config=ROOT_CONFIG, *, run=None, check=None, i
         return 1
     print("Asking for your password. It lets StyNpilot copy ONE settings file to %s for your account only. "
           "It installs and starts nothing." % ROOT_CONFIG, file=out, flush=True)
-    run = run or (lambda argv: subprocess.run(argv, timeout=600))
+    run = run or (lambda argv: pkexec_run(argv, timeout=600))
     try:
         result = run(["pkexec", ROOT_HELPER, "root-setup", "--from", str(paths["proposed"])])
     except KeyboardInterrupt:                                              # Ctrl-C at the password prompt
@@ -393,8 +446,8 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
     host = "127.0.0.1:%d" % port
     session = secrets.token_urlsafe(24)
     used = {"entered": False}
-    runner = root_runner or (lambda src: subprocess.run(["pkexec", ROOT_HELPER, "root-setup", "--from", src],
-                                                        capture_output=True, text=True, timeout=300))
+    runner = root_runner or (lambda src: pkexec_run(["pkexec", ROOT_HELPER, "root-setup", "--from", src],
+                                                    capture_output=True, text=True, timeout=300))
 
     starter = start_runner or (lambda: subprocess.run(["/usr/bin/stynpilot", "start"], capture_output=True, text=True,
                                                       timeout=400))

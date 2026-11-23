@@ -402,6 +402,15 @@ def scenario_remote(vm):
                       "echo mallory:mallorypw | chpasswd; mkdir -p ~mallory/.ssh; cp ~owner/.ssh/authorized_keys ~mallory/.ssh/; "
                       "chown -R mallory ~mallory/.ssh; id mallory", timeout=1200)
     record("package installed; a second, non-admin account exists", "uid=" in out, out[-200:])
+    # --- make this VM match the real Ryzen: Ubuntu's current polkit (127-2ubuntu1.1) with the SOCKET-ACTIVATED password helper
+    rc, out = vm.root("chmod 0755 /usr/lib/polkit-1/polkit-agent-helper-1; systemctl unmask polkit-agent-helper.socket; "
+                      "systemctl enable --now polkit-agent-helper.socket; "
+                      "echo 'deb https://archive.ubuntu.com/ubuntu resolute-updates main' > /etc/apt/sources.list.d/up.list; "
+                      "apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y polkitd pkexec libpolkit-agent-1-0 "
+                      "libpolkit-gobject-1-0 >/dev/null 2>&1; dpkg-query -W -f='${Version}' polkitd; echo; "
+                      "stat -c %a /usr/lib/polkit-1/polkit-agent-helper-1; systemctl is-active polkit-agent-helper.socket", timeout=1200)
+    record("VM uses the Ryzen's polkit 127-2ubuntu1.1 with the socket-activated (non-setuid) helper",
+           "127-2ubuntu1.1" in out and "\n755\n" in out and "\nactive" in out, out)
 
     def pty(user, command, timeout=120):
         argv = ["-tt", "-i", vm.key, "-p", str(vm.a.ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
@@ -433,9 +442,68 @@ def scenario_remote(vm):
     rc, out = vm.ssh("owner", "pkcheck --action-id org.stynpilot.root-setup --process $$; echo rc=$?")
     record("polkit now says 'requires authentication' (exit 2) for the remote login", "rc=2" in out, out)
 
+    # --- the failure ChatGPT reported, reproduced; then the proposed workarounds, each tried for real
+    helper_cmd = "pkexec /usr/libexec/stynpilot/root-helper root-setup --from /nonexistent"
+
+    def typed(cmd, pw="ownerpw"):
+        c = pty("owner", cmd + "; echo END_RC=$?")
+        text = ""
+        while True:
+            i = c.expect(["[Pp]assword: ?", "END_RC=\\d+", pexpect.EOF])
+            text += c.before + (c.after if isinstance(c.after, str) else "")
+            if i == 0:
+                c.sendline(pw)
+                continue
+            return text
+    text = typed(helper_cmd)
+    record("REPRODUCED: pkexec's own prompt fails with 'No session for cookie' (polkit issue 686)",
+           "No session for cookie" in text and "END_RC=127" in text, text[-300:])
+    text = typed("bash -c 'exec %s'" % helper_cmd)
+    record("'exec pkexec' does NOT fix it", "No session for cookie" in text, text[-300:])
+    text = typed("pkttyagent --process $$ --fallback & sleep 1; %s" % helper_cmd)
+    record("an agent run as the owner (non-interactive shell) works: authentication completes",
+           "AUTHENTICATION COMPLETE" in text and "No session for cookie" not in text, text[-300:])
+
+    def two_terminals(agent_command):
+        s1 = pexpect.spawn("ssh", ["-tt", "-i", vm.key, "-p", str(vm.a.ssh_port), "-o", "StrictHostKeyChecking=no", "-o",
+                                   "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "owner@127.0.0.1", "bash --norc -i"],
+                           encoding="utf-8", timeout=40)
+        s1.expect(r"\$ ")
+        s1.sendline("echo PID=$$")
+        s1.expect(r"PID=(\d+)\s")
+        pid = s1.match.group(1)
+        s2 = pexpect.spawn("ssh", ["-tt", "-i", vm.key, "-p", str(vm.a.ssh_port), "-o", "StrictHostKeyChecking=no", "-o",
+                                   "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "owner@127.0.0.1", "bash --norc -i"],
+                           encoding="utf-8", timeout=40)
+        s2.expect(r"\$ ")
+        s2.sendline(agent_command % pid)
+        time.sleep(2)
+        s1.sendline(helper_cmd + "; echo END_RC=$?")
+        if s2.expect(["[Pp]assword: ?", pexpect.TIMEOUT], timeout=10) == 0:
+            s2.sendline("ownerpw")
+        time.sleep(3)
+        s1.expect("END_RC=\\d+", timeout=20)
+        out1 = s1.before
+        s2.expect(pexpect.TIMEOUT, timeout=2)
+        out2 = s2.before
+        s1.close()
+        s2.close()
+        return out1, out2
+    out1, out2 = two_terminals("pkttyagent --process %s")
+    record("ONE-TIME WORKAROUND: agent as the owner in a second terminal succeeds",
+           "AUTHENTICATION COMPLETE" in out2 and "No session for cookie" not in out1 + out2 and "Not authorized" not in out1, out1[-200:] + out2[-200:])
+    out1, out2 = two_terminals("echo ownerpw | sudo -S -p '' pkttyagent --process %s")
+    record("the same agent started with sudo (root) still fails: the agent must run as the owner",
+           "No session for cookie" in out2 + out1, (out1 + out2)[-300:])
+
     def nothing_in_etc():
         return vm.root("ls /etc/stynpilot 2>&1 | grep -c -E 'installer.json|receipt'")[1].strip() == "0"
 
+    c = pty("owner", "stynpilot auth-check")
+    text = finish(c)
+    record("auth-check explains this login (remote, will ask, socket helper handled) and changes nothing",
+           "remote (SSH)" in text and "will ask for the administrator password" in text and "No session for cookie" in text
+           and "Nothing was changed" in text, text[-500:])
     # --- wrong password
     c = pty("owner", "stynpilot setup-system")
     c.expect("Password: ")
@@ -475,7 +543,8 @@ def scenario_remote(vm):
     text = c.before
     record("repeating asks for no password and changes nothing", i == 1 and "already finished" in text, text[-200:])
     # --- a different account cannot use the owner's installer
-    c = pty("mallory", "pkexec /usr/libexec/stynpilot/root-helper root-start")
+    c = pty("mallory", "PYTHONPATH=/usr/lib/stynpilot/lib python3 -c \"from stynpilot.setup_wizard import pkexec_run; "
+                         "pkexec_run(['pkexec', '/usr/libexec/stynpilot/root-helper', 'root-start'])\"")
     c.expect("Password: ")
     c.sendline("ownerpw")                       # even with the admin's password, the helper checks WHO asked
     text = finish(c)

@@ -1,13 +1,20 @@
 PASS VM boots with real systemd
 PASS package installed; a second, non-admin account exists :: Unpacking stynpilot (0.1.0~dev0) ...
+PASS VM uses the Ryzen's polkit 127-2ubuntu1.1 with the socket-activated (non-setuid) helper :: 127-2ubuntu1.1
 PASS the owner's SSH login is a REMOTE session with no seat (the Termius case) :: Seat= Remote=yes Active=yes 
 PASS pairing database exists for the owner :: {"ok": true, "owner": "acct_e3f7d65021afe4c3d246af2f4377ca0f8ee1abf0", "pairing": "/home/owner/.local/state/stynpilot-owner/pairing.sqlite3"}
 PASS form saved from the remote login; system step pending :: {"pairing_found": "/home/owner/.local/state/stynpilot-owner/pairing.sqlite3", "step": "saved"}
 PASS owner.json and installer.proposed.json exist :: f70196bee72ef1acfef675b42a94b69ab4d915822dce6fbddbca5d7b80766139  .config/stynpilot/owner.json
 PASS polkit now says 'requires authentication' (exit 2) for the remote login :: polkit\56result=auth_admin
-PASS wrong password: refused, says so, nothing written :: failure
+PASS REPRODUCED: pkexec's own prompt fails with 'No session for cookie' (polkit issue 686) :: ine 'polkit-agent-helper-1: error response to PolicyKit daemon: GDBus.Error:org.freedesktop.PolicyKit1.Err
+PASS 'exec pkexec' does NOT fix it :: ine 'polkit-agent-helper-1: error response to PolicyKit daemon: GDBus.Error:org.freedesktop.PolicyKit1.Error.Failed: No session for cookie' from helper
+PASS an agent run as the owner (non-interactive shell) works: authentication completes ::  settings file to /etc/stynpilot/installer.json, for your account only. It installs nothing and starts nothing
+PASS ONE-TIME WORKAROUND: agent as the owner in a second terminal succeeds :: -5.3$ pkexec /usr/libexec/stynpilot/root-helper root-setup --from /nonexistent; echo END_RC=$?
+PASS the same agent started with sudo (root) still fails: the agent must run as the owner :: nt has been reported.
+PASS auth-check explains this login (remote, will ask, socket helper handled) and changes nothing :: OK   this login                   remote (SSH) session, no seat
+PASS wrong password: refused, says so, nothing written ::  helper
 PASS cancelled at the prompt (Ctrl-D): did not finish, nothing written :: inal.
-PASS cancelled at the prompt (Ctrl-C): no crash, nothing written :: 
+PASS cancelled at the prompt (Ctrl-C): no crash, nothing written :: ^C
 PASS prompt names the one operation :: taller.json for your account only. It installs and starts nothing.
 PASS right password: system settings written, nothing started :: 
 PASS the saved answers were not touched (nothing re-entered) :: f70196bee72ef1acfef675b42a94b69ab4d915822dce6fbddbca5d7b80766139  .config/stynpilot/owner.json
@@ -17,4 +24,4 @@ PASS another account is refused by the helper even after authenticating ::
 PASS another account cannot run the owner's setup step :: Nothing was changed. Setup has not been saved yet (or the saved settings do not match): open 'stynpilot setup' and press 'Save and prepare' fi
 PASS stynpilot start works from the remote login :: 
 PASS stynpilot stop works from the remote login :: 
-RESULT: PASS  (19 checks, 0 failed)
+RESULT: PASS  (26 checks, 0 failed)

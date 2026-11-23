@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 try:
     import jwt
-    from stynpilot import backup, doctor, service, setup_wizard
+    from stynpilot import backup, doctor, lifecycle, service, setup_wizard
     from stynpilot.service import ConfigError
     import test_service as ts
     from test_service import owner_data
@@ -1105,6 +1105,113 @@ class RemoteAuthTests(unittest.TestCase):
             notes = {n.get("key"): n.text for n in a.findall("annotate")}
             self.assertEqual(notes["org.freedesktop.policykit.exec.path"], "/usr/libexec/stynpilot/root-helper")
             self.assertEqual("org.stynpilot." + notes["org.freedesktop.policykit.exec.argv1"], a.get("id"))
+
+
+class TerminalAgentTests(unittest.TestCase):
+    """polkit 127 refuses pkexec's own setuid text agent ("No session for cookie"): we run polkit's agent as the owner."""
+
+    class FakeProc:
+        def __init__(self, argv, **kw):
+            self.argv, self.kw, self.terminated, self.killed = argv, kw, False, False
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            self.killed = True
+
+    def start(self, **kw):
+        procs = []
+
+        def popen(argv, **k):
+            procs.append(self.FakeProc(argv, **k))
+            return procs[-1]
+        agent = setup_wizard.terminal_agent(pid=4242, path=__file__, interactive=kw.pop("interactive", True), popen=popen,
+                                            wait=0.05, **kw)
+        return agent, procs
+
+    def test_agent_runs_for_this_process_never_replaces_a_desktop_agent_and_stops_afterwards(self):
+        agent, procs = self.start()
+        with agent:
+            self.assertEqual(len(procs), 1)
+            argv = procs[0].argv
+            self.assertEqual(argv[1:4], ["--process", "4242", "--fallback"])
+            self.assertEqual(argv[4], "--notify-fd")
+            self.assertEqual(len(procs[0].kw["pass_fds"]), 1)
+            self.assertFalse(procs[0].terminated)
+        self.assertTrue(procs[0].terminated)
+
+    def test_agent_is_stopped_even_when_the_password_step_raises(self):
+        agent, procs = self.start()
+        with self.assertRaises(KeyboardInterrupt):
+            with agent:
+                raise KeyboardInterrupt
+        self.assertTrue(procs[0].terminated)
+
+    def test_no_agent_without_a_terminal_or_without_the_program_or_when_it_cannot_start(self):
+        agent, procs = self.start(interactive=False)
+        with agent:
+            pass
+        self.assertEqual(procs, [])
+        missing = setup_wizard.terminal_agent(path="/nonexistent/pkttyagent", interactive=True,
+                                              popen=lambda *a, **k: self.fail("must not start"))
+        with missing:
+            pass
+
+        def broken(argv, **k):
+            raise OSError("cannot start")
+        with setup_wizard.terminal_agent(path=__file__, interactive=True, popen=broken, wait=0.05):
+            pass                                                          # pkexec then behaves exactly as before
+
+    def test_only_pkexec_commands_get_the_agent(self):
+        seen = []
+
+        class Spy:
+            def __enter__(self_inner):
+                seen.append("in")
+
+            def __exit__(self_inner, *a):
+                seen.append("out")
+        with mock.patch.object(setup_wizard, "terminal_agent", Spy), \
+                mock.patch.object(subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")):
+            lifecycle._run(["systemctl", "is-active", "x"])
+            self.assertEqual(seen, [])
+            lifecycle._run(["pkexec", setup_wizard.ROOT_HELPER, "root-start"])
+            self.assertEqual(seen, ["in", "out"])
+
+    def test_authorization_check_explains_this_login_and_changes_nothing(self):
+        calls = []
+
+        def run(argv):
+            calls.append(argv)
+            if argv[0] == "loginctl":
+                return SimpleNamespace(returncode=0, stdout="Remote=yes\nSeat=\n")
+            if argv[0].endswith("pkcheck"):
+                return SimpleNamespace(returncode=2, stdout="")
+            return SimpleNamespace(returncode=0, stdout="active")
+        found = doctor.check_authorization(run=run, environ={"XDG_SESSION_ID": "7"}, exists=lambda p: True,
+                                           stat=lambda p: SimpleNamespace(st_mode=0o100755))
+        names = {n: (level, detail) for n, level, detail in found}
+        self.assertIn("remote (SSH)", names["this login"][1])
+        self.assertEqual(names["polkit decision"][0], doctor.OK)
+        self.assertIn("No session for cookie", names["polkit password helper"][1])
+        self.assertTrue(all(c[0] in ("loginctl", "/usr/bin/pkcheck", "systemctl") for c in calls))
+        # polkit says no, agent missing
+        found = doctor.check_authorization(run=lambda argv: SimpleNamespace(returncode=1, stdout=""), environ={},
+                                           exists=lambda p: False, stat=lambda p: (_ for _ in ()).throw(OSError()))
+        names = {n: level for n, level, detail in found}
+        self.assertEqual((names["polkit decision"], names["terminal password agent"]), (doctor.FAIL, doctor.WARN))
+
+    def test_auth_check_command_is_wired(self):
+        from stynpilot import cli
+        import io
+        with mock.patch.object(doctor, "check_authorization", return_value=[("x", doctor.OK, "fine")]), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(cli.main(["auth-check"]), 0)
+        self.assertIn("Nothing was changed", out.getvalue())
 
 
 @unittest.skipIf(jwt is None, "PyJWT/cryptography not installed")

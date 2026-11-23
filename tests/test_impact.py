@@ -5,7 +5,10 @@ from stynpilot import impact
 
 
 def tx(installs=None, upgrades=None, removals=None, meta=None):
-    return {"installs": installs or {}, "upgrades": upgrades or {}, "removals": removals or [], "meta": meta or {}}
+    full = {n: {"version": "1", "priority": "optional", "essential": False} for n in {**(installs or {}), **(upgrades or {})}}
+    for name, extra in (meta or {}).items():
+        full[name] = {**full.get(name, {"version": "1", "priority": "optional", "essential": False}), **extra}
+    return {"installs": installs or {}, "upgrades": upgrades or {}, "removals": removals or [], "meta": full}
 
 
 class ImpactTests(unittest.TestCase):
@@ -47,8 +50,22 @@ class ImpactTests(unittest.TestCase):
         self.assertIsNone(code)
         self.assertIn("upgrades", notes[0])
 
+    def test_missing_or_incomplete_metadata_is_refused(self):
+        good = tx({"ncdu": "1", "libx": "1"})
+        self.assertEqual(impact.check_transaction(["ncdu"], good), (None, []))
+        for broken in ({}, {"version": ""}, {"version": "1", "priority": ""}, {"version": "1", "priority": "optional"}, "junk", None):
+            t = dict(good, meta=dict(good["meta"]))
+            if broken == {}:
+                del t["meta"]["libx"]
+            else:
+                t["meta"]["libx"] = broken
+            self.assertEqual(impact.check_transaction(["ncdu"], t)[0], "package_metadata_missing", repr(broken))
+        t = tx({"ncdu": "2"}, {"ncdu": "1"})
+        del t["meta"]["ncdu"]
+        self.assertEqual(impact.check_transaction(["ncdu"], t)[0], "package_metadata_missing")
+
     def test_explain_is_plain(self):
-        for code in ("kernel_or_boot", "login_or_privilege", "would_remove_packages", "package_touches_login_or_boot_files", "unknown"):
+        for code in ("package_metadata_missing", "package_contents_unreadable", "kernel_or_boot", "login_or_privilege", "would_remove_packages", "package_touches_login_or_boot_files", "unknown"):
             self.assertTrue(impact.explain(code).endswith("."))
 
     LISTING = (
@@ -70,6 +87,16 @@ class ImpactTests(unittest.TestCase):
                      "./usr/share/polkit-1/rules.d/a.rules", "./lib/modules/6/x.ko", "./etc/shadow"):
             line = "-rw-r--r-- root/root 1 2026-01-01 00:00 %s\n" % path
             self.assertEqual(impact.inspect_listing(line)[0], "package_touches_login_or_boot_files", path)
+
+    def test_script_notes(self):
+        self.assertEqual(impact.inspect_scripts(""), [])
+        self.assertEqual(impact.inspect_scripts("chmod u+s /usr/bin/fusermount3"), ["Its install script sets setuid/setgid permissions on files."])
+        self.assertEqual(len(impact.inspect_scripts("chmod 4755 /usr/bin/x", "deb-systemd-helper enable foo.service")), 2)
+        self.assertEqual(impact.inspect_scripts("chmod 755 /usr/bin/x\nchmod u+x y"), [])
+
+    def test_unreadable_listings_fail_closed(self):
+        for bad in ("", "\n  \n", None, "garbage line\n", self.LISTING + "this is not a listing line\n", "E: cannot read\n"):
+            self.assertEqual(impact.inspect_listing(bad), ("package_contents_unreadable", []), repr(bad))
 
     def test_listing_directories_alone_are_fine(self):
         self.assertEqual(impact.inspect_listing("drwxr-xr-x root/root 0 2026-01-01 00:00 ./etc/ssh/\n"), (None, []))

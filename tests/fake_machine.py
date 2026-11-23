@@ -32,7 +32,9 @@ class FakeMachine:
         self.fail_marks = False
         self.pause = None                                # threading.Event: a real install waits here (long install)
         self.meta = {}                                   # name -> {"Essential": "yes", "Priority": .., "Section": .., "Installed-Size": ..}
+        self.meta_hidden = set()                         # names `apt-cache show` knows nothing about
         self.search_names = []                           # extra names `apt-cache search` returns
+        self.deb_scripts = {}                            # name -> postinst text
         self.deb_files = {}                              # name -> `dpkg-deb -c` listing text
         self.paused = None                               # threading.Event set when it has started waiting
 
@@ -96,12 +98,15 @@ class FakeMachine:
             out = ""
             for name in argv[argv.index("--") + 1:]:
                 version = self.available.get(name) or self.installed.get(name)
-                if version is None:
+                if version is None or name in self.meta_hidden:
                     continue
                 fields = {"Package": name, "Version": version, "Priority": "optional", "Section": "utils",
                           "Installed-Size": "100", **self.meta.get(name, {})}
                 out += "".join("%s: %s\n" % kv for kv in fields.items()) + "Description: %s tool\n long text\n\n" % name
             return (0 if out else 100), out
+        if tool == "dpkg-deb" and argv[1] == "-I":
+            text = self.deb_scripts.get(Path(argv[2]).name.split("_")[0], "")
+            return (0, text) if text else (1, "")
         if tool == "dpkg-deb":
             stem = Path(argv[-1]).name.split("_")[0]
             return 0, self.deb_files.get(stem, "drwxr-xr-x root/root 0 2026-01-01 00:00 ./\n-rwxr-xr-x root/root 10 2026-01-01 00:00 ./usr/bin/%s\n" % stem)

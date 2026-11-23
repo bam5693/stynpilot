@@ -108,6 +108,8 @@ def explain(code):
         return "StyNpilot does not let an AI install %s." % _PLAIN_REFUSAL[code]
     return {"would_remove_packages": "That install would remove installed software.",
             "would_upgrade_core_package": "That install would change a core operating-system package.",
+            "package_metadata_missing": "StyNpilot could not read complete package information, so it refuses.",
+            "package_contents_unreadable": "StyNpilot could not read what the package would install, so it refuses.",
             "package_touches_login_or_boot_files": "That package changes login, boot, sudo or package-signing files."}.get(
         code, "StyNpilot refuses this package set.")
 
@@ -128,6 +130,10 @@ def check_transaction(requested, transaction):
         found = _match(name)
         if found:
             return found[0], []
+    for name in sorted(set(installs) | set(upgrades)):            # no metadata -> cannot judge -> refuse
+        info = meta.get(name)
+        if not isinstance(info, dict) or not info.get("version") or not info.get("priority") or "essential" not in info:
+            return "package_metadata_missing", []
     for name in sorted(upgrades):
         info = meta.get(name) or {}
         if info.get("essential") or info.get("priority") in CORE_PRIORITIES:
@@ -157,25 +163,46 @@ _UNIT = re.compile(r"(?:usr/)?lib/systemd/system/([^/]+\.(?:service|socket|timer
 
 
 def inspect_listing(text):
-    """(refusal_code or None, [plain notes]) from ``dpkg-deb -c`` output for ONE package."""
-    notes, units, setuid = [], set(), set()
-    for line in text.splitlines():
+    """(refusal_code or None, [plain notes]) from ``dpkg-deb -c`` output for ONE package. Fails closed:
+    empty or unparseable listings are refused (``package_contents_unreadable``)."""
+    notes, units, setuid, entries = [], set(), set(), 0
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
         m = _LISTING.match(line.strip())
         if not m:
-            continue
+            return "package_contents_unreadable", []
+        entries += 1
         path = m.group("path").lstrip("./")
-        if m.group("mode")[0] != "d":
-            for forbidden in _FORBIDDEN_PATHS:
-                if path.startswith(forbidden) or ("/" + path).startswith("/" + forbidden):
-                    return "package_touches_login_or_boot_files", []
         mode = m.group("mode")
+        if mode[0] != "d":
+            for forbidden in _FORBIDDEN_PATHS:
+                if path.startswith(forbidden):
+                    return "package_touches_login_or_boot_files", []
         if mode[0] == "-" and (mode[3] in "sS" or mode[6] in "sS"):
-            setuid.add(path.rsplit("/", 1)[-1])
+            setuid.add("/" + path)
         unit = _UNIT.search(path)
         if unit:
             units.add(unit.group(1))
+    if not entries:
+        return "package_contents_unreadable", []
     if units:
-        notes.append("Ships background service files: %s." % ", ".join(sorted(units)[:5]))
+        notes.append("Ships background service files: %s." % ", ".join(sorted(units)[:8]))
     if setuid:
-        notes.append("Installs program(s) that run with extra privileges (setuid/setgid): %s." % ", ".join(sorted(setuid)[:5]))
+        notes.append("Installs program(s) that run with extra privileges (setuid/setgid): %s." % ", ".join(sorted(setuid)[:8]))
     return None, notes
+
+
+_PRIV_CHMOD = re.compile(r"chmod\s+(?:-\S+\s+)*(?:[ugoa]*\+[rwxXt]*s|[0-7]?[2467][0-7]{3})\b|dpkg-statoverride\s+--add\S*\s+\S+\s+\S+\s+[2467][0-7]{3}")
+_ENABLES = re.compile(r"deb-systemd-helper\s+(?:--user-\S*\s+)?enable|systemctl\s+(?:--\S+\s+)*enable|update-rc\.d\s+\S+\s+(?:defaults|enable)")
+
+
+def inspect_scripts(*texts):
+    """Best-effort extra notes from maintainer scripts (these are NOT a security check: scripts run as root anyway)."""
+    body = "\n".join(t for t in texts if t)
+    notes = []
+    if _PRIV_CHMOD.search(body):
+        notes.append("Its install script sets setuid/setgid permissions on files.")
+    if _ENABLES.search(body):
+        notes.append("Its install script enables a background service.")
+    return notes

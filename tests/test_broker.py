@@ -169,14 +169,69 @@ class BrokerTests(unittest.TestCase):
                                 expected_owner=OWNER, expected_device=DEVICE).content()
         self.denied("blocked_package:would_remove_packages", self.executor.challenge, payload, "approve")
 
-    def test_package_shipping_login_files_is_refused_after_download_and_nothing_changes(self):
+    def test_package_shipping_login_files_is_refused_before_approval_and_again_at_install(self):
         payload = self.generic_plan()
-        self.machine.deb_files["ncdu"] = "-rw-r--r-- root/root 10 2026-01-01 00:00 ./etc/sudoers.d/ncdu\n"
-        result = self.install(payload)
-        self.assertFalse(result["ok"])
+        bad = "-rw-r--r-- root/root 10 2026-01-01 00:00 ./etc/sudoers.d/ncdu\n"
+        self.machine.deb_files["ncdu"] = bad
+        self.denied("blocked_package:package_touches_login_or_boot_files", self.executor.challenge, payload, "approve")
+        self.machine.deb_files.pop("ncdu")
+        challenge, token = self.approval(payload)                       # safe at preview time...
+        self.machine.deb_files["ncdu"] = bad                            # ...different by install time
+        result = self.executor.install(payload, token, challenge)
         self.assertEqual(result["stopped"], "blocked_package:package_touches_login_or_boot_files")
-        self.assertEqual((result["changed_anything"], self.machine.changes()), (False, []))
-        self.assertEqual(self.machine.installed, {"bash": "5.2"})
+        self.assertEqual((result["changed_anything"], self.machine.changes(), self.machine.installed), (False, [], {"bash": "5.2"}))
+
+    def test_unreadable_package_contents_refuse_install_and_approval(self):
+        payload = self.generic_plan()
+        for listing in ("", "garbage\n", "-rw-r--r-- root/root 1 2026-01-01 00:00 ./ok\nnot a line\n"):
+            self.machine.deb_files["ncdu"] = listing
+            self.denied("blocked_package:package_contents_unreadable", self.executor.challenge, payload, "approve")
+            self.assertEqual(self.machine.changes(), [])
+        real = self.machine.__call__
+        self.machine.deb_files.pop("ncdu")
+        calls = []
+
+        def failing(argv):
+            if argv[0] == "dpkg-deb":
+                calls.append(argv)
+                return 2, ""
+            return real(argv)
+        self.executor.run = failing
+        self.denied("blocked_package:package_contents_unreadable", self.executor.challenge, payload, "approve")
+        self.assertTrue(calls)
+        self.executor.run = real
+
+    def test_install_itself_fails_closed_when_contents_become_unreadable(self):
+        payload = self.generic_plan()
+        challenge, token = self.approval(payload)                       # preview was fine
+        self.machine.deb_files["ncdu"] = ""                             # then the downloaded file cannot be listed
+        result = self.executor.install(payload, token, challenge)
+        self.assertEqual((result["ok"], result["stopped"], result["changed_anything"]),
+                         (False, "blocked_package:package_contents_unreadable", False))
+        self.assertEqual((self.machine.changes(), self.machine.installed), ([], {"bash": "5.2"}))
+
+    def test_services_and_privileged_programs_are_shown_before_approval(self):
+        payload = self.generic_plan()
+        self.machine.deb_files["ncdu"] = ("-rwxr-xr-x root/root 1 2026-01-01 00:00 ./usr/bin/ncdu\n"
+                                          "-rwsr-xr-x root/root 1 2026-01-01 00:00 ./usr/bin/ncdu-helper\n"
+                                          "-rw-r--r-- root/root 1 2026-01-01 00:00 ./usr/lib/systemd/system/ncdu.service\n")
+        shown = " ".join(self.executor.challenge(payload, "approve")["summary"])
+        self.assertIn("ncdu: Ships background service files: ncdu.service.", shown)
+        self.assertIn("setuid/setgid): /usr/bin/ncdu-helper", shown)
+        self.machine.deb_scripts["ncdu"] = "#!/bin/sh\nchmod u+s /usr/bin/ncdu\n"
+        self.assertIn("ncdu: Its install script sets setuid/setgid permissions on files.",
+                      " ".join(self.executor.challenge(payload, "approve")["summary"]))
+        self.machine.deb_scripts.clear()
+        self.machine.deb_files["ncdu"] = "-rwxr-xr-x root/root 1 2026-01-01 00:00 ./usr/bin/ncdu\n"
+        self.assertIn("no background services or privileged programs found", " ".join(self.executor.challenge(payload, "approve")["summary"]))
+        self.assertEqual(self.machine.changes(), [])
+
+    def test_missing_package_metadata_cannot_bypass_the_gate_at_root(self):
+        from stynpilot.plan import validate_plan
+        self.machine.meta_hidden = {"libncurses6"}
+        payload = validate_plan(self.raw_generic(["ncdu"], {"libncurses6": "6.4", "ncdu": "2.3-1"}),
+                                expected_owner=OWNER, expected_device=DEVICE).content()
+        self.denied("blocked_package:package_metadata_missing", self.executor.challenge, payload, "approve")
 
     def test_package_from_a_third_party_source_is_refused_at_request_time(self):
         from stynpilot.broker import apt

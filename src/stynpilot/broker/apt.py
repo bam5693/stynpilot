@@ -241,6 +241,14 @@ def deb_listing(path, run=real_run):
     return out if code == 0 else ""
 
 
+def deb_script(path, which="postinst", run=real_run):
+    """Text of one maintainer script of a downloaded package ('' if it has none)."""
+    if which not in ("preinst", "postinst"):
+        raise ValueError("invalid script")
+    code, out = run(["dpkg-deb", "-I", str(path), which])
+    return out if code == 0 else ""
+
+
 def sha256_of_version(name, version, run=real_run):
     """The set of SHA256 values the package indexes list for this exact version (one value if unambiguous)."""
     code, out = run(["apt-cache", "show", "--", "%s=%s" % (name, version)])

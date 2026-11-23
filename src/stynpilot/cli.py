@@ -19,6 +19,7 @@ def main(argv=None):
     svc.add_argument("role", choices=("owner", "installer", "provision"))
     svc.add_argument("--config", required=True)
     sub.add_parser("setup")
+    sub.add_parser("setup-system", help="finish setup's one password step in this terminal (works over SSH)")
     rbak = sub.add_parser("root-backup", help="back up the installer's rollback records (asks for your password)")
     rbak.add_argument("--out", required=True)
     rres = sub.add_parser("root-restore", help="restore the installer's rollback records (asks for your password)")
@@ -48,6 +49,9 @@ def main(argv=None):
         elif args.command == "setup":
             from . import setup_wizard
             setup_wizard.serve()
+        elif args.command == "setup-system":
+            from . import setup_wizard
+            return setup_wizard.finish_system(Path.home(), os.getuid())
         elif args.command in ("root-backup", "root-restore"):
             import subprocess
             from .setup_wizard import ROOT_HELPER

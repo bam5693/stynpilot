@@ -28,6 +28,7 @@ from .service import ConfigError, InstallerConfig, OwnerConfig, provision_owner_
 ROOT_CONFIG = Path("/etc/stynpilot/installer.json")
 RECEIPT_NAME = "setup-receipt.json"
 ROOT_HELPER = "/usr/libexec/stynpilot/root-helper"
+PKCHECK = "/usr/bin/pkcheck"
 APPROVAL_PORT, MCP_PORT = 18444, 18443
 FIELDS = ("issuer", "approval_client_id", "approval_public_host", "mcp_public_host", "pairing_db",
           "chatgpt_client_id", "claude_client_id")
@@ -271,6 +272,72 @@ def root_setup(source, *, dest=ROOT_CONFIG, invoking_uid=None, geteuid=os.geteui
     return str(dest)
 
 
+# ------------------------------------------------------------------------------- finishing from a terminal (SSH)
+def pkexec_reason(returncode, text=""):
+    """Plain words for how a pkexec run ended. pkexec: 126 = the prompt was dismissed, 127 = not authorized / failed."""
+    if returncode == 0:
+        return "done"
+    if returncode == 126:
+        return "cancelled: the password prompt was dismissed"
+    if returncode == 127 or "not authorized" in (text or "").lower():
+        return "refused: the password was not accepted, or this login is not allowed to ask"
+    return "did not finish (exit %s)" % returncode
+
+
+def _polkit_would_ask(action, pid, check=None):
+    """Read-only question to polkit: would THIS login get a password prompt? 'ask' / 'allowed' / 'no' / None=unknown."""
+    check = check or (lambda argv: subprocess.run(argv, capture_output=True, text=True, timeout=30).returncode)
+    try:
+        code = check([PKCHECK, "--action-id", action, "--process", str(pid)])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {0: "allowed", 2: "ask", 1: "no"}.get(code)
+
+
+def finish_system(home, uid, root_config=ROOT_CONFIG, *, run=None, check=None, interactive=None, out=None):
+    """``stynpilot setup-system``: the same one-file root step as the page's button, run in the terminal you are in
+    (so it works over SSH). Uses the settings already saved; asks polkit for the owner's password right here; starts
+    nothing. Safe to repeat: when it is already finished it only says so."""
+    import sys
+    out = out or sys.stdout
+    paths = default_paths(home)
+    status = setup_status(home, uid, root_config)
+    if status["config"] != "ok" or status["proposal"] != "ok" or status["state"] != "complete":
+        print("Nothing was changed. Setup has not been saved yet (or the saved settings do not match): open "
+              "'stynpilot setup' and press 'Save and prepare' first.", file=out)
+        return 1
+    if status["system"] == "done":
+        mark_complete(home)
+        print("The system step is already finished. Nothing was changed, no password needed. Next: stynpilot start", file=out)
+        return 0
+    if interactive is None:
+        interactive = sys.stdin.isatty()
+    if not interactive:
+        print("Nothing was changed. This step asks for your password, so run it in a terminal you are typing in.", file=out)
+        return 1
+    if _polkit_would_ask("org.stynpilot.root-setup", os.getpid(), check) == "no":
+        print("Nothing was changed. This computer's permission rules do not let this login ask for a password for "
+              "this step (an older StyNpilot package only allowed someone sitting at the machine). Install the current "
+              "package, then run this again.", file=out)
+        return 1
+    print("Asking for your password. It lets StyNpilot copy ONE settings file to %s for your account only. "
+          "It installs and starts nothing." % ROOT_CONFIG, file=out, flush=True)
+    run = run or (lambda argv: subprocess.run(argv, timeout=600))
+    try:
+        result = run(["pkexec", ROOT_HELPER, "root-setup", "--from", str(paths["proposed"])])
+    except KeyboardInterrupt:                                              # Ctrl-C at the password prompt
+        print("\nCancelled. Nothing was changed. You can run it again.", file=out)
+        return 1
+    code = getattr(result, "returncode", 1)
+    status = setup_status(home, uid, root_config)
+    if code != 0 or status["system"] != "done":
+        print("The system step did not finish (%s). Nothing was started. You can run it again." % pkexec_reason(code), file=out)
+        return 1
+    mark_complete(home)
+    print("System settings are in place. Nothing was started. Next: stynpilot start", file=out)
+    return 0
+
+
 def _write_receipt(path, uid, digest):
     """Public (0644) proof that the privileged step finished: no secrets, only the owner uid and a hash."""
     tmp = path.with_name(".%s.tmp" % path.name)
@@ -459,7 +526,9 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
         if getattr(result, "returncode", 1) != 0 or status["system"] != "done":
             why = html.escape(str(getattr(result, "stderr", "") or "")[:300])
             return next_step(status, "<p><b>The system step did not finish</b> (cancelled or refused). Nothing was "
-                                     "started. You can try again.</p>%s" % ("<p><small>%s</small></p>" % why if why else ""))
+                                     "started. You can try again.</p>%s<p>Connected over SSH? Open a second terminal and run "
+                                     "<b>stynpilot setup-system</b> there; it asks for your password in that terminal, then "
+                                     "reload this page.</p>" % ("<p><small>%s</small></p>" % why if why else ""))
         mark_complete(home)
         return next_step(setup_status(home, uid, root_config))
     async def start(request: Request):
@@ -497,5 +566,5 @@ def serve(home=None, uid=None, open_browser=True):                     # pragma:
     url = "http://127.0.0.1:%d/setup/%s" % (port, token)
     if open_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    print("Setup page:", url)
+    print("Setup page:", url, flush=True)
     server.run()

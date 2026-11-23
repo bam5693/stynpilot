@@ -1,0 +1,20 @@
+PASS VM boots with real systemd
+PASS package installed; a second, non-admin account exists :: Unpacking stynpilot (0.1.0~dev0) ...
+PASS the owner's SSH login is a REMOTE session with no seat (the Termius case) :: Seat= Remote=yes Active=yes 
+PASS pairing database exists for the owner :: {"ok": true, "owner": "acct_e3f7d65021afe4c3d246af2f4377ca0f8ee1abf0", "pairing": "/home/owner/.local/state/stynpilot-owner/pairing.sqlite3"}
+PASS form saved from the remote login; system step pending :: {"pairing_found": "/home/owner/.local/state/stynpilot-owner/pairing.sqlite3", "step": "saved"}
+PASS owner.json and installer.proposed.json exist :: f70196bee72ef1acfef675b42a94b69ab4d915822dce6fbddbca5d7b80766139  .config/stynpilot/owner.json
+PASS polkit now says 'requires authentication' (exit 2) for the remote login :: polkit\56result=auth_admin
+PASS wrong password: refused, says so, nothing written :: failure
+PASS cancelled at the prompt (Ctrl-D): did not finish, nothing written :: inal.
+PASS cancelled at the prompt (Ctrl-C): no crash, nothing written :: 
+PASS prompt names the one operation :: taller.json for your account only. It installs and starts nothing.
+PASS right password: system settings written, nothing started :: 
+PASS the saved answers were not touched (nothing re-entered) :: f70196bee72ef1acfef675b42a94b69ab4d915822dce6fbddbca5d7b80766139  .config/stynpilot/owner.json
+PASS settings file is root-owned and private :: root 600
+PASS repeating asks for no password and changes nothing :: The system step is already finished. Nothing was changed, no password needed. Next: stynpilot start
+PASS another account is refused by the helper even after authenticating :: 
+PASS another account cannot run the owner's setup step :: Nothing was changed. Setup has not been saved yet (or the saved settings do not match): open 'stynpilot setup' and press 'Save and prepare' fi
+PASS stynpilot start works from the remote login :: 
+PASS stynpilot stop works from the remote login :: 
+RESULT: PASS  (19 checks, 0 failed)

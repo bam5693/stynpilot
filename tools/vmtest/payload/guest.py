@@ -46,7 +46,7 @@ def wizard(url):
     first = c.get(parts.path)
     assert first.status_code == 303, first.status_code
     again = c.get(parts.path)                                   # one-time link: must now be refused
-    assert again.status_code == 404, "setup link was reusable"
+    assert again.status_code == 410, "setup link was reusable"
     page = c.get("/setup")
     assert page.status_code == 200 and "pairing" in page.text.lower()
     found = ""
@@ -61,6 +61,8 @@ def wizard(url):
     assert saved.status_code == 200 and "One step left" in saved.text, saved.text[:400]
     out(step="saved", pairing_found=found)
     sys.stdout.flush()
+    if "--save-only" in sys.argv:                               # the owner fills the form; the password step comes later
+        return
     done = c.post("/setup/system", data={"go": "1"}, headers=h)      # blocks while the password prompt is answered
     finished = "Setup is finished" in done.text
     out(step="system", finished=finished, page=done.text[-500:] if not finished else "")

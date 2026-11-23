@@ -257,7 +257,7 @@ def scenario(vm):
     record("owner logs in on a real local session", True)
     rc, out = vm.serial("loginctl show-session $(loginctl --no-legend | awk '$3==\"owner\"{print $1}' | head -1) -p Active -p Remote -p Class | tr '\\n' ' '")
     record("that login is a local active session (what polkit's allow_active needs)", "Active=yes" in out and "Remote=no" in out, out[-200:])
-    c.sendline("BROWSER=true stynpilot setup")
+    c.sendline("PYTHONUNBUFFERED=1 BROWSER=true stynpilot setup")
     c.expect(r"Setup page: (http://\S+)", timeout=180)
     url = c.match.group(1).strip()
     wiz = vm.ssh_popen("owner", "python3 -I /mnt/payload/guest.py wizard %s --start" % url)
@@ -390,6 +390,114 @@ def scenario(vm):
 
 
 
+def scenario_remote(vm):
+    """The owner is on SSH (a REMOTE logind session, no seat): finish setup's password step from the terminal. Real polkit,
+    real pkexec text agent, real sshd. Nothing here starts a service except the final start/stop round trip."""
+    import pexpect
+    vm.boot(first=True)
+    record("VM boots with real systemd", vm.wait_ssh() is True)
+    vm.set_proxy()
+    vm.root("mkdir -p /mnt/payload && mount -o ro /dev/vdb /mnt/payload")
+    rc, out = vm.root("DEBIAN_FRONTEND=noninteractive apt-get install -y /mnt/payload/stynpilot.deb 2>&1 | tail -2; useradd -m -s /bin/bash mallory; "
+                      "echo mallory:mallorypw | chpasswd; mkdir -p ~mallory/.ssh; cp ~owner/.ssh/authorized_keys ~mallory/.ssh/; "
+                      "chown -R mallory ~mallory/.ssh; id mallory", timeout=1200)
+    record("package installed; a second, non-admin account exists", "uid=" in out, out[-200:])
+
+    def pty(user, command, timeout=120):
+        argv = ["-tt", "-i", vm.key, "-p", str(vm.a.ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "LogLevel=ERROR", "%s@127.0.0.1" % user, command]
+        return pexpect.spawn("ssh", argv, encoding="utf-8", timeout=timeout)
+
+    def finish(child):
+        child.expect(pexpect.EOF)
+        return child.before
+
+    rc, out = vm.ssh("owner", "loginctl show-session $XDG_SESSION_ID -p Remote -p Seat -p Active | tr '\\n' ' '")
+    record("the owner's SSH login is a REMOTE session with no seat (the Termius case)", "Remote=yes" in out and "Seat=" in out, out)
+    rc, js, out = vm.guest("pairing")
+    record("pairing database exists for the owner", js.get("ok"), out[-200:])
+    # --- the owner fills the form (page over SSH), exactly as before; the system step is left pending
+    setup = vm.ssh_popen("owner", "PYTHONUNBUFFERED=1 BROWSER=true stynpilot setup")
+    url = ""
+    for line in setup.stdout:
+        if line.startswith("Setup page:"):
+            url = line.split()[-1]
+            break
+    rc, js, out = vm.guest("wizard %s --save-only" % url)
+    setup.kill()
+    record("form saved from the remote login; system step pending", '"step": "saved"' in out, out[-300:])
+    rc, before = vm.as_owner("bash -c 'cd ~ && sha256sum .config/stynpilot/owner.json .config/stynpilot/installer.proposed.json'")
+    record("owner.json and installer.proposed.json exist", before.count("stynpilot") == 2, before)
+
+    # --- diagnosis: what polkit says for this very login
+    rc, out = vm.ssh("owner", "pkcheck --action-id org.stynpilot.root-setup --process $$; echo rc=$?")
+    record("polkit now says 'requires authentication' (exit 2) for the remote login", "rc=2" in out, out)
+
+    def nothing_in_etc():
+        return vm.root("ls /etc/stynpilot 2>&1 | grep -c -E 'installer.json|receipt'")[1].strip() == "0"
+
+    # --- wrong password
+    c = pty("owner", "stynpilot setup-system")
+    c.expect("Password: ")
+    c.sendline("wrongpw")
+    text = finish(c)
+    record("wrong password: refused, says so, nothing written", "refused" in text and "did not finish" in text and nothing_in_etc(), text[-300:])
+    # --- cancel with Ctrl-D (end of input at the prompt)
+    c = pty("owner", "stynpilot setup-system")
+    c.expect("Password: ")
+    c.sendeof()
+    text = finish(c)
+    record("cancelled at the prompt (Ctrl-D): did not finish, nothing written", "did not finish" in text and nothing_in_etc(), text[-300:])
+    # --- cancel with Ctrl-C
+    c = pty("owner", "stynpilot setup-system")
+    c.expect("Password: ")
+    c.sendintr()
+    text = finish(c)
+    record("cancelled at the prompt (Ctrl-C): no crash, nothing written", "Traceback" not in text and nothing_in_etc(), text[-300:])
+    # --- the prompt names exactly what is being approved; right password
+    c = pty("owner", "stynpilot setup-system")
+    c.expect("Password: ")
+    prompt = c.before
+    record("prompt names the one operation", "AUTHENTICATING FOR org.stynpilot.root-setup" in prompt and "ONE settings file" in prompt, prompt[-300:])
+    c.sendline("ownerpw")
+    text = finish(c)
+    rc, files = vm.root("ls -l /etc/stynpilot; systemctl is-active stynpilot-installer.service; ss -ltn | grep -c -E ':(18443|18444)\\b'")
+    record("right password: system settings written, nothing started", "System settings are in place" in text and "installer.json" in files
+           and "setup-receipt.json" in files
+           and "inactive" in files, text[-200:] + files)
+    rc, after = vm.as_owner("bash -c 'cd ~ && sha256sum .config/stynpilot/owner.json .config/stynpilot/installer.proposed.json'")
+    record("the saved answers were not touched (nothing re-entered)", after == before, after)
+    rc, mode = vm.root("stat -c '%U %a' /etc/stynpilot/installer.json")
+    record("settings file is root-owned and private", mode.strip() == "root 600", mode)
+    # --- repeat: asks for nothing
+    c = pty("owner", "stynpilot setup-system")
+    i = c.expect(["Password: ", pexpect.EOF])
+    text = c.before
+    record("repeating asks for no password and changes nothing", i == 1 and "already finished" in text, text[-200:])
+    # --- a different account cannot use the owner's installer
+    c = pty("mallory", "pkexec /usr/libexec/stynpilot/root-helper root-start")
+    c.expect("Password: ")
+    c.sendline("ownerpw")                       # even with the admin's password, the helper checks WHO asked
+    text = finish(c)
+    rc, act = vm.root("systemctl is-active stynpilot-installer.service")
+    record("another account is refused by the helper even after authenticating", "belongs_to_another_user" in text and "inactive" in act, text[-300:])
+    c = pty("mallory", "stynpilot setup-system")
+    text = finish(c)
+    record("another account cannot run the owner's setup step", "Nothing was changed" in text, text[-200:])
+    # --- the next step works remotely too (this is the first time anything starts)
+    c = pty("owner", "stynpilot start", timeout=240)
+    c.expect("Password: ")
+    c.sendline("ownerpw")
+    text = finish(c)
+    record("stynpilot start works from the remote login", "StyNpilot is running" in text, text[-300:])
+    c = pty("owner", "stynpilot stop", timeout=240)
+    c.expect("Password: ")
+    c.sendline("ownerpw")
+    text = finish(c)
+    rc, act = vm.root("systemctl is-active stynpilot-installer.service")
+    record("stynpilot stop works from the remote login", "stopped" in text and "inactive" in act, text[-300:])
+
+
 def scenario_preview26(vm):
     """Rehearses the Preview26 safety net: back up a stand-in install, add the new StyNpilot beside it, wreck the
     stand-in, restore, and prove it is byte-for-byte what it was."""
@@ -480,11 +588,11 @@ def main():
     p.add_argument("--work", required=True)
     p.add_argument("--key", required=True)
     p.add_argument("--ssh-port", type=int, default=2222)
-    p.add_argument("--scenario", choices=["full", "preview26"], default="full")
+    p.add_argument("--scenario", choices=["full", "preview26", "remote"], default="full")
     a = p.parse_args()
     vm = Vm(a)
     try:
-        (scenario if a.scenario == "full" else scenario_preview26)(vm)
+        {"full": scenario, "preview26": scenario_preview26, "remote": scenario_remote}[a.scenario](vm)
     except Exception as error:
         record("scenario aborted: %s" % type(error).__name__, False, str(error)[-500:])
     finally:

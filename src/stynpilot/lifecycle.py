@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from .setup_wizard import ROOT_HELPER
+from .setup_wizard import ROOT_HELPER, pkexec_reason
 
 OWNER_UNIT = "stynpilot-owner.service"
 INSTALLER_UNIT = "stynpilot-installer.service"
@@ -52,7 +52,7 @@ def run(command, config_path, *, show=False, run=_run, active=_active, wait=wait
         config = OwnerConfig.from_file(config_path)               # fail early if setup was never finished
         first = run(["pkexec", ROOT_HELPER, "root-start"], timeout=300)
         if first.returncode != 0:
-            print("The installer was NOT started (password prompt cancelled or refused):",
+            print("The installer was NOT started (%s):" % pkexec_reason(first.returncode, first.stderr),
                   (first.stderr or first.stdout).strip()[:300], file=out)
             return 1
         second = run(["systemctl", "--user", "enable", "--now", OWNER_UNIT])
@@ -69,7 +69,8 @@ def run(command, config_path, *, show=False, run=_run, active=_active, wait=wait
         run(["systemctl", "--user", "disable", "--now", OWNER_UNIT])
         stopped = run(["pkexec", ROOT_HELPER, "root-stop"], timeout=300)
         if stopped.returncode != 0:
-            print("The installer was NOT stopped:", (stopped.stderr or stopped.stdout).strip()[:300], file=out)
+            print("The installer was NOT stopped (%s):" % pkexec_reason(stopped.returncode, stopped.stderr),
+                  (stopped.stderr or stopped.stdout).strip()[:300], file=out)
             return 1
         print("StyNpilot is stopped. Your settings, requests and backups are untouched.", file=out)
         code = 0

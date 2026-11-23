@@ -954,6 +954,159 @@ class ScriptAndPolicyTests(unittest.TestCase):
             root_helper.main(["run-anything", "--cmd", "id"])
 
 
+class RemoteAuthTests(unittest.TestCase):
+    """Finishing setup's one password step from a terminal (SSH): success, denial, cancel, wrong identity, repeats."""
+    setUp = SetupTests.setUp
+    install_root_config = SetupTests.install_root_config
+    status = SetupTests.status
+    resume = SetupTests.resume
+    receipt = SetupTests.receipt
+
+    def finish(self, run, *, check=lambda argv: 2, interactive=True, uid=None):
+        import io
+        out = io.StringIO()
+        code = setup_wizard.finish_system(self.home, self.uid if uid is None else uid, self.root_config, run=run, check=check,
+                                          interactive=interactive, out=out)
+        return code, out.getvalue()
+
+    def pkexec_ok(self, calls):
+        def run(argv):
+            calls.append(argv)
+            self.install_root_config()                                   # what the root helper does after the password
+            return SimpleNamespace(returncode=0)
+        return run
+
+    def saved_files(self):
+        return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (self.paths["config"], self.paths["proposed"])}
+
+    def test_success_uses_the_saved_settings_changes_only_the_system_file_and_starts_nothing(self):
+        self.resume()
+        before, calls = self.saved_files(), []
+        code, said = self.finish(self.pkexec_ok(calls))
+        self.assertEqual(code, 0, said)
+        self.assertEqual(calls, [["pkexec", setup_wizard.ROOT_HELPER, "root-setup", "--from", str(self.paths["proposed"])]])
+        self.assertEqual(self.status()["system"], "done")
+        self.assertTrue(self.paths["done"].exists())
+        self.assertEqual(self.saved_files(), before)                      # the seven answers were not asked for again or changed
+        self.assertIn("Nothing was started", said)
+
+    def test_denied_password_changes_nothing_and_can_be_retried(self):
+        self.resume()
+        calls = []
+        code, said = self.finish(lambda argv: calls.append(argv) or SimpleNamespace(returncode=127))
+        self.assertEqual(code, 1)
+        self.assertIn("refused", said)
+        self.assertEqual(self.status()["system"], "pending")
+        self.assertFalse(self.root_config.exists() or self.receipt.exists() or self.paths["done"].exists())
+        code, said = self.finish(self.pkexec_ok(calls))                    # the next try works
+        self.assertEqual((code, self.status()["system"]), (0, "done"))
+
+    def test_cancelled_prompt_says_cancelled_and_changes_nothing(self):
+        self.resume()
+        code, said = self.finish(lambda argv: SimpleNamespace(returncode=126))
+        self.assertEqual(code, 1)
+        self.assertIn("cancelled", said)
+        self.assertEqual(self.status()["system"], "pending")
+        self.assertFalse(self.root_config.exists())
+
+    def test_ctrl_c_at_the_prompt_is_a_clean_cancel(self):
+        self.resume()
+
+        def interrupted(argv):
+            raise KeyboardInterrupt
+        code, said = self.finish(interrupted)
+        self.assertEqual(code, 1)
+        self.assertIn("Cancelled", said)
+        self.assertFalse(self.root_config.exists())
+
+    def test_a_zero_exit_without_the_receipt_is_not_success(self):
+        self.resume()
+        code, said = self.finish(lambda argv: SimpleNamespace(returncode=0))
+        self.assertEqual(code, 1)
+        self.assertFalse(self.paths["done"].exists())
+
+    def test_repeating_after_it_finished_asks_for_nothing(self):
+        self.resume()
+        self.finish(self.pkexec_ok([]))
+        calls = []
+        code, said = self.finish(lambda argv: calls.append(argv) or SimpleNamespace(returncode=0))
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("already finished", said)
+
+    def test_a_login_polkit_will_not_even_ask_is_told_so_before_any_prompt(self):
+        self.resume()
+        calls = []
+        code, said = self.finish(lambda argv: calls.append(argv), check=lambda argv: 1)
+        self.assertEqual((code, calls), (1, []))
+        self.assertIn("Install the current package", said)
+        for answer in (0, 2):                                              # allowed / will ask: go ahead
+            calls.clear()
+            self.finish(lambda argv: calls.append(argv) or SimpleNamespace(returncode=126), check=lambda argv, a=answer: a)
+            self.assertEqual(len(calls), 1)
+        calls.clear()
+
+        def no_pkcheck(argv):
+            raise FileNotFoundError(argv[0])
+        self.finish(lambda argv: calls.append(argv) or SimpleNamespace(returncode=126), check=no_pkcheck)
+        self.assertEqual(len(calls), 1)                                    # unknown: the real prompt decides
+
+    def test_refuses_without_saved_settings_or_a_terminal_or_for_another_account(self):
+        calls = []
+        run = lambda argv: calls.append(argv) or SimpleNamespace(returncode=0)
+        code, said = self.finish(run)                                      # nothing saved yet
+        self.assertEqual(code, 1)
+        self.assertIn("Save and prepare", said)
+        self.resume()
+        self.assertEqual(self.finish(run, interactive=False)[0], 1)        # no terminal to type a password in
+        self.assertEqual(self.finish(run, uid=self.uid + 1)[0], 1)         # saved for a different account
+        self.assertEqual(calls, [])
+        self.assertFalse(self.root_config.exists())
+
+    def test_the_root_step_still_acts_only_for_the_authenticated_owner(self):
+        """Whoever types the password, the helper checks WHO polkit authenticated against the saved settings."""
+        self.resume()
+        for stranger in (self.uid + 1, 0):
+            with self.assertRaises(ConfigError):
+                setup_wizard.root_setup(self.paths["proposed"], dest=self.root_config, geteuid=lambda: 0, invoking_uid=stranger)
+        with self.assertRaises(ConfigError):
+            setup_wizard.root_setup(self.paths["proposed"], dest=self.root_config, geteuid=lambda: 0, environ={})
+        self.assertFalse(self.root_config.exists())
+
+    def test_pkexec_outcomes_are_named_plainly(self):
+        self.assertEqual(setup_wizard.pkexec_reason(0), "done")
+        self.assertIn("cancelled", setup_wizard.pkexec_reason(126))
+        self.assertIn("refused", setup_wizard.pkexec_reason(127))
+        self.assertIn("refused", setup_wizard.pkexec_reason(1, "Error: Not authorized"))
+        self.assertIn("exit 3", setup_wizard.pkexec_reason(3))
+
+    def test_the_command_exists_and_the_page_points_to_it_when_the_button_fails(self):
+        from stynpilot import cli
+        with mock.patch.object(setup_wizard, "finish_system", return_value=0) as fs:
+            self.assertEqual(cli.main(["setup-system"]), 0)
+        self.assertEqual(fs.call_count, 1)
+        self.resume()
+        from starlette.testclient import TestClient
+        app = setup_wizard.build_app(home=self.home, uid=self.uid, token="tok123", port=5555,
+                                     root_runner=lambda s: SimpleNamespace(returncode=127, stderr="Not authorized"),
+                                     root_config=self.root_config)
+        c = TestClient(app, base_url="http://127.0.0.1:5555", follow_redirects=False)
+        c.get("/setup/tok123", headers={"host": "127.0.0.1:5555"})
+        r = c.post("/setup/system", data={"go": "1"}, headers={"host": "127.0.0.1:5555", "origin": "http://127.0.0.1:5555"})
+        self.assertIn("stynpilot setup-system", r.text)
+
+    def test_polkit_actions_ask_for_the_admin_password_everywhere_and_never_say_yes(self):
+        import xml.etree.ElementTree as ET
+        actions = ET.parse(ROOT / "packaging/org.stynpilot.policy").getroot().findall("action")
+        self.assertEqual(sorted(a.get("id") for a in actions), ["org.stynpilot.root-backup", "org.stynpilot.root-restore",
+                         "org.stynpilot.root-setup", "org.stynpilot.root-start", "org.stynpilot.root-stop"])
+        for a in actions:
+            d = {e.tag: e.text for e in a.find("defaults")}
+            self.assertEqual(d, {"allow_any": "auth_admin", "allow_inactive": "no", "allow_active": "auth_admin"}, a.get("id"))
+            notes = {n.get("key"): n.text for n in a.findall("annotate")}
+            self.assertEqual(notes["org.freedesktop.policykit.exec.path"], "/usr/libexec/stynpilot/root-helper")
+            self.assertEqual("org.stynpilot." + notes["org.freedesktop.policykit.exec.argv1"], a.get("id"))
+
+
 @unittest.skipIf(jwt is None, "PyJWT/cryptography not installed")
 class PackageTests(unittest.TestCase):
     @classmethod

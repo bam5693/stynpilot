@@ -48,7 +48,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .. import catalog, statelock
+from .. import catalog, impact, statelock
 from ..ledger import InstallLedger, LedgerError
 from ..plan import PlanError, validate_plan
 from ..requests import request_id as payload_hash
@@ -247,15 +247,18 @@ class Executor:
         content = plan.content()
         if any(step["kind"] != "apt" for step in content["steps"]):
             raise ExecutionDenied("step_kind_not_supported_yet")
+        if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
+            raise ExecutionDenied("already_decided_or_used")
+        wanted = {p["name"]: p["version"] for step in content["steps"] for p in step["packages"]}
+        if catalog.is_generic(content.get("software")):
+            self._check_generic(content, wanted)
+            return content
         try:
             entry = catalog.entry(content.get("software"))
         except catalog.CatalogError:
             raise ExecutionDenied("software_not_in_plan_or_catalog") from None
-        names = {p["name"] for step in content["steps"] for p in step["packages"]}
-        if entry["kind"] != "apt" or not set(entry["packages"]) <= names:
+        if entry["kind"] != "apt" or not set(entry["packages"]) <= set(wanted):
             raise ExecutionDenied("plan_does_not_match_catalog_entry")
-        if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
-            raise ExecutionDenied("already_decided_or_used")
         # The root installer derives the allowed package set ITSELF: the catalog's packages plus
         # exactly the dependencies apt resolves for them now. Extra packages, even real Ubuntu ones,
         # are refused before anyone is asked to approve.
@@ -263,10 +266,29 @@ class Executor:
             allowed = {p["name"]: p["version"] for p in apt.resolve(list(entry["packages"]), self.run)}
         except (RuntimeError, ValueError):
             raise ExecutionDenied("catalog_resolution_failed") from None
-        wanted = {p["name"]: p["version"] for step in content["steps"] for p in step["packages"]}
         if wanted != allowed:
             raise ExecutionDenied("plan_is_not_the_exact_catalog_closure")
         return content
+
+    def _check_generic(self, content, wanted):
+        """AI-named Ubuntu packages: the root side re-derives everything from the requested names alone."""
+        steps = content["steps"]
+        requested = steps[0].get("requested") if len(steps) == 1 else None
+        if not requested or content["software"] != catalog.generic_slug(requested):
+            raise ExecutionDenied("generic_install_not_well_formed")
+        for name in requested:
+            code = impact.refusal_for(name)
+            if code:
+                raise ExecutionDenied("blocked_package:" + code)
+        try:
+            analysis = apt.analyze(list(requested), self.run)
+        except (RuntimeError, ValueError):
+            raise ExecutionDenied("catalog_resolution_failed") from None
+        code, _ = impact.check_transaction(requested, analysis)
+        if code:
+            raise ExecutionDenied("blocked_package:" + code)
+        if not set(requested) <= set(analysis["installs"]) or wanted != analysis["installs"]:
+            raise ExecutionDenied("plan_is_not_the_exact_package_closure")
 
     def install(self, payload, proof_token, challenge, *, now=None):
         """Execute an approved install. Raises ExecutionDenied before any change; else returns a result.
@@ -331,6 +353,12 @@ class Executor:
             files = sorted(cache.glob("%s_*.deb" % name))
             if len(files) != 1 or _sha256(files[0]) != hashes[name]:
                 raise ExecutionDenied("downloaded_file_does_not_match_the_signed_index")
+        if catalog.is_generic(content.get("software")):               # what the downloaded files would put on disk
+            for name, version in pins:
+                (file,) = sorted(cache.glob("%s_*.deb" % name))
+                code, _ = impact.inspect_listing(apt.deb_listing(file, self.run))
+                if code:
+                    raise ExecutionDenied("blocked_package:" + code)
         try:
             would, removals, chosen = apt.simulate_install(apt._pins(pins), self.run, cache=cache, no_download=True,
                                                            with_origins=True)

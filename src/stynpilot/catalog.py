@@ -18,10 +18,13 @@ anything different.
 """
 from __future__ import annotations
 
+import hashlib
+import re
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 
-from .plan import validate_plan
+from . import impact
+from .plan import MAX_REQUESTED, validate_plan
 
 PLAN_LIFETIME = timedelta(hours=1)
 BACKUP, ROLLBACK = "required-before-mutation", "restore-verified-snapshot"
@@ -68,6 +71,41 @@ def listing():
             for key, value in sorted(CATALOG.items())]
 
 
+GENERIC_PREFIX = "apt-"
+_NAME = re.compile(r"[a-z0-9][a-z0-9+.-]{0,127}\Z")
+
+
+def generic_slug(requested):
+    """Deterministic software id for an install of arbitrary Ubuntu packages: apt-<first name>-<8 hex of all names>.
+
+    Derived from the requested names only, so the root installer recomputes it and a mismatch is refused.
+    """
+    names = sorted(requested)
+    base = re.sub(r"[^a-z0-9]+", "-", names[0])[:28].strip("-") or "pkg"
+    return "%s%s-%s" % (GENERIC_PREFIX, base, hashlib.sha256("\n".join(names).encode()).hexdigest()[:8])
+
+
+def is_generic(software):
+    return type(software) is str and software.startswith(GENERIC_PREFIX)
+
+
+def check_names(packages):
+    """1..MAX_REQUESTED distinct, strictly shaped package names (sorted). Raises CatalogError("invalid_package_name")."""
+    if (type(packages) is not list or not 1 <= len(packages) <= MAX_REQUESTED
+            or not all(type(n) is str and _NAME.fullmatch(n) for n in packages)):
+        raise CatalogError("invalid_package_name")
+    if len(set(packages)) != len(packages):
+        raise CatalogError("invalid_package_name")
+    return sorted(packages)
+
+
+def describe(software, requested=None):
+    """Plain title for a catalog id or a generic install (used by status and rollback)."""
+    if is_generic(software):
+        return "Ubuntu package%s %s" % ("s" if requested and len(requested) > 1 else "", ", ".join(requested or [software]))
+    return entry(software)["title"]
+
+
 def _expiry(now):
     return (now + PLAN_LIFETIME).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -100,3 +138,56 @@ def install_plan(software, *, owner, device, resolve_apt, now=None):
     summary += ["A backup is taken before anything changes; rollback restores it.",
                 "Expires %s UTC if not approved." % raw["expires_at"].replace("T", " ").rstrip("Z")]
     return validated, summary
+
+
+def generic_install_plan(packages, *, owner, device, analyze, installed, now=None):
+    """Plan for 1..3 AI-named Ubuntu packages. Returns (ValidatedPlan, summary lines, info).
+
+    ``analyze(names) -> {installs, upgrades, removals, origins, meta}`` simulates the install (no change).
+    ``installed(names) -> {name: version or None}``.
+    Raises CatalogError with a stable code: invalid_package_name, package_not_available, already_installed,
+    blocked_package:<code>, version_resolution_unavailable.
+    """
+    names = check_names(packages)
+    now = datetime.now(timezone.utc) if now is None else now
+    if not callable(analyze) or not callable(installed):
+        raise CatalogError("version_resolution_unavailable")
+    for name in names:
+        code = impact.refusal_for(name)
+        if code:
+            raise CatalogError("blocked_package:" + code)
+    try:
+        have = installed(names)
+        analysis = analyze(names)
+    except Exception:
+        raise CatalogError("package_not_available") from None
+    if not analysis.get("installs"):
+        if all(have.get(n) for n in names):
+            raise CatalogError("already_installed")
+        raise CatalogError("package_not_available")
+    if not all(all(o.startswith("Ubuntu:") for o in analysis["origins"].get(n, [])) and analysis["origins"].get(n)
+               for n in analysis["installs"]):
+        raise CatalogError("package_not_available")
+    code, notes = impact.check_transaction(names, analysis)
+    if code:
+        raise CatalogError("blocked_package:" + code)
+    requested = [n for n in names if n in analysis["installs"]]
+    already = [n for n in names if n not in analysis["installs"]]
+    if already and not all(have.get(n) for n in already):
+        raise CatalogError("package_not_available")
+    packages_out = [{"name": n, "version": v} for n, v in sorted(analysis["installs"].items())]
+    slug = generic_slug(requested)
+    raw = {"schema": 1, "owner": owner, "device": device, "software": slug,
+           "steps": [{"kind": "apt", "packages": packages_out, "requested": requested}],
+           "backup": BACKUP, "rollback": ROLLBACK, "expires_at": _expiry(now)}
+    validated = validate_plan(raw, expected_owner=owner, expected_device=device, now=now)
+    summary = ["Install %s from the Ubuntu archive (named by the assistant, checked by StyNpilot)." % ", ".join(requested)]
+    summary += ["Package %s, exact version %s%s." % (p["name"], p["version"],
+                "" if p["name"] in requested else " (needed by it)") for p in packages_out]
+    if already:
+        summary.append("Already installed, unchanged: %s." % ", ".join(already))
+    summary += notes
+    summary += ["Install scripts in Ubuntu packages run as root; a signed Ubuntu source proves where a package came from, not that it is harmless.",
+                "A backup is taken before anything changes; rollback restores it.",
+                "Expires %s UTC if not approved." % raw["expires_at"].replace("T", " ").rstrip("Z")]
+    return validated, summary, {"software": slug, "requested": requested, "already_installed": already, "notes": notes}

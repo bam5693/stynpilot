@@ -96,6 +96,12 @@ def _match(name):
     return None
 
 
+def refusal_for(name):
+    """Stable refusal code if this package name is never installable by an AI, else None."""
+    found = _match(name)
+    return found[0] if found else None
+
+
 def explain(code):
     """One plain sentence for a refusal code, for the AI and the owner."""
     if code in _PLAIN_REFUSAL:

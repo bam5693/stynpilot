@@ -244,6 +244,7 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
         propose = dict(clients=EnrolledClients([dict(c) for c in config.enrolled_clients], revocations=revocations),
                        store=store, ledger=BrokerLedger(config.broker_socket),
                        resolve_apt=resolve_apt or apt.resolve,
+                       analyze_apt=apt.analyze, installed_apt=apt.installed_versions, search_apt=apt.search,
                        approval_url="https://%s" % config.approval_public_host)
         service.mcp = (start_mcp or run.start)(router=router, public_host=config.mcp_public_host,
                                                port=config.mcp_port, propose=propose)

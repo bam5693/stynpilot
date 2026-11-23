@@ -31,6 +31,9 @@ class FakeMachine:
         self.fail_remove = False
         self.fail_marks = False
         self.pause = None                                # threading.Event: a real install waits here (long install)
+        self.meta = {}                                   # name -> {"Essential": "yes", "Priority": .., "Section": .., "Installed-Size": ..}
+        self.search_names = []                           # extra names `apt-cache search` returns
+        self.deb_files = {}                              # name -> `dpkg-deb -c` listing text
         self.paused = None                               # threading.Event set when it has started waiting
 
     def changes(self):
@@ -85,6 +88,23 @@ class FakeMachine:
             return 0, ""
         if tool == "apt-config":
             return (0, "".join(l + "\n" for l in ["Acquire::Languages \"none\";", *self.config])) if self.config_ok else (1, "")
+        if tool == "apt-cache" and argv[1] == "search":
+            q = argv[-1].lower()
+            names = sorted({n for n in [*self.available, *self.search_names, *self.installed] if q in n})
+            return 0, "".join("%s - %s tool\n" % (n, n) for n in names)
+        if tool == "apt-cache" and argv[1] == "show" and "--no-all-versions" in argv:
+            out = ""
+            for name in argv[argv.index("--") + 1:]:
+                version = self.available.get(name) or self.installed.get(name)
+                if version is None:
+                    continue
+                fields = {"Package": name, "Version": version, "Priority": "optional", "Section": "utils",
+                          "Installed-Size": "100", **self.meta.get(name, {})}
+                out += "".join("%s: %s\n" % kv for kv in fields.items()) + "Description: %s tool\n long text\n\n" % name
+            return (0 if out else 100), out
+        if tool == "dpkg-deb":
+            stem = Path(argv[-1]).name.split("_")[0]
+            return 0, self.deb_files.get(stem, "drwxr-xr-x root/root 0 2026-01-01 00:00 ./\n-rwxr-xr-x root/root 10 2026-01-01 00:00 ./usr/bin/%s\n" % stem)
         if tool == "apt-cache" and argv[1] == "show":
             name, _, version = argv[-1].partition("=")
             if not self._downloadable(name, version):

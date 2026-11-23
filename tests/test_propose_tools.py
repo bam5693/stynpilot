@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 from datetime import timedelta
 
+from stynpilot.broker import apt
+from tests.fake_machine import FakeMachine
 from stynpilot.identity import TokenDenied
 from stynpilot.ledger import InstallLedger
 from stynpilot.requests import RequestStore
@@ -84,9 +86,16 @@ class ProposeToolTests(unittest.TestCase):
         self.now = [datetime(2026, 11, 22, 17, 0, 5, tzinfo=timezone.utc)]
         self.store = RequestStore(self.state / "requests.sqlite3", clock=lambda: self.now[0].timestamp())
         self.ledger = InstallLedger(self.state / "installs.sqlite3", clock=lambda: self.now[0].timestamp())
+        self.machine = FakeMachine(installed={"bash": "5", "tree": "2.1-1"},
+                                   available={"ncdu": "2.3-1", "libncurses6": "6.4", "tree": "2.1-1", "sudo": "1.9",
+                                               "openssh-server": "9", "nginx": "1.24", "docker.io": "26"},
+                                   deps={"ncdu": ["libncurses6"]})
         self.server = create_server(router=router, resource_url=AUDIENCE, propose=dict(
             clients=self.clients, store=self.store, ledger=self.ledger, resolve_apt=lambda names: [{"name": "htop", "version": "3.3.0-4build1"}, {"name": "libnl-3-200", "version": "3.7.0-0.3build1.1"}],
-            approval_url="https://ryzen.example.test/app", clock=lambda: self.now[0]))
+            approval_url="https://ryzen.example.test/app", clock=lambda: self.now[0],
+            analyze_apt=lambda names: apt.analyze(names, self.machine),
+            installed_apt=lambda names: apt.installed_versions(names, self.machine),
+            search_apt=lambda q: apt.search(q, self.machine)))
 
     def call(self, name, arguments, token="chatgpt"):
         who = Tokens.valid.get(token)
@@ -106,7 +115,7 @@ class ProposeToolTests(unittest.TestCase):
 
     def test_tools_listed_and_none_can_approve(self):
         names = sorted(t.name for t in asyncio.run(self.server.list_tools()))
-        self.assertEqual(names, sorted(["computer_health", "commander_software_catalog",
+        self.assertEqual(names, sorted(["computer_health", "commander_software_catalog", "commander_software_search",
                                         "commander_request_software_install", "commander_software_install_status",
                                         "commander_request_software_rollback"]))
         self.assertFalse(any(word in n for n in names for word in ("approve", "review", "execute", "run")))
@@ -123,6 +132,51 @@ class ProposeToolTests(unittest.TestCase):
                            {"device_id": DEVICE, "request_id": receipt["request_id"]}, "claude")
         self.assertEqual(status["result"]["state"], "pending")
         self.assertEqual(self.install("claude")["result"]["request_id"], receipt["request_id"])   # same plan, one request
+
+    def pkgs(self, packages, token="chatgpt"):
+        return self.call("commander_request_software_install", {"device_id": DEVICE, "packages": packages}, token)
+
+    def test_search_lists_and_flags_blocked_packages(self):
+        out = self.call("commander_software_search", {"device_id": DEVICE, "query": "tree"})
+        self.assertTrue(out["ok"], out)
+        self.assertTrue(out["results"][0]["installed"])
+        sudo = self.call("commander_software_search", {"device_id": DEVICE, "query": "sudo"})["results"][0]
+        self.assertFalse(sudo["ai_may_request"])
+        self.assertIn("login", sudo["blocked_reason"])
+        self.assertTrue(self.call("commander_software_search", {"device_id": DEVICE, "query": "ncdu"})["results"][0]["ai_may_request"])
+
+    def test_search_refuses_bad_text_and_unauthorised(self):
+        self.assertEqual(self.call("commander_software_search", {"device_id": DEVICE, "query": "a;b"})["error"], "invalid_search_text")
+        self.assertFalse(self.call("commander_software_search", {"device_id": DEVICE, "query": "ncdu"}, "readonly")["ok"])
+        self.assertEqual(self.machine.changes(), [])
+
+    def test_non_catalog_package_request_files_exact_plan(self):
+        out = self.pkgs(["ncdu"])
+        self.assertTrue(out["ok"], out)
+        r = out["result"]
+        self.assertEqual((r["state"], r["approved_by_ai"], r["requested"]), ("pending", False, ["ncdu"]))
+        text = " ".join(r["summary"])
+        self.assertIn("Package ncdu, exact version 2.3-1.", text)
+        self.assertIn("Package libncurses6, exact version 6.4 (needed by it).", text)
+        self.assertIn("not that it is harmless", text)
+        self.assertEqual(self.machine.changes(), [])
+        self.assertEqual(self.pkgs(["ncdu"], "claude")["result"]["request_id"], r["request_id"])
+
+    def test_already_installed_files_nothing(self):
+        out = self.pkgs(["tree"])
+        self.assertTrue(out["ok"] and out["already_installed"], out)
+        self.assertNotIn("request_id", json.dumps(out))
+
+    def test_blocked_and_malformed_requests_refused_before_any_request(self):
+        for names, code in ((["sudo"], "blocked_package"), (["openssh-server"], "blocked_package"), (["docker.io"], "blocked_package"),
+                            (["nosuch"], "package_not_available"), (["a;b"], "invalid_package_name"), (["-o"], "invalid_package_name"),
+                            (["Ncdu"], "invalid_package_name"), (["a", "b", "c", "d"], "invalid_package_name"), (["ncdu", "ncdu"], "invalid_package_name")):
+            out = self.pkgs(names)
+            self.assertEqual((out["ok"], out["error"]), (False, code), names)
+        self.assertEqual(self.call("commander_request_software_install", {"device_id": DEVICE})["error"], "give_software_or_packages")
+        self.assertEqual(self.call("commander_request_software_install", {"device_id": DEVICE, "software": "htop", "packages": ["ncdu"]})["error"],
+                         "give_software_or_packages")
+        self.assertEqual(self.store.pending() if hasattr(self.store, "pending") else [], [])
 
     def test_every_refusal(self):
         cases = {

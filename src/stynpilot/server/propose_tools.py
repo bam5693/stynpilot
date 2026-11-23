@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 from mcp.types import ToolAnnotations
 
-from .. import catalog
+from .. import catalog, impact
 from ..identity import TokenDenied
 from ..ledger import LedgerError
 from ..plan import PlanError
@@ -29,8 +29,9 @@ from .clients import PROPOSE_SCOPE, ClientDenied
 from .router import AccessDenied
 
 _LOG = logging.getLogger("stynpilot.propose")
+_SLUG = re.compile(r"[a-z][a-z0-9-]{0,47}\Z")
 _ROLLBACK_ID = re.compile(r"[a-f0-9]{16,64}\Z")
-REQUEST_TOOLS = ("commander_software_catalog", "commander_request_software_install",
+REQUEST_TOOLS = ("commander_software_catalog", "commander_software_search", "commander_request_software_install",
                  "commander_software_install_status", "commander_request_software_rollback")
 FILES_A_REQUEST = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
@@ -59,7 +60,8 @@ class ProposeGate:
         return proposer, who.account
 
 
-def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt=None, approval_url=None, clock=None):
+def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt=None, approval_url=None, clock=None,
+             analyze_apt=None, installed_apt=None, search_apt=None):
     """Add the request tools. ``bearer()`` returns the verified request's bearer header or None."""
     gate = ProposeGate(router=router, clients=clients)
     now = clock or (lambda: datetime.now(timezone.utc))
@@ -86,22 +88,75 @@ def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt
     def software_catalog() -> dict:
         return {"ok": True, "software": catalog.listing()}
 
+    @server.tool(name="commander_software_search", title="Search Ubuntu packages by name",
+                 annotations=READ_ONLY,
+                 description=("Search the computer's signed Ubuntu package lists by package NAME (read-only, local, "
+                              "bounded). Returns name, version, summary, whether it is installed and whether an AI "
+                              "may request it. Changes nothing."))
+    def software_search(device_id: str, query: str) -> dict:
+        try:
+            guarded(device_id)
+            if search_apt is None:
+                return _error("search_unavailable")
+            try:
+                found = search_apt(query)
+            except ValueError:
+                return _error("invalid_search_text")
+            except RuntimeError:
+                return _error("search_unavailable")
+            results = []
+            for item in found:
+                blocked = impact.refusal_for(item["name"])
+                results.append({**{k: item[k] for k in ("name", "version", "summary", "section", "installed")},
+                                "installed": item.get("installed") is not None and bool(item.get("installed")),
+                                "installed_version": item.get("installed"),
+                                "ai_may_request": blocked is None,
+                                **({"blocked_reason": impact.explain(blocked)} if blocked else {})})
+            return {"ok": True, "results": results,
+                    "note": "Ubuntu archive only. To install, call commander_request_software_install with packages=[names]."}
+        except ClientDenied as denied:
+            return _error(denied.code)
+        except Exception as error:
+            _LOG.warning("search failed type=%s", type(error).__name__)
+            return _error("search_unavailable")
+
     @server.tool(name="commander_request_software_install", title="Ask the owner to approve a software install",
                  annotations=FILES_A_REQUEST,
-                 description=("Ask the computer's owner to approve installing one catalog application. "
-                              "StyNpilot builds the exact plan; the owner reviews and approves it separately "
-                              "on his phone. You supply only the catalog id and cannot approve anything."))
-    def request_install(device_id: str, software: str) -> dict:
+                 description=("Ask the computer's owner to approve installing software: either one catalog id "
+                              "(software) or 1-3 Ubuntu package NAMES (packages) found with commander_software_search. "
+                              "StyNpilot independently resolves signed Ubuntu versions and dependencies, refuses "
+                              "kernels, boot, login, firewall and other core packages, and builds the exact plan; "
+                              "the owner reviews and approves it separately on his phone. You cannot approve anything."))
+    def request_install(device_id: str, software: str = "", packages: list[str] | None = None) -> dict:
         try:
             proposer, owner = guarded(device_id)
-            plan, summary = catalog.install_plan(software, owner=owner, device=device_id,
-                                                 resolve_apt=resolve_apt, now=now())
+            if bool(software) == bool(packages):
+                return _error("give_software_or_packages")
+            info = None
+            if packages:
+                plan, summary, info = catalog.generic_install_plan(
+                    packages, owner=owner, device=device_id, analyze=analyze_apt, installed=installed_apt, now=now())
+                software = info["software"]
+            else:
+                plan, summary = catalog.install_plan(software, owner=owner, device=device_id,
+                                                     resolve_apt=resolve_apt, now=now())
             expires = datetime.strptime(plan.content()["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
                 tzinfo=timezone.utc).timestamp()
             result, _ = store.submit(kind="install", software=software, device=device_id, owner=owner,
                                      proposer=proposer, payload=plan.content(), summary=summary, expires=expires)
-        except (ClientDenied, catalog.CatalogError, RequestError) as denied:
+            if info:
+                result = {**result, "requested": info["requested"], "already_installed": info["already_installed"]}
+        except (ClientDenied, RequestError) as denied:
             return _error(denied.code)
+        except catalog.CatalogError as denied:
+            code = denied.code
+            out = _error(code.split(":", 1)[0])
+            if code.startswith("blocked_package:"):
+                out["reason"] = impact.explain(code.split(":", 1)[1])
+            if code == "already_installed":
+                out = {"ok": True, "already_installed": True, "result": {"already_installed": True},
+                       "next": "Nothing to install: those packages are already installed. No request was filed."}
+            return out
         except PlanError:
             return _error("plan_invalid")
         except Exception as error:
@@ -129,7 +184,8 @@ def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt
     def request_rollback(device_id: str, software: str, rollback_id: str) -> dict:
         try:
             proposer, owner = guarded(device_id)
-            item = catalog.entry(software)
+            title = catalog.describe(software) if catalog.is_generic(software) and _SLUG.fullmatch(software) \
+                else catalog.entry(software)["title"]
             if type(rollback_id) is not str or not _ROLLBACK_ID.fullmatch(rollback_id):
                 return _error("invalid_rollback_id")
             if ledger is None:
@@ -141,7 +197,7 @@ def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt
             payload = {"kind": "rollback", "software": software, "rollback_id": rollback_id,
                        "request_id": install["request_id"], "snapshot_id": install["snapshot_id"],
                        "owner": owner, "device": device_id, "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
-            summary = ["Roll back %s (install %s)." % (item["title"], rollback_id[:12]),
+            summary = ["Roll back %s (install %s)." % (title, rollback_id[:12]),
                        "Packages that install added are removed (their settings files are kept); packages it "
                        "upgraded go back to their saved earlier versions. The installer re-checks everything first "
                        "and refuses if anything else would be affected.",

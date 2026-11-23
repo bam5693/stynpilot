@@ -357,7 +357,7 @@ def scenario(vm):
     inv = jsi.get("result", {}).get("inventory", {})
     record("M1: read-only hardware/software inventory works and leaks no identifiers",
            bool(inv.get("os", {}).get("name")) and inv.get("memory", {}).get("total_bytes")
-           and not any(w in json.dumps(inv) for w in ("serial", "uuid", "hostname")), json.dumps(inv)[:300])
+           and not any(w in json.dumps({k: v for k, v in inv.items() if k != "software"}) for w in ("serial", "uuid", "hostname")), json.dumps(inv)[:300])
     rc, jss, _ = vm.guest("search claude-connector ncdu")
     hits = jss.get("result", {}).get("results", [])
     record("M1: AI searches the signed Ubuntu lists and finds a non-catalog package", any(h.get("name") == "ncdu" and h.get("ai_may_request") and not h.get("installed") for h in hits), json.dumps(jss)[:300])

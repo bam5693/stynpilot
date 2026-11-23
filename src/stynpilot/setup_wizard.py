@@ -335,23 +335,50 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
     def page(title, body, status=200):
         out = HTMLResponse("<!doctype html><meta charset=utf-8><title>%s</title><style>%s</style>%s"
                            % (html.escape(title), _STYLE, body), status_code=status)
-        out.headers.update({"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
+        out.headers.update({"Cache-Control": "no-store", "Referrer-Policy": "same-origin", "X-Frame-Options": "DENY",
                             "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"})
         return out
 
     def nope():
         return page("Not found", "<p>Not found.</p>", 404)
 
-    def allowed(request):
+    def why_not(request):
+        """None when the request may proceed, else a short code. Browsers send ``Origin: null`` on a form post when the
+        page's Referrer-Policy is no-referrer, so the pages use same-origin (the exact-Origin check stays strict)."""
         if request.headers.get("host") != host:
-            return False
+            return "host"
         if not hmac.compare_digest(request.cookies.get("sp_setup", ""), session):
-            return False
-        return request.method == "GET" or request.headers.get("origin") == "http://" + host
+            return "cookie"
+        if request.method != "GET" and request.headers.get("origin") != "http://" + host:
+            return "origin"
+        return None
+
+    def allowed(request):
+        return why_not(request) is None
+
+    def refused(request):
+        """A real explanation (403) instead of a bare 'Not found'. Nothing is changed and no secret is shown."""
+        code = why_not(request) or "unknown"
+        sent = html.escape((request.headers.get("host") if code == "host" else request.headers.get("origin")) or "nothing")
+        if code == "host":
+            why = ("This page was opened as <b>%s</b> but StyNpilot is waiting at <b>%s</b>. Open the setup page with exactly the "
+                   "address <code>stynpilot setup</code> printed; if you forward the port, the number on your side must be the same."
+                   % (sent, html.escape(host)))
+        elif code == "cookie":
+            why = ("Your browser did not present this setup session. Close this page, run <code>stynpilot setup</code> again "
+                   "and open the new link once (each link works one time). Cookies must be allowed for 127.0.0.1.")
+        else:
+            why = ("Your browser did not send the expected <b>Origin</b> (it sent <b>%s</b>, expected <b>http://%s</b>). "
+                   "Reload the setup page and try again; if it repeats, tell your helper this exact line." % (sent, html.escape(host)))
+        return page("Not accepted", "<h1>Not accepted, nothing was changed</h1><p>%s</p><p><small>Reason code: %s</small></p>" % (why, code), 403)
 
     async def enter(request: Request):
-        if request.headers.get("host") != host or used["entered"] \
-                or not hmac.compare_digest(request.path_params.get("token", ""), token):
+        if request.headers.get("host") != host:
+            return refused(request)
+        if used["entered"]:
+            return page("Link already used", "<h1>This setup link was already used</h1><p>Each link works once. Run "
+                        "<code>stynpilot setup</code> again for a new one. Nothing was changed.</p>", 410)
+        if not hmac.compare_digest(request.path_params.get("token", ""), token):
             return nope()
         used["entered"] = True                                  # one-time: the URL secret is spent now
         response = RedirectResponse("/setup", status_code=303)
@@ -387,7 +414,7 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
 
     async def home_page(request: Request):
         if not allowed(request):
-            return nope()
+            return refused(request)
         status = setup_status(home, uid, root_config)
         if status["config"] != "missing":
             return next_step(status)
@@ -402,7 +429,7 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
 
     async def save(request: Request):
         if not allowed(request):
-            return nope()
+            return refused(request)
         values = await _form_values(request)
         try:
             status = setup(values, home, uid, root_config)
@@ -413,7 +440,7 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
 
     async def resume(request: Request):
         if not allowed(request):
-            return nope()
+            return refused(request)
         try:
             status = setup(None, home, uid, root_config)
         except ConfigError as error:
@@ -423,7 +450,7 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
 
     async def system(request: Request):
         if not allowed(request):
-            return nope()
+            return refused(request)
         status = setup_status(home, uid, root_config)
         if not (status["config"] == "ok" and status["proposal"] == "ok" and status["state"] == "complete"):
             return page("Not ready", "<h1>Not ready for this step</h1><p><a href=/setup>Back</a></p>", 400)
@@ -437,7 +464,7 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
         return next_step(setup_status(home, uid, root_config))
     async def start(request: Request):
         if not allowed(request):
-            return nope()
+            return refused(request)
         status = setup_status(home, uid, root_config)
         if status["system"] != "done":
             return page("Not ready", "<h1>Finish setup first</h1><p><a href=/setup>Back</a></p>", 400)

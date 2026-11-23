@@ -810,21 +810,57 @@ class SetupTests(unittest.TestCase):
     def test_the_setup_link_works_once_then_a_session_cookie_is_required(self):
         c = self.client(lambda src: SimpleNamespace(returncode=0))
         self.assertEqual(c.get("/setup/wrong", headers=self.H).status_code, 404)
-        self.assertEqual(c.get("/setup/tok123", headers={"host": "evil.example"}).status_code, 404)
-        self.assertEqual(c.get("/setup", headers=self.H).status_code, 404)             # no session yet
+        self.assertEqual(c.get("/setup/tok123", headers={"host": "evil.example"}).status_code, 403)
+        self.assertEqual(c.get("/setup", headers=self.H).status_code, 403)             # no session yet
         first = c.get("/setup/tok123", headers=self.H)
         self.assertEqual((first.status_code, first.headers["location"]), (303, "/setup"))
         self.assertIn("httponly", first.headers["set-cookie"].lower())
         self.assertIn("samesite=strict", first.headers["set-cookie"].lower())
-        self.assertEqual(c.get("/setup/tok123", headers=self.H).status_code, 404)      # the link is spent
+        spent = c.get("/setup/tok123", headers=self.H)                                 # the link is spent, and it says so
+        self.assertEqual(spent.status_code, 410)
+        self.assertIn("already used", spent.text)
         from starlette.testclient import TestClient
         stranger = TestClient(c.app, base_url="http://127.0.0.1:5555")
-        self.assertEqual(stranger.get("/setup", headers=self.H).status_code, 404)      # no cookie, no page
+        self.assertEqual(stranger.get("/setup", headers=self.H).status_code, 403)      # no cookie, no page
         page = c.get("/setup", headers=self.H)
         self.assertEqual(page.status_code, 200)
         self.assertIn("frame-ancestors 'none'", page.headers["content-security-policy"])
         self.assertIn(str(self.pairing), page.text)                                    # prefilled from discovery
-        self.assertEqual(c.post("/setup/save", data=self.form, headers=self.H).status_code, 404)   # post needs Origin
+        self.assertEqual(c.post("/setup/save", data=self.form, headers=self.H).status_code, 403)   # post needs Origin
+
+    def _browser_post_origin(self, page_headers, host):
+        """What a real browser puts in Origin on a same-origin form POST (Fetch standard): the literal 'null' when the page's
+        Referrer-Policy is no-referrer, otherwise the page's origin. (Unit tests that type the Origin themselves missed this.)"""
+        policy = page_headers.get("referrer-policy", "")
+        return "null" if policy == "no-referrer" else "http://" + host
+
+    def test_a_real_browser_form_post_is_accepted_and_every_refusal_says_why(self):
+        """Regression: Android Chrome got a bare 'Not found' on Save because the page said Referrer-Policy: no-referrer."""
+        c = self.client(lambda src: SimpleNamespace(returncode=126))
+        c.get("/setup/tok123", headers=self.H)
+        page = c.get("/setup", headers=self.H)
+        for name in ("content-security-policy", "referrer-policy"):
+            self.assertIn(name, page.headers)
+        self.assertNotEqual(page.headers["referrer-policy"], "no-referrer")
+        origin = self._browser_post_origin(page.headers, "127.0.0.1:5555")
+        saved = c.post("/setup/save", data=self.form, headers={**self.H, "origin": origin})
+        self.assertEqual(saved.status_code, 200)
+        self.assertIn("One step left", saved.text)
+        # CSRF stays strict: the old browser behaviour (Origin: null), a foreign Origin, a foreign Host and a missing cookie are refused
+        # with a reason and change nothing
+        fresh = self.client(lambda src: SimpleNamespace(returncode=126))
+        fresh.get("/setup/tok123", headers=self.H)
+        for headers, code in (({**self.H, "origin": "null"}, "origin"), ({**self.H, "origin": "http://evil.example"}, "origin"),
+                              ({"host": "evil.example", "origin": "http://evil.example"}, "host")):
+            refusal = fresh.post("/setup/save", data=self.form, headers=headers)
+            self.assertEqual(refusal.status_code, 403)
+            self.assertIn("Reason code: " + code, refusal.text)
+            self.assertIn("nothing was changed", refusal.text)
+        from starlette.testclient import TestClient
+        stranger = TestClient(fresh.app, base_url="http://127.0.0.1:5555")
+        gone = stranger.post("/setup/save", data=self.form, headers=self.HP)
+        self.assertIn("Reason code: cookie", gone.text)
+        self.assertNotIn("sp_setup", gone.text)
 
     def test_cancelled_password_prompt_then_browser_restart_shows_resume_and_finishes(self):
         calls = []

@@ -18,7 +18,7 @@ If every requested package is already installed, the request tool answers `alrea
 
 1. **Owner side (early, friendly refusal)** – strict names (`[a-z0-9][a-z0-9+.-]*`, max 3, distinct), the impact gate,
    an `apt-get -s` simulation (no changes), every chosen source must be the signed Ubuntu archive, no removals.
-2. **Root installer (authoritative, repeats everything)** – derives the allowed set *itself* from the requested names only
+2. **Root installer (authoritative, repeats everything; also runs at approval time)** – derives the allowed set *itself* from the requested names only
    (`apt.analyze`), refuses a plan that differs by one package, re-runs the impact gate, requires the software id to equal
    the deterministic id of the requested names, downloads the exact files, checks each file against the signed index hash,
    inspects every downloaded `.deb` (`dpkg-deb -c`) and refuses one that ships boot, kernel-module, sudoers, PAM, ssh, apt,
@@ -37,14 +37,16 @@ server, service files, setuid programs, large size, upgrades of already-installe
 ## Limits (stated plainly)
 
 * Backup/rollback is the existing bounded package rollback, not a system snapshot (see `LIMITS` in the result).
-* The approval summary lists exact packages and versions plus a fixed warning; the `.deb`-content findings (service files,
-  setuid) are enforced as a hard refusal for dangerous paths but are not yet shown as notes at approval time.
+* The approval page shows, before the owner decides, what the exact verified packages would install: background service files, setuid/setgid
+  programs, and install scripts that set setuid bits or enable a service. The root installer computes this from the downloaded files; dangerous paths
+  (boot, kernel modules, sudoers, PAM, ssh, apt, polkit rules, account files) are refused, and unreadable contents are refused (fail closed). The
+  install-script notes are best-effort text matching, not a security check: package scripts run as root either way.
 * DIMM slot/speed details need administrator access (`dmidecode`); the inventory reports them as unavailable, never guessed.
 * Tool list changed (`commander_software_search`, `computer_inventory` are new): connectors must be refreshed after the upgrade.
 
 ## Evidence
 
-* Unit tests: `tests/test_impact.py`, `tests/test_m1_apt.py`, `tests/test_inventory.py`, plus new cases in `test_plan.py`,
+* Unit tests (434): `tests/test_impact.py`, `tests/test_m1_apt.py`, `tests/test_inventory.py`, plus new cases in `test_plan.py`,
   `test_broker.py`, `test_propose_tools.py`, `test_server.py`.
 * Real apt on an Ubuntu 26.04 chroot: `tests/test_broker_real_apt.py` (non-catalog `ncdu`: search → plan → approval → install →
   verify → already_installed → rollback; blocked names refused).

@@ -1,0 +1,14 @@
+get_release.sh from a fresh clone of the public repo, pinned commits:
+
+built stynpilot_0.1.0~dev0_all.deb from bfa1ef0be968fbbd6e24f1dfc9bae72a0c3b2e62
+sha256 b3d639bd190abe240ea87526cb31b4e58096fe4aac9a09c7ca2996a32c4c91cf
+saved /tmp/rel3/stynpilot_0.1.0~dev0_all.deb
+RESULT: PASS checksum matches
+built stynpilot_0.1.0~dev1_all.deb from 5f82d33db35390e6206e211d3f93525e5de29ceb
+sha256 f055d1dd397b0e94edee30263197423d8cd7364969dc43b9a7f3bde80f9a66ed
+saved /tmp/rel3/stynpilot_0.1.0~dev1_all.deb
+RESULT: PASS checksum matches
+
+wrong expected hash is refused:
+sha256 f055d1dd397b0e94edee30263197423d8cd7364969dc43b9a7f3bde80f9a66ed
+FAIL: checksum differs from the published value (0000000000000000000000000000000000000000000000000000000000000000); do not use this file

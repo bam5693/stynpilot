@@ -15,7 +15,7 @@ Description: STAND-IN for the Preview26 build (test only)
 UNIT_USER = """[Unit]
 Description=Stand-in Preview26 commander (user)
 [Service]
-ExecStart=/usr/bin/python3 /usr/share/stynpilot-preview/commander.py
+ExecStart=/usr/bin/python3 /usr/share/stynpilot-ryzen/commander.py
 Restart=on-failure
 [Install]
 WantedBy=default.target
@@ -24,7 +24,7 @@ UNIT_ROOT = """[Unit]
 Description=Stand-in Preview26 root broker
 ConditionPathExists=/etc/stynpilot/remote-broker.json
 [Service]
-ExecStart=/usr/bin/python3 /usr/share/stynpilot-preview/broker.py
+ExecStart=/usr/bin/python3 /usr/share/stynpilot-ryzen/broker.py
 Restart=on-failure
 [Install]
 WantedBy=multi-user.target
@@ -45,8 +45,8 @@ def build(out):
             open(full, "w").write(text)
             os.chmod(full, mode)
         put("DEBIAN/control", CONTROL)
-        put("usr/share/stynpilot-preview/commander.py", PROGRAM % 18991, 0o755)
-        put("usr/share/stynpilot-preview/broker.py", PROGRAM % 18992, 0o755)
+        put("usr/share/stynpilot-ryzen/commander.py", PROGRAM % 18991, 0o755)
+        put("usr/share/stynpilot-ryzen/broker.py", PROGRAM % 18992, 0o755)
         put("usr/lib/systemd/user/stynpilot-commander-user.service", UNIT_USER)
         put("usr/lib/systemd/system/stynpilot-remote-broker.service", UNIT_ROOT)
         put("usr/share/polkit-1/actions/com.stynpilot.preview.policy", POLICY)

@@ -21,7 +21,9 @@ tar --numeric-owner --xattrs -C "$STAGE" -xf "$ARCH" --no-same-permissions --war
 # only paths the backup tool could have produced
 ( cd "$STAGE/files" && find . -mindepth 1 \( -type f -o -type l \) | sed 's#^\.##' ) > "$STAGE/targets"
 while read -r t; do
-  case "$t" in /usr/share/stynpilot-preview/*|/usr/lib/systemd/*stynpilot*|/usr/lib/stynpilot-preview/*|/usr/lib/systemd/*/stynpilot*|/usr/share/doc/stynpilot-preview/*|/usr/bin/stynpilot-*|/usr/share/polkit-1/actions/*stynpilot*|/etc/stynpilot/*|/var/lib/stynpilot*|/etc/systemd/system/*stynpilot*|/etc/polkit-1/rules.d/*stynpilot*|/home/*/.local/state/stynpilot-owner/*|/home/*/.config/stynpilot/*|/home/*/.config/systemd/user/*stynpilot*|/usr/share/applications/*stynpilot*|/usr/libexec/stynpilot*|/usr/sbin/stynpilot*) ;;
+  # exact paths the package itself owns (recorded at backup time) are always allowed
+  if [ -f "$STAGE/meta/package-files.txt" ] && grep -qxF -- "$t" "$STAGE/meta/package-files.txt"; then continue; fi
+  case "$t" in /usr/share/stynpilot-*/*|/usr/lib/stynpilot-*/*|/usr/share/stynpilot-preview/*|/usr/lib/systemd/*stynpilot*|/usr/lib/stynpilot-preview/*|/usr/lib/systemd/*/stynpilot*|/usr/share/doc/stynpilot-preview/*|/usr/bin/stynpilot-*|/usr/share/polkit-1/actions/*stynpilot*|/etc/stynpilot/*|/var/lib/stynpilot*|/etc/systemd/system/*stynpilot*|/etc/polkit-1/rules.d/*stynpilot*|/home/*/.local/state/stynpilot-owner/*|/home/*/.config/stynpilot/*|/home/*/.config/systemd/user/*stynpilot*|/usr/share/applications/*stynpilot*|/usr/libexec/stynpilot*|/usr/sbin/stynpilot*) ;;
     *) echo "outside the allowed StyNpilot locations: $t"; exit 4 ;; esac
 done < "$STAGE/targets"
 echo "backup: $(cat "$STAGE/meta/INFO" | tr '\n' ' ')"
@@ -43,6 +45,23 @@ if ! dpkg-query -W -f='${db:Status-Status}' "$PKG" 2>/dev/null | grep -qx instal
   echo "reinstalled $PKG from the copy inside the backup"
 fi
 ( cd "$STAGE/files" && find . \( -type f -o -type l \) -print0 | tar --null -T - --no-recursion --numeric-owner --xattrs -cf - ) | tar --numeric-owner --xattrs -C / -xf - --overwrite
+# a restored SQLite file must stand alone: remove stale write-ahead/journal companions, then check it opens cleanly
+python3 - "$STAGE/targets" <<'PY'
+import os, sqlite3, sys
+bad = []
+for t in (l.rstrip("\n") for l in open(sys.argv[1])):
+    if os.path.isfile(t) and not os.path.islink(t) and open(t, "rb").read(16).startswith(b"SQLite format 3"):
+        for s in ("-wal", "-shm", "-journal"):
+            if os.path.lexists(t + s):
+                os.unlink(t + s)
+        db = sqlite3.connect("file:%s?mode=ro" % t, uri=True)
+        ok = db.execute("PRAGMA integrity_check").fetchone()[0]
+        db.close()
+        if ok != "ok":
+            bad.append(t)
+if bad:
+    sys.exit("restored database(s) failed their integrity check: %s" % bad)
+PY
 OGRP="$(id -g "$OWNER")"; OHOME="$(getent passwd "$OWNER" | cut -d: -f6)"
 for d in "$OHOME/.local/state/stynpilot-owner" "$OHOME/.config/stynpilot"; do [ -d "$d" ] && chown -R "$OUID:$OGRP" "$d" || true; done
 systemctl daemon-reload; runuser -u "$OWNER" -- env XDG_RUNTIME_DIR="/run/user/$OUID" systemctl --user daemon-reload || true

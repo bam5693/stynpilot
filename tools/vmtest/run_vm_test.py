@@ -170,6 +170,13 @@ class Vm:
             time.sleep(5)
         return False
 
+    def set_proxy(self):
+        """The sandbox's outbound proxy port changes between sessions; point the guest's apt at the current one."""
+        import urllib.parse
+        port = urllib.parse.urlsplit(os.environ.get("HTTPS_PROXY", "")).port
+        if port:
+            self.root("printf 'Acquire::http::Proxy \"http://10.0.2.2:%d\";\\nAcquire::https::Proxy \"http://10.0.2.2:%d\";\\n' > /etc/apt/apt.conf.d/99vmproxy" % (port, port))
+
     def root(self, command, **kw):
         return self.ssh("root", command, **kw)
 
@@ -222,6 +229,7 @@ def scenario(vm):
     # ---------------------------------------------------------------- boot 1
     vm.boot(first=True)
     record("VM boots to a login prompt with real systemd", vm.wait_ssh() is True)
+    vm.set_proxy()
     rc, out = vm.root("systemctl is-system-running --wait; cat /etc/os-release | head -2; mkdir -p /mnt/payload && mount -o ro /dev/vdb /mnt/payload && ls /mnt/payload")
     record("machine is Ubuntu 26.04 and the payload is mounted", "26.04" in out and "stynpilot.deb" in out, out[-200:])
     rc, out = vm.root("systemctl is-active g8-fake-idp; curl -s https://auth.g8test.example/.well-known/openid-configuration | head -c 200")
@@ -387,6 +395,7 @@ def scenario_preview26(vm):
     stand-in, restore, and prove it is byte-for-byte what it was."""
     vm.boot(first=True)
     record("VM boots", vm.wait_ssh())
+    vm.set_proxy()
     vm.root("systemctl is-system-running --wait >/dev/null; mkdir -p /mnt/payload && mount -o ro /dev/vdb /mnt/payload")
     rc, out = vm.root("DEBIAN_FRONTEND=noninteractive apt-get install -y dpkg-repack /mnt/payload/stynpilot-preview.deb 2>&1 | tail -2; dpkg-query -W stynpilot-preview", timeout=900)
     record("stand-in Preview26 package installs", "0.5.13~preview26" in out, out[-200:])
@@ -395,10 +404,18 @@ def scenario_preview26(vm):
     vm.root("mkdir -p /etc/stynpilot && printf '{\"secret\": \"SECRET-MARKER-26\"}' > /etc/stynpilot/remote-broker.json && chmod 600 /etc/stynpilot/remote-broker.json && chmod 750 /home/owner")
     vm.root("loginctl enable-linger owner; sleep 5; runuser -u owner -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user enable --now stynpilot-commander-user.service; systemctl enable --now stynpilot-remote-broker.service; sleep 5")
     check = "python3 -I /mnt/payload/p26_check.py"
+    DB = "/home/owner/.local/state/stynpilot-owner/pairing.sqlite3"
+    vm.root("nohup runuser -u owner -- python3 -I /mnt/payload/walholder.py %s > /tmp/wal.out 2>&1 &" % DB)
+    time.sleep(6)
+    rc, out = vm.root("cat /tmp/wal.out; ls -la %s*" % DB)
+    record("a live service holds committed rows only in the -wal file (as a running Preview26 would)", "ready" in out and "-wal" in out and "-shm" in out, out[-300:])
 
     def fingerprint():
         rc, out = vm.root(check)
-        return json.loads([l for l in out.splitlines() if l.startswith("{")][-1])
+        lines = [l for l in out.splitlines() if l.startswith("{")]
+        if not lines:
+            raise RuntimeError("fingerprint failed: " + out[-600:])
+        return json.loads(lines[-1])
     base = fingerprint()
     record("stand-in is really running (user unit, root unit, both ports)", base["units"] == {"system:stynpilot-remote-broker": "active", "user:stynpilot-commander-user": "active"}
            and all(base["ports"].values()), json.dumps(base["units"]) + json.dumps(base["ports"]))
@@ -411,6 +428,8 @@ def scenario_preview26(vm):
     record("backup runs and writes a private archive owned by the owner", rc == 0 and bool(arch) and "-rw------- 1 owner" in out, out[-500:])
     arch = arch[0] if arch else "/home/owner/missing.tar"
     record("backup changed nothing (same fingerprint, same running state)", fingerprint() == base)
+    rc, out = vm.root("tar -tf %s | grep -E 'sqlite3-(wal|shm|journal)' ; echo end; mkdir -p /tmp/x && tar -xf %s -C /tmp/x files%s && python3 -c \"import sqlite3;d=sqlite3.connect('/tmp/x/files%s');print(d.execute('select v from wal_marker').fetchall(), d.execute('pragma integrity_check').fetchone())\"" % (arch, arch, DB, DB))
+    record("snapshot has the WAL-only rows, passes integrity, and no -wal/-shm/-journal companions are archived", "ONLY-IN-THE-WAL" in out and "'ok'" in out and out.split("end")[0].strip() == "", out[-300:])
     rc, out = vm.root("tar -tf %s | grep -E 'remote-broker|pairing|package.deb'; tar -xOf %s meta/INFO; echo %s >/dev/null" % (arch, arch, arch))
     record("archive holds the files, the settings, the sqlite copy and a reinstallable package copy", "remote-broker.json" in out and "pairing.sqlite3" in out and "package.deb" in out and "format 1" in out, out[-400:])
 
@@ -423,6 +442,7 @@ def scenario_preview26(vm):
     record("both policy sets coexist and both unit files verify", out.split()[0] == "2", out[-200:])
 
     # ---- damage: package removed with purge, state corrupted, settings gone
+    vm.root("pkill -f walholder.py; sleep 1; printf 'STALE-GARBAGE' > %s-wal; printf 'STALE-GARBAGE' > %s-shm; chown owner %s-wal %s-shm" % (DB, DB, DB, DB))
     vm.root("runuser -u owner -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user stop stynpilot-commander-user; systemctl stop stynpilot-remote-broker; "
             "apt-get purge -y stynpilot-preview >/dev/null 2>&1; rm -f /etc/stynpilot/remote-broker.json; : > /home/owner/.local/state/stynpilot-owner/pairing.sqlite3; echo damaged")
     broken = fingerprint()
@@ -443,6 +463,8 @@ def scenario_preview26(vm):
     after = fingerprint()
     same_files = {k: v for k, v in after["files"].items()} == base["files"]
     record("everything is exactly as before: files, modes, owners, database content", same_files, json.dumps({k: (base["files"].get(k), after["files"].get(k)) for k in set(base["files"]) | set(after["files"]) if base["files"].get(k) != after["files"].get(k)})[:500])
+    rc, out = vm.root("grep -l STALE-GARBAGE %s %s-wal %s-shm 2>/dev/null; echo end; python3 -c \"import sqlite3;d=sqlite3.connect('%s');print(d.execute('select v from wal_marker').fetchall(), d.execute('pragma integrity_check').fetchone())\"" % (DB, DB, DB, DB))
+    record("restore removed the stale -wal/-shm and the database holds the WAL-only rows, intact", out.split("end")[0].strip() == "" and "ONLY-IN-THE-WAL" in out and "'ok'" in out, out[-300:])
     record("services are running again as before", after["units"] == base["units"] and after["ports"] == base["ports"] and after["dpkg"] == base["dpkg"], json.dumps(after["units"]) + after["dpkg"])
     rc, out = vm.root("dpkg-query -W stynpilot; dpkg -V stynpilot | head -3; systemctl is-enabled stynpilot-installer; echo end")
     record("the new StyNpilot was left alone by the restore", "0.1.0" in out and out.split("end")[0].strip().endswith("disabled"), out[-200:])

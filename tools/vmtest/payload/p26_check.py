@@ -2,7 +2,7 @@
 logical content, which of its units are active, and which of its ports answer. Used before/after backup, upgrade, damage, restore."""
 import hashlib, json, os, socket, sqlite3, subprocess, sys
 
-ROOTS = ["/usr/share/stynpilot-preview", "/usr/lib/systemd/user/stynpilot-commander-user.service",
+ROOTS = ["/usr/share/stynpilot-ryzen", "/usr/lib/systemd/user/stynpilot-commander-user.service",
          "/usr/lib/systemd/system/stynpilot-remote-broker.service", "/usr/share/polkit-1/actions/com.stynpilot.preview.policy",
          "/etc/stynpilot/remote-broker.json", "/home/owner/.local/state/stynpilot-owner"]
 
@@ -12,13 +12,18 @@ def files():
     for root in ROOTS:
         paths = [root] if os.path.isfile(root) else [os.path.join(d, n) for d, _, ns in os.walk(root) for n in ns] if os.path.isdir(root) else []
         for p in sorted(paths):
+            if p.endswith(("-wal", "-shm", "-journal")):        # SQLite companions come and go; the database is the state
+                continue
             st = os.lstat(p)
             if p.endswith(".sqlite3"):
-                db = sqlite3.connect("file:%s?mode=ro" % p, uri=True)
-                digest = hashlib.sha256("\n".join(db.iterdump()).encode()).hexdigest()
-                ok = db.execute("PRAGMA integrity_check").fetchone()[0]
-                db.close()
-                digest += ":" + ok
+                try:
+                    db = sqlite3.connect("file:%s?mode=ro" % p, uri=True)
+                    digest = hashlib.sha256("\n".join(db.iterdump()).encode()).hexdigest()
+                    ok = db.execute("PRAGMA integrity_check").fetchone()[0]
+                    db.close()
+                    digest += ":" + ok
+                except sqlite3.Error as error:
+                    digest = "UNREADABLE:%s" % error
             else:
                 digest = hashlib.sha256(open(p, "rb").read()).hexdigest()
             out[p] = "%s %o %d" % (digest, st.st_mode & 0o7777, st.st_uid)

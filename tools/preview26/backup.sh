@@ -25,6 +25,20 @@ for d in "$OHOME/.local/state/stynpilot-owner" "$OHOME/.config/stynpilot" "$OHOM
   [ -d "$d" ] && find "$d" \( -type f -o -type l \) >> "$LIST" || add "$d"; done
 find "$OHOME/.config/systemd/user" -maxdepth 3 -lname '*stynpilot*' 2>/dev/null >> "$LIST" || true
 sort -u "$LIST" -o "$LIST"
+# a SQLite database is copied as ONE consistent snapshot (its -wal/-shm/-journal companions are folded in by SQLite's own
+# backup call and are NOT copied: stale companions next to a restored database would corrupt it)
+python3 - "$LIST" <<'PY'
+import os, sys
+paths = [l.rstrip("\n") for l in open(sys.argv[1]) if l.strip()]
+def sqlite(p):
+    try:
+        return os.path.isfile(p) and not os.path.islink(p) and open(p, "rb").read(16).startswith(b"SQLite format 3")
+    except OSError:
+        return False
+dbs = {p for p in paths if sqlite(p)}
+keep = [p for p in paths if not any(p == d + s for d in dbs for s in ("-wal", "-shm", "-journal"))]
+open(sys.argv[1], "w").write("\n".join(keep) + "\n")
+PY
 # consistent copy: ordinary files as they are, SQLite files through SQLite's own online-backup call
 python3 - "$LIST" "$STAGE/files" <<'PY'
 import os, shutil, sqlite3, sys
@@ -38,12 +52,19 @@ for p in paths:
     magic = open(p, "rb").read(16) if os.path.isfile(p) else b""
     if magic.startswith(b"SQLite format 3"):
         src = sqlite3.connect("file:%s?mode=ro" % p, uri=True); out = sqlite3.connect(dst)
-        src.backup(out); out.close(); src.close()
+        src.backup(out)
+        ok = out.execute("PRAGMA integrity_check").fetchone()[0]
+        out.close(); src.close()
+        if ok != "ok":
+            sys.exit("database snapshot failed its integrity check: %s (%s)" % (p, ok))
+        for extra in ("-wal", "-shm", "-journal"):
+            assert not os.path.exists(dst + extra), "snapshot must stand alone"
         shutil.copystat(p, dst); os.chown(dst, os.stat(p).st_uid, os.stat(p).st_gid)
     else:
         shutil.copy2(p, dst); os.chown(dst, os.stat(p).st_uid, os.stat(p).st_gid)
 PY
 mkdir "$STAGE/meta"
+dpkg -L "$PKG" | while read -r f; do [ -f "$f" ] || [ -L "$f" ] && echo "$f"; done > "$STAGE/meta/package-files.txt" || true
 dpkg-query -W -f='${Package} ${Version}\n' "$PKG" > "$STAGE/meta/package.txt"
 CACHED="$(ls /var/cache/apt/archives/${PKG}_*.deb 2>/dev/null | tail -1 || true)"
 if [ -n "$CACHED" ]; then cp "$CACHED" "$STAGE/meta/package.deb"

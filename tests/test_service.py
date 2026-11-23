@@ -511,22 +511,22 @@ class UnitFileTests(unittest.TestCase):
     def test_owner_unit_is_unprivileged_and_hardened(self):
         text = self.read("stynpilot-owner.service")
         self.assertNotIn("User=root", text)
-        for line in ("NoNewPrivileges=yes", "ProtectSystem=strict", "-m stynpilot.service owner"):
+        for line in ("NoNewPrivileges=yes", "ProtectSystem=strict", "/usr/bin/stynpilot service owner"):
             self.assertIn(line, text)
 
     def test_installer_unit_is_root_only_and_runs_the_installer_role(self):
         text = self.read("stynpilot-installer.service")
         self.assertIn("User=root", text)
-        self.assertIn("-m stynpilot.service installer", text)
+        self.assertIn("/usr/bin/stynpilot service installer", text)
         self.assertIn("RuntimeDirectory=stynpilot", text)
 
     def test_unit_paths_match_the_sample_configs(self):
         owner_unit, installer_unit = self.read("stynpilot-owner.service"), self.read("stynpilot-installer.service")
         sample_owner = json.loads((self.root.parent / "owner.example.json").read_text())
         sample_installer = json.loads((self.root.parent / "installer.example.json").read_text())
-        writable = [l.split("=", 1)[1].replace("%h", "/home/owner") for l in owner_unit.splitlines()
+        writable = [l.split("=", 1)[1].lstrip("-").replace("-%h", "%h").replace("%h", "/home/owner") for l in owner_unit.splitlines()
                     if l.startswith("ReadWritePaths=")][0]
-        self.assertTrue(any(sample_owner["state_dir"].startswith(w) for w in writable.split()), (sample_owner["state_dir"], writable))
+        self.assertTrue(any(sample_owner["state_dir"].startswith(w) for w in writable.replace(" -", " ").split()), (sample_owner["state_dir"], writable))
         self.assertIn("StateDirectory=stynpilot-installer", installer_unit)
         self.assertEqual(sample_installer["state_dir"], "/var/lib/stynpilot-installer")
         self.assertEqual(os.path.dirname(sample_installer["socket_path"]), "/run/stynpilot")

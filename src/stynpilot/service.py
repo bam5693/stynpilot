@@ -159,27 +159,43 @@ def _check_state_dir(state):
         raise ConfigError("state_dir_must_be_private_and_owned_by_the_service_user")
 
 
-def provision_owner_state(config):
+def provision_owner_state(config, *, resume=False):
     """The ONE place the owner's request store and revocation lists are created. Run deliberately by the owner
     (or the owner-approved installer), never by a normal start and never reachable by an AI. Refuses if any
-    state is already there: restoring access to revoked AI clients must be an explicit, visible decision."""
+    state is already there: restoring access to revoked AI clients must be an explicit, visible decision.
+
+    ``resume=True`` (first-run setup that was interrupted): only the MISSING files are created, existing ones are
+    never touched, and the completion marker is written last. Once the marker exists, provisioning is finished:
+    any later loss of state is NEVER recreated here (restore a backup instead)."""
     state = config.state_dir
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     _check_state_dir(state)
     present = [name for name in PROVISIONED + ("requests.sqlite3-journal",) if (state / name).exists()]
-    if present:
+    if present and not resume:
         raise ConfigError("state_already_present_refusing_to_reset_it")
-    RevocationFile(state / "revoked-clients.json").provision()
-    from .identity import SQLiteRevocations
-    SQLiteRevocations(state / "token-revocations.sqlite3").close()
-    RequestStore(state / "requests.sqlite3")
+    if (state / "provisioned.json").exists():
+        if all((state / name).exists() for name in PROVISIONED):
+            return []                                       # already complete: nothing to do
+        raise ConfigError("state_lost_after_setup_restore_a_backup_not_recreated")
+    created = []
+    if not (state / "revoked-clients.json").exists():
+        RevocationFile(state / "revoked-clients.json").provision()
+        created.append("revoked-clients.json")
+    if not (state / "token-revocations.sqlite3").exists():
+        from .identity import SQLiteRevocations
+        SQLiteRevocations(state / "token-revocations.sqlite3").close()
+        created.append("token-revocations.sqlite3")
+    if not (state / "requests.sqlite3").exists():
+        RequestStore(state / "requests.sqlite3")
+        created.append("requests.sqlite3")
     fd = os.open(state / "provisioned.json", os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     try:
         os.write(fd, json.dumps({"provisioned_at": int(time.time()), "version": 1}).encode())
         os.fsync(fd)
     finally:
         os.close(fd)
-    return sorted(PROVISIONED)
+    created.append("provisioned.json")
+    return sorted(created if resume else PROVISIONED)
 
 
 def start_owner_service(config, *, broker=None, exchange=None, start_listener=None, start_mcp=None, tokens=None,

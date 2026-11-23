@@ -48,7 +48,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .. import catalog
+from .. import catalog, statelock
 from ..ledger import InstallLedger, LedgerError
 from ..plan import PlanError, validate_plan
 from ..requests import request_id as payload_hash
@@ -156,6 +156,10 @@ class Executor:
         info = os.lstat(self.dir)
         if self.dir.is_symlink() or info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise ExecutionDenied("installer_state_not_private")
+        try:
+            self._alive = statelock.hold_alive(self.dir)        # a restore of these records is refused while we live
+        except statelock.Busy:
+            raise ExecutionDenied("installer_records_are_being_restored") from None
         self.owner, self.device, self.verifier, self.run = owner, device, verifier, run
         self.sources_root, self.file_root = sources_root, Path(file_root)
         self.runs = Runs(self.dir / "runs.sqlite3")
@@ -265,7 +269,15 @@ class Executor:
         return content
 
     def install(self, payload, proof_token, challenge, *, now=None):
-        """Execute an approved install. Raises ExecutionDenied before any change; else returns a result."""
+        """Execute an approved install. Raises ExecutionDenied before any change; else returns a result.
+        Holds the operation lock for the whole change so a backup can never read half-written records."""
+        try:
+            with statelock.operation(self.dir):
+                return self._install_locked(payload, proof_token, challenge, now=now)
+        except statelock.Busy:
+            raise ExecutionDenied("a_backup_or_restore_is_running_try_again") from None
+
+    def _install_locked(self, payload, proof_token, challenge, *, now=None):
         content = self._check_install_payload(payload, now)
         rid = self._decide(payload, proof_token, challenge, "approve", "install")
         try:
@@ -491,6 +503,13 @@ class Executor:
         return entry
 
     def rollback(self, payload, proof_token, challenge):
+        try:
+            with statelock.operation(self.dir):
+                return self._rollback_locked(payload, proof_token, challenge)
+        except statelock.Busy:
+            raise ExecutionDenied("a_backup_or_restore_is_running_try_again") from None
+
+    def _rollback_locked(self, payload, proof_token, challenge):
         entry = self._check_rollback_payload(payload)
         manifest = self._verify_backup(entry["snapshot_id"])
         self._rollback_preflight(manifest)                      # refuses before the approval is consumed

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=StyNpilot Doctor
+Comment=Check StyNpilot's health and permissions (changes nothing)
+Exec=/usr/bin/stynpilot doctor --html
+Icon=utilities-system-monitor
+Categories=System;
+Terminal=false

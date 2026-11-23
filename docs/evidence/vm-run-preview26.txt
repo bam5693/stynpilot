@@ -1,0 +1,23 @@
+PASS VM boots
+PASS stand-in Preview26 package installs :: Setting up dpkg-repack (1.54build1) ...
+PASS owner pairing database exists (as Preview26 leaves it) :: {"ok": true, "owner": "acct_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "pairi
+PASS a live service holds committed rows only in the -wal file (as a running Preview26 would) :: 1 owner owner 61440 Nov 23 03:04 /home/owne
+PASS stand-in is really running (user unit, root unit, both ports) :: {"system:stynpilot-remote-broker": "active", "user:stynpilot-commander
+PASS inventory lists the package and prints no secret :: s/stynpilot-commander-user.service
+PASS backup runs and writes a private archive owned by the owner :: backup written: /home/owner/preview26-backup-20261123T030440Z.tar
+PASS backup changed nothing (same fingerprint, same running state)
+PASS snapshot has the WAL-only rows, passes integrity, and no -wal/-shm/-journal companions are archived :: end
+PASS archive holds the files, the settings, the sqlite copy and a reinstallable package copy :: files/usr/lib/systemd/system/stynpilot-remot
+PASS new StyNpilot installs beside Preview26 without touching it :: Unpacking stynpilot (0.1.0~dev0) ...
+PASS doctor notices the existing Preview26 service :: OK   python                       3.14
+PASS both policy sets coexist and both unit files verify :: 2
+PASS the damage is real (package gone, settings gone, database emptied, services down)
+PASS dry run reports what would change and changes nothing :: 
+PASS a damaged archive is refused and nothing is restored :: sha256sum: WARNING: 1 computed checksum did NOT match
+PASS a world-readable archive is refused :: the archive must be yours and private (mode 600)
+PASS restore completes (package reinstalled from the backup's own copy) :: tl daemon-reload' to reload units.
+PASS everything is exactly as before: files, modes, owners, database content :: {}
+PASS restore removed the stale -wal/-shm and the database holds the WAL-only rows, intact :: end
+PASS services are running again as before :: {"system:stynpilot-remote-broker": "active", "user:stynpilot-commander-user": "active"}installe
+PASS the new StyNpilot was left alone by the restore :: stynpilot	0.1.0~dev0
+RESULT: PASS  (22 checks, 0 failed)

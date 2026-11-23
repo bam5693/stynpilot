@@ -8,7 +8,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/python3 -m stynpilot.service installer --config /etc/stynpilot/installer.json
+ExecStart=/usr/bin/stynpilot service installer --config /etc/stynpilot/installer.json
 Restart=on-failure
 RestartSec=5
 RuntimeDirectory=stynpilot

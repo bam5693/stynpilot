@@ -1,46 +1,35 @@
---- backup
-== 3. verify
-== verified: /tmp/ownerhome/bk1 and /var/backups/stynpilot-pre-m1-20261123-165140
+== A. normal backup, permissions, re-verify, tamper detection
+ok: complete and restricted
+ok: tamper detected on both sides
+== B. injection attempts through the root-side reference (an owner-writable file)
+ok: no injected command ran: ROOT_DEST=/var/backups/stynpilot-pre-m1-20261123-1
+ok: no injected command ran: ROOT_DEST=$(touch /tmp/INJECTED_subst)
+ok: no injected command ran: ROOT_DEST=`touch /tmp/INJECTED_tick`
+ok: no injected command ran: ROOT_DEST=/var/backups/x"; touch /tmp/INJECTED_dq;
+ok: no injected command ran: ROOT_DEST=/var/backups/stynpilot-pre-m1-20261123-1
+ok: no injected command ran: ROOT_DEST=/var/backups/stynpilot-pre-m1-20261123-1
+ok: no injected command ran: ROOT_DEST=/var/backups/../etc
+ok: no injected command ran: ROOT_DEST=/var/backups/stynpilot-pre-m1-20260101-0
+ok: no injected command ran: ROOT_DEST=/var/backups/stynpilot-pre-m1-2026*
+ok: no injected command ran: ROOT_DEST=-n
+ok: no injected command ran: ROOT_DEST=
+ok: no injected command ran: ROOT_DEST=/etc/stynpilot
+ok: symlinked root-side folder refused
+ok: root-side folder with wrong mode refused
+ok: restored valid reference verifies again
+ok: unexpected checksum list refused
+== C. injection through environment and paths
+ok: no injected command ran: environment variables
+ok: environment cannot redirect the root folder
+ok: no injected command ran: owner destination path
+ok: owner folder with quotes and metacharacters handled as plain text
+ok: no injected command ran: settings file values
+ok: invalid owner settings fail closed and create nothing
+== D. state layout is enforced (flat, audited)
+ok: unexpected layouts refused before anything is written; known side files tolerated
+== E. root-side source checks
+ok: symlinked source refused; optional receipt tolerated
+== F. baseline verification
+ok: baseline verification: pass, unit/program tamper refused, version change refused
 
-Owner-side backup: /tmp/ownerhome/bk1
-Root-side backup:  /var/backups/stynpilot-pre-m1-20261123-165140
 RESULT: PASS
---- perms
-600 /tmp/ownerhome/bk1/ROOT_DEST
-600 /tmp/ownerhome/bk1/owner/INFO.txt
-600 /tmp/ownerhome/bk1/owner/SHA256SUMS
-600 /tmp/ownerhome/bk1/owner/owner.json
-600 /tmp/ownerhome/bk1/owner/pairing.sqlite3
-600 /tmp/ownerhome/bk1/owner/state/provisioned.json
-600 /tmp/ownerhome/bk1/owner/state/requests.sqlite3
-600 /tmp/ownerhome/bk1/owner/state/revoked-clients.json
-600 /tmp/ownerhome/bk1/owner/state/token-revocations.sqlite3
-700 /tmp/ownerhome/bk1
-700 /tmp/ownerhome/bk1/owner
-700 /tmp/ownerhome/bk1/owner/state
-drwx------  2 root root 4096 Nov 23 16:51 stynpilot-pre-m1-20261123-165140
---- verify again
-== verified: /tmp/ownerhome/bk1 and /var/backups/stynpilot-pre-m1-20261123-165140
-RESULT: PASS (verify)
---- refuses overwrite
-FAIL: /tmp/ownerhome/bk1 already exists; refusing to overwrite
---- tamper detection (owner side)
-FAIL: owner-side checksum mismatch
---- tamper detection (root side)
-FAIL: root-side checksum mismatch
---- baseline verify (installed = baseline)
-baseline sha256 b3d639bd190abe240ea87526cb31b4e58096fe4aac9a09c7ca2996a32c4c91cf
-files in baseline: 164; files installed by the package: 164
-systemd/unit-related files compared: 2
-RESULT: PASS the installed stynpilot 0.1.0~dev0 is byte-for-byte the baseline package
---- tamper: unit file
-BYTES DIFFER /usr/lib/systemd/system/stynpilot-installer.service
-FAIL: installed files differ from the baseline package (see above); do NOT upgrade until this is understood
---- tamper: program file
-BYTES DIFFER /usr/bin/stynpilot
-FAIL: installed files differ from the baseline package (see above); do NOT upgrade until this is understood
---- tamper: extra file in package tree
-RESULT: PASS the installed stynpilot 0.1.0~dev0 is byte-for-byte the baseline package
---- M1 installed vs baseline file
-FAIL: installed version 0.1.0~dev1 differs from the baseline 0.1.0~dev0
-RESULT: PASS the installed stynpilot 0.1.0~dev1 is byte-for-byte the baseline package

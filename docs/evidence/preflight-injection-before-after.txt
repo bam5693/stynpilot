@@ -1,0 +1,3 @@
+Regression proof that the injection test has teeth: the previous script (97dff28) versus the fixed one.
+/tmp/old_pre.sh: INJECTION EXECUTED (vulnerable)
+/tmp/preflight_backup.sh: no injection (safe)

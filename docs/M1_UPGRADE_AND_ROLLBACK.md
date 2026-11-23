@@ -21,15 +21,25 @@ on a different machine and path; a wrong expected hash is refused). Versions dif
 |---|---|---|
 | Owner settings file (AI-endpoint and Auth0 *connection* settings on this machine) | `~/.config/stynpilot/owner.json` | `tools/preflight_backup.sh` |
 | Existing device pairing database | path from `owner.json` (`pairing_db`) | `tools/preflight_backup.sh` (SQLite online copy, integrity-checked) |
-| Approval/request history, revocations, provisioned marker (every file in the owner state folder) | `state_dir` from `owner.json` | `tools/preflight_backup.sh` **and** `stynpilot backup` (the latter holds only four named files) |
+| Approval/request history, revocations, provisioned marker: the four files StyNpilot keeps in its owner state folder (`requests.sqlite3`, `token-revocations.sqlite3`, `revoked-clients.json`, `provisioned.json`) | `state_dir` from `owner.json` | `tools/preflight_backup.sh` **and** `stynpilot backup`. The script **enforces** this audited flat layout: a missing file, subfolder, link or unknown file makes it refuse and write nothing, so no state file can be silently skipped |
 | Root installer settings and setup receipt | `/etc/stynpilot/installer.json`, `setup-receipt.json` | `tools/preflight_backup.sh` root side -> root-only `/var/backups/stynpilot-pre-m1-<time>` (0700) |
 | Installation records, run history, rollback snapshots | `/var/lib/stynpilot-installer` | `stynpilot root-backup` (polkit password prompt) |
 | The program itself and its units/policy | package files | the saved baseline `.deb` + `tools/verify_baseline.sh` |
 | Auth0 tenant settings, Tailscale | outside this machine | **not** backed up by anything here; not changed by this upgrade |
 
-All backup folders are created new (0700), files 0600, never overwriting. Every copy is checked: SHA-256 list, SQLite integrity check, live files unchanged
-while copying; `--verify` re-checks later. Contents are never printed. Tests: `tools/preflight_tools_check.sh`, evidence in `docs/evidence/preflight-tools-check.txt`
-(tamper on either side is detected; existing destination is refused).
+Safety and integrity, exactly what is and is not claimed:
+* All backup folders are new (0700), files 0600, never overwriting. Contents are never printed.
+* **No value is ever placed in privileged shell source.** The root-side work is a fixed script that receives the backup folder as a positional argument and
+  validates it again itself. The root folder is always `/var/backups/stynpilot-pre-m1-YYYYMMDD-HHMMSS` (no environment override); the name stored in the owner
+  folder is untrusted text used only if it matches that exact pattern, and root additionally requires a real (non-symlink) root-owned 0700 directory holding only
+  `installer.json`, `setup-receipt.json` and `SHA256SUMS`. Root-side sources must be plain, non-symlink, root-owned files. Invalid settings, odd paths, links or
+  layouts fail closed before anything is written.
+* Integrity: a SHA-256 list for every copy, SQLite integrity checks on the three databases, `--verify` to re-check later. SQLite files are copied through SQLite's
+  read-only online-backup call, so they are consistent but cannot be "proved unchanged" by hashing; only `owner.json` and the two JSON state files are checked unchanged before/after.
+  The hashes detect damage; they are not a signature against someone who can rewrite the whole folder.
+* Tests (`tools/preflight_tools_check.sh`, `docs/evidence/preflight-tools-check.txt`): quotes, `$(...)`, backticks, newlines, `..`, globs, symlinks, wrong modes, foreign
+  paths in the checksum list, hostile environment variables, hostile owner paths and settings values: nothing injected, nothing created. `docs/evidence/preflight-injection-before-after.txt`
+  shows the previous script executing the planted command and the fixed one not.
 
 ## Preflight (read-only, or writes only into new private folders under the owner's home and /var/backups)
 

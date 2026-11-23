@@ -107,6 +107,7 @@ class ServerTests(unittest.TestCase):
         ownership = LocalOwnership(grants=grants, owner_id="acct_owner", device_id=DEVICE)
         self.router = ReadRouter(tokens=Tokens(), ownership=ownership,
                                  read_health=lambda: {"cpu_usage_percent": 1.0},
+                                 read_inventory=lambda: {"os": {"name": "Kubuntu"}},
                                  read_service_status=lambda s: {"state": "running_setup_required"}
                                  if s == "forgejo" else (_ for _ in ()).throw(KeyError(s)))
         self.server = create_server(router=self.router, resource_url=AUDIENCE)
@@ -124,7 +125,7 @@ class ServerTests(unittest.TestCase):
 
     def test_tools_are_listed_read_only(self):
         tools = {t.name: t for t in asyncio.run(self.server.list_tools())}
-        self.assertEqual(sorted(tools), ["computer_health", "software_service_status"])
+        self.assertEqual(sorted(tools), ["computer_health", "computer_inventory", "software_service_status"])
         for tool in tools.values():
             self.assertTrue(tool.annotations.readOnlyHint)
             self.assertFalse(tool.annotations.destructiveHint)
@@ -137,6 +138,10 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.call("software_service_status", {"device_id": DEVICE, "software": "nope"}),
                          {"ok": False, "error": "unknown_software"})
         refused = {"ok": False, "error": "device_unavailable_or_not_authorized"}
+        self.assertEqual(self.call("computer_inventory", {"device_id": DEVICE})["inventory"], {"os": {"name": "Kubuntu"}})
+        self.assertEqual(self.call("computer_inventory", {"device_id": DEVICE}, scopes=("openid",)), refused)
+        self.assertEqual(self.call("computer_inventory", {"device_id": DEVICE}, token="stolen"), refused)
+        self.assertEqual(self.call("computer_inventory", {"device_id": "dtdev_other"}), refused)
         self.assertEqual(self.call("computer_health", {"device_id": DEVICE}, scopes=("openid",)), refused)
         self.assertEqual(self.call("computer_health", {"device_id": DEVICE}, token="stolen"), refused)
 

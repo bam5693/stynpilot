@@ -66,13 +66,15 @@ class LocalOwnership:
 
 
 class ReadRouter:
-    def __init__(self, *, tokens, ownership, read_health, read_service_status=None, clock=time.time):
+    def __init__(self, *, tokens, ownership, read_health, read_service_status=None, read_inventory=None, clock=time.time):
         if tokens is None or ownership is None or not callable(read_health):
             raise ValueError("Token verifier, ownership and health reader required")
         if read_service_status is not None and not callable(read_service_status):
             raise ValueError("Service status reader must be callable")
         self.tokens, self.ownership, self.clock = tokens, ownership, clock
-        self.read_health, self.read_service_status = read_health, read_service_status
+        if read_inventory is not None and not callable(read_inventory):
+            raise ValueError("Inventory reader must be callable")
+        self.read_health, self.read_service_status, self.read_inventory = read_health, read_service_status, read_inventory
 
     def _authorize(self, header, device_id):
         if not isinstance(device_id, str) or not DEVICE_ID.fullmatch(device_id):
@@ -114,6 +116,16 @@ class ReadRouter:
         if not metrics:
             raise AccessDenied("Telemetry unavailable")
         return metrics
+
+    def inventory(self, *, authorization_header, device_id):
+        if self.read_inventory is None:
+            raise AccessDenied("Inventory unavailable")
+        identity = self._authorize(authorization_header, device_id)
+        data = self.read_inventory()
+        self._recheck(authorization_header, identity, device_id)
+        if not isinstance(data, Mapping):
+            raise AccessDenied("Inventory unavailable")
+        return dict(data)
 
     def service_status(self, *, authorization_header, device_id, software):
         if self.read_service_status is None:

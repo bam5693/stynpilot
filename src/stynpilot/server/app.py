@@ -108,6 +108,24 @@ def create_server(*, router, resource_url, allowed_hosts=None, propose=None):
             return {"ok": False, "error": "device_health_temporarily_unavailable"}
         return {"ok": True, "device_id": device_id, "scope": READ_SCOPE, "metrics": metrics}
 
+    if router.read_inventory is not None:
+        @server.tool(name="computer_inventory", title="Read computer hardware and software inventory", annotations=READ_ONLY,
+                     description=("Read-only inventory of the paired computer: OS, CPU, motherboard, memory capacity, "
+                                  "GPU, drives, and installed Ubuntu packages. No serial numbers, addresses, host names "
+                                  "or file contents. Changes nothing."))
+        def computer_inventory(device_id: str) -> dict:
+            header = _bearer()
+            if header is None:
+                return NOT_AUTHORIZED
+            try:
+                report = router.inventory(authorization_header=header, device_id=device_id)
+            except AccessDenied:
+                return NOT_AUTHORIZED
+            except Exception as error:
+                _LOG.warning("inventory_internal_failure type=%s", type(error).__name__)
+                return {"ok": False, "error": "inventory_temporarily_unavailable"}
+            return {"ok": True, "device_id": device_id, "scope": READ_SCOPE, "inventory": report}
+
     if router.read_service_status is not None:
         @server.tool(name="software_service_status", title="Check installed software status", annotations=READ_ONLY,
                      description=("Read-only check of one StyNpilot catalog application (for example 'forgejo'): "

@@ -160,7 +160,7 @@ def start_approval(*, flow, public_host, port, address=LISTEN_ADDRESS, startup_t
     return Running(web, thread, "http://%s:%d/approve" % (address, port))
 
 
-def router_for_paired_device(*, tokens, grants, read_health, read_service_status=None):
+def router_for_paired_device(*, tokens, grants, read_health, read_service_status=None, read_inventory=None):
     """Bind the router to the one live paired owner/device in the pairing database."""
     from .router import LocalOwnership, ReadRouter
     paired = grants.paired_devices()
@@ -168,4 +168,5 @@ def router_for_paired_device(*, tokens, grants, read_health, read_service_status
         raise RuntimeError("Exactly one live paired device is required (found %d)" % len(paired))
     owner_id, device_id = paired[0]
     return ReadRouter(tokens=tokens, ownership=LocalOwnership(grants=grants, owner_id=owner_id, device_id=device_id),
-                      read_health=read_health, read_service_status=read_service_status)
+                      read_health=read_health, read_service_status=read_service_status,
+                      read_inventory=read_inventory)

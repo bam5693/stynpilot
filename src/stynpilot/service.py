@@ -237,10 +237,11 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
             tokens = OIDCConfig(issuer=config.issuer, audience="https://%s/mcp" % config.mcp_public_host,
                                 revocations=SQLiteRevocations(state / "token-revocations.sqlite3"),
                                 allowed_scopes=_run.PROPOSE_SCOPES).build_verifier()
-        from . import health, service_status
+        from . import health, inventory, service_status
         grants = PairingDeviceGrants(config.pairing_db)
         router = run.router_for_paired_device(tokens=tokens, grants=grants, read_health=health.snapshot,
-                                              read_service_status=service_status.read_service_status)
+                                              read_service_status=service_status.read_service_status,
+                                              read_inventory=inventory.snapshot)
         propose = dict(clients=EnrolledClients([dict(c) for c in config.enrolled_clients], revocations=revocations),
                        store=store, ledger=BrokerLedger(config.broker_socket),
                        resolve_apt=resolve_apt or apt.resolve,

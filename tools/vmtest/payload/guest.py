@@ -28,8 +28,11 @@ def pairing():
     import time as _t
     from legacy_pairing import make_pairing_db
     from pathlib import Path
-    from stynpilot.identity import account_id
-    owner = account_id(verified_issuer=ISS, verified_subject=OWNER_SUB)
+    try:
+        from stynpilot.identity import account_id
+        owner = account_id(verified_issuer=ISS, verified_subject=OWNER_SUB)
+    except ImportError:                                  # Preview26 rehearsal: the new package is not installed yet
+        owner = "acct_" + "e" * 40
     folder = Path.home() / ".local/state/stynpilot-owner"
     path = make_pairing_db(folder, [(DEVICE, owner, _t.time() + 86400, None,
                                      ["development.file.read", "workspace.propose", "workspace.review"])])

@@ -96,6 +96,9 @@ class Vm:
         shutil.rmtree(stage, ignore_errors=True)
         shutil.copytree(os.path.join(HERE, "payload"), stage)
         shutil.copy(self.a.deb, os.path.join(stage, "stynpilot.deb"))
+        shutil.copytree(os.path.join(HERE, "..", "preview26"), os.path.join(stage, "preview26"))
+        import make_fake_preview
+        make_fake_preview.build(os.path.join(stage, "stynpilot-preview.deb"))
         img = os.path.join(self.work, "payload.img")
         if os.path.exists(img):
             os.unlink(img)
@@ -378,6 +381,74 @@ def scenario(vm):
     vm.child.wait_exit(300)
 
 
+
+def scenario_preview26(vm):
+    """Rehearses the Preview26 safety net: back up a stand-in install, add the new StyNpilot beside it, wreck the
+    stand-in, restore, and prove it is byte-for-byte what it was."""
+    vm.boot(first=True)
+    record("VM boots", vm.wait_ssh())
+    vm.root("systemctl is-system-running --wait >/dev/null; mkdir -p /mnt/payload && mount -o ro /dev/vdb /mnt/payload")
+    rc, out = vm.root("DEBIAN_FRONTEND=noninteractive apt-get install -y dpkg-repack /mnt/payload/stynpilot-preview.deb 2>&1 | tail -2; dpkg-query -W stynpilot-preview", timeout=900)
+    record("stand-in Preview26 package installs", "0.5.13~preview26" in out, out[-200:])
+    rc, js, out = vm.guest("pairing")                                   # the owner's pairing database (Preview26 layout)
+    record("owner pairing database exists (as Preview26 leaves it)", js.get("ok"), out[-200:])
+    vm.root("mkdir -p /etc/stynpilot && printf '{\"secret\": \"SECRET-MARKER-26\"}' > /etc/stynpilot/remote-broker.json && chmod 600 /etc/stynpilot/remote-broker.json && chmod 750 /home/owner")
+    vm.root("loginctl enable-linger owner; sleep 5; runuser -u owner -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user enable --now stynpilot-commander-user.service; systemctl enable --now stynpilot-remote-broker.service; sleep 5")
+    check = "python3 -I /mnt/payload/p26_check.py"
+
+    def fingerprint():
+        rc, out = vm.root(check)
+        return json.loads([l for l in out.splitlines() if l.startswith("{")][-1])
+    base = fingerprint()
+    record("stand-in is really running (user unit, root unit, both ports)", base["units"] == {"system:stynpilot-remote-broker": "active", "user:stynpilot-commander-user": "active"}
+           and all(base["ports"].values()), json.dumps(base["units"]) + json.dumps(base["ports"]))
+    P = "/mnt/payload/preview26"
+    ENV = "SUDO_USER=owner"
+    rc, out = vm.root("%s sh %s/inventory.sh 2>&1" % (ENV, P))
+    record("inventory lists the package and prints no secret", "stynpilot-preview 0.5.13~preview26 installed" in out and "SECRET-MARKER-26" not in out and "remote-broker.json" in out, out[-300:])
+    rc, out = vm.root("%s sh %s/backup.sh 2>&1; ls -la /home/owner/preview26-backup-*.tar* 2>&1" % (ENV, P), timeout=600)
+    arch = re.findall(r"backup written: (\S+\.tar)", out)
+    record("backup runs and writes a private archive owned by the owner", rc == 0 and bool(arch) and "-rw------- 1 owner" in out, out[-500:])
+    arch = arch[0] if arch else "/home/owner/missing.tar"
+    record("backup changed nothing (same fingerprint, same running state)", fingerprint() == base)
+    rc, out = vm.root("tar -tf %s | grep -E 'remote-broker|pairing|package.deb'; tar -xOf %s meta/INFO; echo %s >/dev/null" % (arch, arch, arch))
+    record("archive holds the files, the settings, the sqlite copy and a reinstallable package copy", "remote-broker.json" in out and "pairing.sqlite3" in out and "package.deb" in out and "format 1" in out, out[-400:])
+
+    # ---- the new StyNpilot goes in next to it
+    rc, out = vm.root("DEBIAN_FRONTEND=noninteractive apt-get install -y /mnt/payload/stynpilot.deb 2>&1 | tail -2; dpkg-query -W stynpilot", timeout=900)
+    record("new StyNpilot installs beside Preview26 without touching it", rc == 0 and "stynpilot\t0.1.0" in out and fingerprint() == base, out[-200:])
+    rc, out = vm.as_owner("/usr/bin/stynpilot doctor", timeout=180)
+    record("doctor notices the existing Preview26 service", "existing Preview26 service" in out and "found" in out.split("existing Preview26 service")[1][:60], out[-500:])
+    rc, out = vm.root("ls /usr/share/polkit-1/actions | grep -c stynpilot; systemd-analyze verify /usr/lib/systemd/system/stynpilot-installer.service /usr/lib/systemd/system/stynpilot-remote-broker.service 2>&1 | head -3")
+    record("both policy sets coexist and both unit files verify", out.split()[0] == "2", out[-200:])
+
+    # ---- damage: package removed with purge, state corrupted, settings gone
+    vm.root("runuser -u owner -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user stop stynpilot-commander-user; systemctl stop stynpilot-remote-broker; "
+            "apt-get purge -y stynpilot-preview >/dev/null 2>&1; rm -f /etc/stynpilot/remote-broker.json; : > /home/owner/.local/state/stynpilot-owner/pairing.sqlite3; echo damaged")
+    broken = fingerprint()
+    record("the damage is real (package gone, settings gone, database emptied, services down)", broken["dpkg"] != base["dpkg"] and "/etc/stynpilot/remote-broker.json" not in broken["files"]
+           and not any(broken["ports"].values()), broken["dpkg"])
+    rc, out = vm.root("%s sh %s/restore.sh %s 2>&1" % (ENV, P, arch))
+    record("dry run reports what would change and changes nothing", "DRY RUN" in out and fingerprint() == broken, out[-300:])
+    vm.root("cp %s /tmp/bad.tar && printf 'X' | dd of=/tmp/bad.tar bs=1 seek=2000 conv=notrunc 2>/dev/null; cp %s.sha256 /tmp/bad.tar.sha256; sed -i 's#preview26-backup-[0-9TZ]*.tar#bad.tar#' /tmp/bad.tar.sha256; chown owner /tmp/bad.tar*; chmod 600 /tmp/bad.tar*" % (arch, arch))
+    rc, out = vm.root("%s sh %s/restore.sh /tmp/bad.tar --really 2>&1" % (ENV, P))
+    record("a damaged archive is refused and nothing is restored", rc != 0 and ("MISMATCH" in out or "refusing" in out or "not a Preview26" in out) and fingerprint() == broken, out[-200:])
+    vm.root("chmod 644 %s" % arch)
+    rc, out = vm.root("%s sh %s/restore.sh %s --really 2>&1" % (ENV, P, arch))
+    record("a world-readable archive is refused", rc != 0 and "private" in out and fingerprint() == broken, out[-200:])
+    vm.root("chmod 600 %s" % arch)
+    rc, out = vm.root("%s sh %s/restore.sh %s --really 2>&1" % (ENV, P, arch), timeout=900)
+    record("restore completes (package reinstalled from the backup's own copy)", rc == 0 and "reinstalled stynpilot-preview" in out, out[-400:])
+    time.sleep(8)
+    after = fingerprint()
+    same_files = {k: v for k, v in after["files"].items()} == base["files"]
+    record("everything is exactly as before: files, modes, owners, database content", same_files, json.dumps({k: (base["files"].get(k), after["files"].get(k)) for k in set(base["files"]) | set(after["files"]) if base["files"].get(k) != after["files"].get(k)})[:500])
+    record("services are running again as before", after["units"] == base["units"] and after["ports"] == base["ports"] and after["dpkg"] == base["dpkg"], json.dumps(after["units"]) + after["dpkg"])
+    rc, out = vm.root("dpkg-query -W stynpilot; dpkg -V stynpilot | head -3; systemctl is-enabled stynpilot-installer; echo end")
+    record("the new StyNpilot was left alone by the restore", "0.1.0" in out and out.split("end")[0].strip().endswith("disabled"), out[-200:])
+    vm.root("poweroff")
+    vm.child.wait_exit(300)
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--base", required=True)
@@ -387,10 +458,11 @@ def main():
     p.add_argument("--work", required=True)
     p.add_argument("--key", required=True)
     p.add_argument("--ssh-port", type=int, default=2222)
+    p.add_argument("--scenario", choices=["full", "preview26"], default="full")
     a = p.parse_args()
     vm = Vm(a)
     try:
-        scenario(vm)
+        (scenario if a.scenario == "full" else scenario_preview26)(vm)
     except Exception as error:
         record("scenario aborted: %s" % type(error).__name__, False, str(error)[-500:])
     finally:

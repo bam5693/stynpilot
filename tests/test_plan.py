@@ -117,6 +117,22 @@ class PlanTests(unittest.TestCase):
         p["steps"] = [{"kind": "apt", "packages": [pkg]}, {"kind": "apt", "packages": [dict(pkg, version="2")]}]
         self.refused(p)
 
+    def apt_plan(self, requested, names=("ncdu",)):
+        p = plan()
+        step = {"kind": "apt", "packages": [{"name": n, "version": "1.0"} for n in names]}
+        if requested is not None:
+            step["requested"] = requested
+        p["steps"] = [step]
+        return p
+
+    def test_requested_names_must_be_in_plan_and_well_formed(self):
+        self.assertEqual(validate(self.apt_plan(["ncdu"])).step_count, 1)
+        self.assertEqual(validate(self.apt_plan(["ncdu", "tree"], ("ncdu", "tree", "libx"))).step_count, 1)
+        for bad in ([], ["tree"], ["ncdu", "ncdu"], ["a", "b", "c", "d"], "ncdu", [1], ["NCDU"], ["ncdu;rm"], ["-o"]):
+            names = ("ncdu", "a", "b", "c", "d")
+            with self.assertRaises(PlanError, msg=repr(bad)):
+                validate(self.apt_plan(bad, names))
+
     def test_apt_step_with_container_fields_refused(self):
         p = plan()
         p["steps"] = [{"kind": "apt", "packages": [{"name": "git", "version": "1"}], "image": "x@sha256:" + DIGEST}]

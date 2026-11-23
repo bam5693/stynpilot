@@ -1,0 +1,48 @@
+PASS VM boots to a login prompt with real systemd
+PASS machine is Ubuntu 26.04 and the payload is mounted :: running
+PASS test identity provider reachable over trusted TLS :: {"issuer": "https://auth.g8test.example/", "authorization_endpoint": "https://auth.g8test.example/auth
+PASS package installs with apt on 26.04 :: 0.1.0.dev0
+PASS installing started and enabled nothing :: disabled
+PASS systemd-analyze verify accepts both unit files :: rc=0
+INFO installer exposure:                                              Files created by service are world-readable by default                       0.1
+PASS legacy pairing database created for the owner :: {"ok": true, "owner": "acct_e3f7d65021afe4c3d246af2f4377ca0f8ee1abf0", "pairing": "/home/owner/.local/stat
+PASS doctor before setup says 'not set up yet' and creates nothing ::              not set up yet: open StyNpilot Setup from the menu
+PASS owner logs in on a real local session
+PASS that login is a local active session (what polkit's allow_active needs) :: ;machineid=950f3ef12928414e8bbf2e53ecd55605;user=owner;hostname=g8vm;bootid=8a6a
+PASS polkit prompt shows 'StyNpilot wants to copy ONE settings fil' :: 
+PASS polkit prompt shows 'StyNpilot wants to START its software in' :: 
+PASS wizard drove setup to the end through the real polkit prompt :: {"pairing_found": "/home/owner/.local/state/stynpilot-owner/pairing.sqlite3", "step": "save
+PASS wizard Start button started StyNpilot :: ;font-size:1rem}button{font-size:1.1rem;padding:.7rem 1.4rem;margin-top:1rem}small{color:#555}li{margin:.3rem 0}</
+PASS root settings 0600 + public receipt; installer and owner service running :: root 600 /etc/stynpilot/installer.json
+PASS listeners are loopback only :: root 600 /etc/stynpilot/installer.json
+PASS doctor after start: no FAIL lines :: vate
+PASS Claude files an install request (htop) and gets an owner approval link :: {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795397618, "kind"
+PASS ChatGPT sees the same pending request :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795397618, "kind": "install", "request_i
+PASS AI side has no approve/decide tool and cannot reach the approval page :: {"routes": {"/approve/callback": 404, "/approve/choose": 404, "/approve/d972a08fc2
+PASS a forged AI token is refused :: {"result": {"error": {"error": "invalid_token", "error_description": "Authentication required"}, "http": 401}, "step": "bad
+PASS owner approves in the approval page (provider sign-in, PKCE, nonce-bound proof) :: {"http": 303, "location": "/approve/status/d972a08fc28126ea30ebad060d77c
+PASS the root installer installed htop and both AIs can see 'done' :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795397618, "kind
+PASS htop is really installed on the machine :: Status: install ok installed
+PASS ChatGPT reports the same accurate result :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795397618, "kind": "install", "reques
+PASS VM boots again after reboot
+PASS after reboot the installer and owner service came back by themselves (nobody logged in) :: active
+PASS the finished request is still reported 'done' after the reboot :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795397618, "kin
+PASS systemd restarts the installer after it is killed :: active
+PASS owner service restarts cleanly :: inactive
+PASS request state survives both restarts :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795397618, "kind": "install", "request_id
+PASS ChatGPT files a rollback request for that install :: {"result": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795397802, "kind": "rollbac
+PASS rollback completes after the owner's approval :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795397802, "kind": "rollback", "
+PASS htop is gone again :: dpkg-query: package 'htop' is not installed and no information is available
+PASS owner-state backup works without a password :: \owner-state backup written to /home/owner/owner.tar (4 files, integrity hashes recorded). This covers YOUR 
+PASS polkit prompt shows 'StyNpilot wants to READ its software-ins' :: command;cwd=/home/owner\[1;31m==== AUTHENTICATING FOR org.stynpilot.root-backup ====
+PASS root backup through the real password prompt :: 
+PASS root backup file is owned by the owner and private :: runs.sqlite3
+PASS polkit prompt shows 'StyNpilot wants to WRITE back' :: ;31m==== AUTHENTICATING FOR org.stynpilot.root-restore ====
+PASS restore is refused while the installer is running (or destination not empty) :: 
+PASS polkit prompt shows 'StyNpilot wants to STOP its software ins' :: ame=g8vm;bootid=73ac2132-609d-41b3-83c3-f939ad9aec92;pid=00000000000000000691;type=comman
+PASS stop works through its own prompt :: 
+PASS after stop nothing is running or enabled :: inactive
+PASS polkit prompt shows 'StyNpilot wants to START its software in' :: pid=00000000000000000691;type=command;cwd=/home/owner\[1;31m==== AUTHENTICATING FOR org
+PASS start again works :: 
+PASS the root helper refuses anyone but the configured owner :: rc=1
+RESULT: PASS  (46 checks, 0 failed)

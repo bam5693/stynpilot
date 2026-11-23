@@ -23,6 +23,10 @@ def main(argv=None):
     rbak.add_argument("--out", required=True)
     rres = sub.add_parser("root-restore", help="restore the installer's rollback records (asks for your password)")
     rres.add_argument("--archive", required=True)
+    for name, text in (("start", "start StyNpilot (asks for your password once)"), ("stop", "stop StyNpilot")):
+        one = sub.add_parser(name, help=text)
+        one.add_argument("--config", default=DEFAULT_OWNER_CONFIG)
+        one.add_argument("--show", action="store_true", help="show the result in a window afterwards")
     doc = sub.add_parser("doctor")
     doc.add_argument("--config", default=DEFAULT_OWNER_CONFIG)
     doc.add_argument("--html", action="store_true", help="show the report in a window (browser) instead of the terminal")
@@ -49,6 +53,9 @@ def main(argv=None):
             from .setup_wizard import ROOT_HELPER
             job = ["root-backup", "--out", args.out] if args.command == "root-backup" else ["root-restore", "--archive", args.archive]
             return subprocess.run(["pkexec", ROOT_HELPER] + job).returncode
+        elif args.command in ("start", "stop"):
+            from . import lifecycle
+            return lifecycle.run(args.command, Path(args.config).expanduser(), show=args.show)
         elif args.command == "doctor":
             from . import doctor
             from .broker.service import BrokerClient

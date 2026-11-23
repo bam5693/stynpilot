@@ -300,7 +300,22 @@ _STAGES = (("config", "Your settings are saved"), ("proposal", "System settings 
            ("state", "Your private records are created"), ("system", "System part is allowed"))
 
 
-def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONFIG, setup=resume_setup):
+async def _form_values(request) -> dict:
+    """Reads a plain urlencoded form without Starlette's form parser (which needs an extra library that the Ubuntu
+    package set does not reliably provide). Anything else, or anything large, is refused as empty."""
+    if not request.headers.get("content-type", "").lower().startswith("application/x-www-form-urlencoded"):
+        return {}
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > 16384:
+            return {}
+    from urllib.parse import parse_qsl
+    return {k: v for k, v in parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True) if len(v) < 512}
+
+
+def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONFIG, setup=resume_setup,
+              start_runner=None):
     """The link is a ONE-TIME entry: the first visit trades the secret URL for a browser session cookie and the URL
     stops working. Close the browser and start Setup again from the menu to get a new link. Every later request
     needs that cookie, the exact Host, and (for posts) the exact Origin."""
@@ -313,6 +328,9 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
     used = {"entered": False}
     runner = root_runner or (lambda src: subprocess.run(["pkexec", ROOT_HELPER, "root-setup", "--from", src],
                                                         capture_output=True, text=True, timeout=300))
+
+    starter = start_runner or (lambda: subprocess.run(["/usr/bin/stynpilot", "start"], capture_output=True, text=True,
+                                                      timeout=400))
 
     def page(title, body, status=200):
         out = HTMLResponse("<!doctype html><meta charset=utf-8><title>%s</title><style>%s</style>%s"
@@ -348,9 +366,11 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
     def next_step(status, note=""):
         if status["config"] == "ok" and status["proposal"] == "ok" and status["state"] == "complete" \
                 and status["system"] == "done":
-            return page("Setup finished", "<h1>Setup is finished</h1>%s<p>Nothing is running yet. Open <b>StyNpilot Doctor</b> "
-                        "from the menu to check everything. Starting the services is a separate step that needs your "
-                        "approval.</p>" % progress(status))
+            return page("Setup finished", "<h1>Setup is finished</h1>%s<p>Nothing is running yet. Starting is a separate step "
+                        "with its own password prompt: it starts the software installer (only changes software you approve "
+                        "one request at a time) and your approval page.</p><form method=post action=/setup/start><button>"
+                        "Start StyNpilot now</button></form><p><small>You can also start or stop it later from the menu. "
+                        "<b>StyNpilot Doctor</b> checks everything.</small></p>" % progress(status))
         if status["system"] == "mismatch" and status["proposal"] == "ok":
             return page("Needs a look", "<h1>A different system settings file is already there</h1>%s<p>The file "
                         "/etc/stynpilot/installer.json does not match the settings you just made (or is not private to "
@@ -383,7 +403,7 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
     async def save(request: Request):
         if not allowed(request):
             return nope()
-        values = {k: v for k, v in (await request.form()).items() if isinstance(v, str) and len(v) < 512}
+        values = await _form_values(request)
         try:
             status = setup(values, home, uid, root_config)
         except ConfigError as error:
@@ -415,9 +435,23 @@ def build_app(*, home, uid, token, port, root_runner=None, root_config=ROOT_CONF
                                      "started. You can try again.</p>%s" % ("<p><small>%s</small></p>" % why if why else ""))
         mark_complete(home)
         return next_step(setup_status(home, uid, root_config))
+    async def start(request: Request):
+        if not allowed(request):
+            return nope()
+        status = setup_status(home, uid, root_config)
+        if status["system"] != "done":
+            return page("Not ready", "<h1>Finish setup first</h1><p><a href=/setup>Back</a></p>", 400)
+        result = starter()
+        said = html.escape(str(getattr(result, "stdout", "") or getattr(result, "stderr", "") or "")[:400])
+        if getattr(result, "returncode", 1) != 0:
+            return page("Not started", "<h1>StyNpilot was not started</h1><p>%s</p><form method=post action=/setup/start>"
+                        "<button>Try again</button></form>" % said, 500)
+        return page("Started", "<h1>StyNpilot is running</h1><p>%s</p><p>Next: connect ChatGPT or Claude. Anything they ask "
+                    "for waits for your approval.</p>" % said)
     return Starlette(routes=[Route("/setup/{token}", enter), Route("/setup", home_page),
                              Route("/setup/save", save, methods=["POST"]), Route("/setup/resume", resume, methods=["POST"]),
-                             Route("/setup/system", system, methods=["POST"])])
+                             Route("/setup/system", system, methods=["POST"]),
+                             Route("/setup/start", start, methods=["POST"])])
 
 
 def serve(home=None, uid=None, open_browser=True):                     # pragma: no cover - interactive wrapper

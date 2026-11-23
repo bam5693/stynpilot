@@ -8,6 +8,7 @@ import tarfile
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -232,9 +233,12 @@ class RootBackupTests(unittest.TestCase):
             root_helper.root_backup(self.tmp / "n.tar", state=self.state, environ=env, geteuid=lambda: 1000)     # not root
         loose = self.tmp / "loose"
         loose.mkdir(mode=0o755)
-        os.chmod(loose, 0o755)
+        os.chmod(loose, 0o775)                                                       # others could swap entries: refused
         with self.assertRaises(ConfigError):
             root_helper.root_backup(loose / "x.tar", state=self.state, environ=env, geteuid=lambda: 0)
+        os.chmod(loose, 0o750)                                                       # Ubuntu's normal home folder: fine, the file is 0600
+        root_helper.root_backup(loose / "x.tar", state=self.state, environ=env, geteuid=lambda: 0)
+        self.assertEqual((loose / "x.tar").stat().st_mode & 0o777, 0o600)
         os.chmod(out, 0o644)
         with self.assertRaises(ConfigError):
             root_helper.root_restore(out, state=self.tmp / "empty", environ=env, geteuid=lambda: 0)
@@ -715,10 +719,13 @@ class SetupTests(unittest.TestCase):
         import xml.dom.minidom as minidom
         doc = minidom.parse(str(ROOT / "packaging/org.stynpilot.policy"))
         actions = {a.getAttribute("id"): a for a in doc.getElementsByTagName("action")}
-        self.assertEqual(set(actions), {"org.stynpilot.root-setup", "org.stynpilot.root-backup", "org.stynpilot.root-restore"})
+        self.assertEqual(set(actions), {"org.stynpilot.root-setup", "org.stynpilot.root-backup", "org.stynpilot.root-restore",
+                                        "org.stynpilot.root-start", "org.stynpilot.root-stop"})
         for job, words in (("root-setup", ("/etc/stynpilot/installer.json", "installs nothing")),
                            ("root-backup", ("READ", "Nothing is changed")),
-                           ("root-restore", ("WRITE", "never overwrites"))):
+                           ("root-restore", ("WRITE", "never overwrites")),
+                           ("root-start", ("START", "approve each request")),
+                           ("root-stop", ("STOP", "Nothing is removed"))):
             action = actions["org.stynpilot." + job]
             message = action.getElementsByTagName("message")[0].firstChild.data
             annotations = {n.getAttribute("key"): n.firstChild.data for n in action.getElementsByTagName("annotate")}
@@ -850,6 +857,21 @@ class SetupTests(unittest.TestCase):
         self.assertTrue(self.paths["done"].exists())
         self.assertEqual(len(calls), 2)
 
+    def test_saving_works_on_a_machine_without_the_form_parsing_library(self):
+        """The first real 26.04 VM run crashed here: Starlette's own form parser needs a library the clean machine lacked."""
+        import starlette.requests as sr
+        was = getattr(sr, "parse_options_header", None), getattr(sr, "multipart", None)
+        sr.parse_options_header = None
+        try:
+            c = self.client(lambda src: SimpleNamespace(returncode=126))
+            c.get("/setup/tok123", headers=self.H)
+            saved = c.post("/setup/save", data=self.form, headers=self.HP)
+            self.assertEqual(saved.status_code, 200)
+            self.assertIn("One step left", saved.text)
+            self.assertEqual(c.post("/setup/save", content=b"x" * 20000, headers={**self.HP, "content-type": "application/x-www-form-urlencoded"}).status_code, 400)
+        finally:
+            sr.parse_options_header = was[0]
+
     def test_resume_button_after_an_interrupted_save_and_a_refused_resume_changes_nothing(self):
         c = self.client(lambda src: SimpleNamespace(returncode=0))
         self.resume()
@@ -956,3 +978,107 @@ class PackageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(jwt is None, "PyJWT/cryptography not installed")
+class LifecycleTests(unittest.TestCase):
+    """Start/stop without a terminal: only the configured owner, only the one installer unit, honest results."""
+
+    def setUp(self):
+        from stynpilot import lifecycle, root_helper
+        self.lifecycle, self.root_helper = lifecycle, root_helper
+        self.tmp = tmpdir(self)
+        self.uid = os.geteuid()
+        self.config = self.tmp / "installer.json"
+        data = {"issuer": "https://tenant.example.auth/", "approval_client_id": "app", "owner": ts.OWNER, "device": ts.DEVICE,
+                "owner_uid": self.uid, "state_dir": "/var/lib/stynpilot-installer", "socket_path": "/run/stynpilot/installer.sock"}
+        fd = os.open(self.config, os.O_CREAT | os.O_WRONLY, 0o600)
+        os.write(fd, json.dumps(data).encode())
+        os.close(fd)
+
+    def test_root_start_and_stop_run_exactly_one_fixed_unit_for_the_configured_owner(self):
+        calls = []
+        env = {"PKEXEC_UID": str(self.uid)}
+        if self.uid < 1000:
+            self.skipTest("needs a normal user id")
+        self.root_helper.root_start(config_path=self.config, systemctl=calls.append, environ=env, geteuid=lambda: 0)
+        self.root_helper.root_stop(config_path=self.config, systemctl=calls.append, environ=env, geteuid=lambda: 0)
+        self.assertEqual(calls, [["enable", "--now", "stynpilot-installer.service"],
+                                 ["disable", "--now", "stynpilot-installer.service"]])
+
+    def test_another_user_a_missing_or_loose_config_and_non_root_are_refused(self):
+        if self.uid < 1000:
+            self.skipTest("needs a normal user id")
+        calls = []
+        for env, euid, cfg in (({"PKEXEC_UID": str(self.uid + 1)}, 0, self.config),            # someone else asking
+                               ({"PKEXEC_UID": str(self.uid)}, 1000, self.config),            # not root
+                               ({}, 0, self.config),                                           # not via polkit
+                               ({"PKEXEC_UID": str(self.uid)}, 0, self.tmp / "missing.json")):
+            with self.assertRaises(Exception):
+                self.root_helper.root_start(config_path=cfg, systemctl=calls.append, environ=env, geteuid=lambda e=euid: e)
+        os.chmod(self.config, 0o644)
+        with self.assertRaises(Exception):
+            self.root_helper.root_start(config_path=self.config, systemctl=calls.append,
+                                        environ={"PKEXEC_UID": str(self.uid)}, geteuid=lambda: 0)
+        self.assertEqual(calls, [])                                                            # systemctl never reached
+
+    def test_start_reports_cancelled_prompt_failed_unit_and_success_honestly(self):
+        import io
+        cfg = self.tmp / "owner.json"
+        cfg.write_text(json.dumps(owner_data(self.tmp)))
+        os.chmod(cfg, 0o600)
+        log = []
+
+        def fake(returns):
+            def run(argv, **kw):
+                log.append(argv)
+                return SimpleNamespace(returncode=returns.get(argv[0] if argv[0] != "systemctl" else "systemctl", 0),
+                                       stdout="", stderr="boom")
+            return run
+        out = io.StringIO()
+        self.assertEqual(self.lifecycle.run("start", cfg, run=fake({"pkexec": 126}), out=out), 1)
+        self.assertIn("NOT started", out.getvalue())
+        self.assertEqual([a[0] for a in log], ["pkexec"])                                       # nothing after a cancel
+        out = io.StringIO()
+        up = lambda: True
+        self.assertEqual(self.lifecycle.run("start", cfg, run=fake({}), active=lambda u, user: True,
+                                            wait=lambda check, s: True, out=out), 0)
+        self.assertIn("is running", out.getvalue())
+        out = io.StringIO()
+        self.assertEqual(self.lifecycle.run("start", cfg, run=fake({}), active=lambda u, user: False,
+                                            wait=lambda check, s: False, out=out), 1)
+        self.assertIn("did not come up", out.getvalue())
+        # "running" needs both listeners answering, not only the units being active
+        results, asked = [], []
+
+        def waiter(check, seconds):
+            results.append(check())
+            return True
+        for answers in (lambda port: False, lambda port: True):
+            with mock.patch.object(self.lifecycle.os.path, "exists", return_value=True):
+                self.lifecycle.run("start", cfg, run=fake({}), active=lambda u, user: True, wait=waiter,
+                                   listening=lambda port, a=answers: asked.append(port) or a(port), out=io.StringIO())
+        self.assertEqual(results, [False, True])
+        self.assertEqual(len(set(asked)), 2)                                                     # approval page AND AI endpoint
+
+    def test_wizard_start_button_only_after_the_system_step_and_shows_the_result(self):
+        t = SetupTests("test_system_step_is_refused_until_the_earlier_stages_are_done")
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        t.resume()
+        started = []
+        from starlette.testclient import TestClient
+        app = setup_wizard.build_app(home=t.home, uid=t.uid, token="tok", port=5556, root_runner=lambda s: None,
+                                     root_config=t.root_config,
+                                     start_runner=lambda: started.append(1) or SimpleNamespace(returncode=0, stdout="StyNpilot is running.", stderr=""))
+        c = TestClient(app, base_url="http://127.0.0.1:5556", follow_redirects=False)
+        c.get("/setup/tok", headers={"host": "127.0.0.1:5556"})
+        hp = {"host": "127.0.0.1:5556", "origin": "http://127.0.0.1:5556"}
+        self.assertEqual(c.post("/setup/start", data={}, headers=hp).status_code, 400)          # system step not done
+        self.assertEqual(started, [])
+        t.install_root_config()
+        page = c.get("/setup", headers={"host": "127.0.0.1:5556"})
+        self.assertIn("Start StyNpilot now", page.text)
+        ok = c.post("/setup/start", data={}, headers=hp)
+        self.assertIn("StyNpilot is running", ok.text)
+        self.assertEqual(started, [1])

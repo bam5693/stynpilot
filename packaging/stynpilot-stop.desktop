@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=StyNpilot Stop
+Comment=Stop StyNpilot (asks for your password once)
+Exec=/usr/bin/stynpilot stop --show
+Icon=media-playback-stop
+Categories=System;
+Terminal=false

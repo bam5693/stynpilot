@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=StyNpilot Start
+Comment=Start StyNpilot (asks for your password once)
+Exec=/usr/bin/stynpilot start --show
+Icon=media-playback-start
+Categories=System;
+Terminal=false

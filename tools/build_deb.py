@@ -69,6 +69,8 @@ def stage(dest, cache):
              "usr/share/polkit-1/actions/org.stynpilot.policy": ("packaging/org.stynpilot.policy", 0o644),
              "usr/share/applications/stynpilot-setup.desktop": ("packaging/stynpilot-setup.desktop", 0o644),
              "usr/share/applications/stynpilot-doctor.desktop": ("packaging/stynpilot-doctor.desktop", 0o644),
+             "usr/share/applications/stynpilot-start.desktop": ("packaging/stynpilot-start.desktop", 0o644),
+             "usr/share/applications/stynpilot-stop.desktop": ("packaging/stynpilot-stop.desktop", 0o644),
              "usr/share/doc/stynpilot/README.md": ("README.md", 0o644),
              "usr/share/doc/stynpilot/copyright": ("packaging/copyright", 0o644)}
     for target, (source, mode) in files.items():

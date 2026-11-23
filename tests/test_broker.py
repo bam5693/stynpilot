@@ -121,6 +121,12 @@ class BrokerTests(unittest.TestCase):
         self.assertTrue(self.executor.rollback(back, token, challenge)["ok"])
         self.assertEqual(self.machine.installed, {"bash": "5.2"})
 
+    def test_owner_sees_which_packages_the_assistant_chose_and_the_root_warning(self):
+        shown = " ".join(self.executor.challenge(self.generic_plan(), "approve")["summary"])
+        self.assertIn("Package ncdu, exact version 2.3-1, from the Ubuntu archive (asked for by the assistant).", shown)
+        self.assertIn("Package libncurses6, exact version 6.4, from the Ubuntu archive (needed by it).", shown)
+        self.assertIn("run as root", shown)
+
     def test_generic_plan_with_extra_or_missing_packages_refused_before_approval(self):
         payload = self.generic_plan()
         extra = self.forged(payload, steps=[{"kind": "apt", "requested": ["ncdu"], "packages": [

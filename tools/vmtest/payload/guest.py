@@ -129,6 +129,13 @@ def main():
     elif cmd == "request":
         out(step="request", result=mcp(sys.argv[2], "commander_request_software_install",
                                        {"device_id": DEVICE, "software": sys.argv[3]}))
+    elif cmd == "search":
+        out(step="search", result=mcp(sys.argv[2], "commander_software_search", {"device_id": DEVICE, "query": sys.argv[3]}))
+    elif cmd == "inventory":
+        out(step="inventory", result=mcp(sys.argv[2], "computer_inventory", {"device_id": DEVICE}))
+    elif cmd == "request-packages":
+        out(step="request-packages", result=mcp(sys.argv[2], "commander_request_software_install",
+                                                {"device_id": DEVICE, "packages": sys.argv[3].split(",")}))
     elif cmd == "request-rollback":
         out(step="request-rollback", result=mcp(sys.argv[2], "commander_request_software_rollback",
                                                 {"device_id": DEVICE, "software": sys.argv[3], "rollback_id": sys.argv[4]}))

@@ -72,9 +72,19 @@ def render_summary(payload):
                 "upgraded go back to their saved earlier versions. Application data and other changes are not restored.",
                 "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")]
     lines = ["Install %s on device ending ...%s." % (payload.get("software"), str(payload.get("device"))[-4:])]
+    generic = str(payload.get("software", "")).startswith("apt-")
+    asked = {n for step in payload.get("steps", []) for n in step.get("requested", [])}
     for step in payload.get("steps", []):
         for package in step.get("packages", []):
-            lines.append("Package %s, exact version %s, from the Ubuntu archive." % (package["name"], package["version"]))
+            role = ""
+            if generic:
+                role = "asked for by the assistant" if package["name"] in asked else "needed by it"
+            lines.append("Package %s, exact version %s, from the Ubuntu archive%s." % (
+                package["name"], package["version"], " (%s)" % role if role else ""))
+    if generic:
+        lines.append("The assistant chose these package names; StyNpilot checked them against the signed Ubuntu archive "
+                     "and refuses kernels, boot, login, firewall and other core packages. Package install scripts run as "
+                     "root: a signed source shows where a package came from, not that it is harmless.")
     lines.append("Backup limits: this saves the packages it changes and their tracked settings files so they can be "
                  "rolled back. It is not a full system snapshot: application data and other changes are not restored.")
     lines.append("Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z"))

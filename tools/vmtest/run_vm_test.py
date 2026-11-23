@@ -352,6 +352,48 @@ def scenario(vm):
     rc, out = vm.root("dpkg -s htop 2>&1 | head -2")
     record("htop is gone again", "not installed" in out or "deinstall" in out or "config-files" in out, out)
 
+    # ---------------------------------------------------------------- M1: a package that is NOT in the catalog
+    rc, jsi, _ = vm.guest("inventory claude-connector")
+    inv = jsi.get("result", {}).get("inventory", {})
+    record("M1: read-only hardware/software inventory works and leaks no identifiers",
+           bool(inv.get("os", {}).get("name")) and inv.get("memory", {}).get("total_bytes")
+           and not any(w in json.dumps(inv) for w in ("serial", "uuid", "hostname")), json.dumps(inv)[:300])
+    rc, jss, _ = vm.guest("search claude-connector ncdu")
+    hits = jss.get("result", {}).get("results", [])
+    record("M1: AI searches the signed Ubuntu lists and finds a non-catalog package", any(h.get("name") == "ncdu" and h.get("ai_may_request") and not h.get("installed") for h in hits), json.dumps(jss)[:300])
+    rc, jsb, _ = vm.guest("search claude-connector sudo")
+    record("M1: search marks sudo as not requestable by an AI", any(h.get("name") == "sudo" and h.get("ai_may_request") is False for h in jsb.get("result", {}).get("results", [])), json.dumps(jsb)[:300])
+    for blocked in ("sudo", "openssh-server", "linux-image-generic"):
+        rc, jb, _ = vm.guest("request-packages chatgpt-connector %s" % blocked)
+        record("M1: requesting %s is refused before any request exists" % blocked,
+               jb.get("result", {}).get("error") == "blocked_package" and not find_key(jb.get("result", {}), "request_id"), json.dumps(jb)[:300])
+    rc, ji, _ = vm.guest("request-packages chatgpt-connector Ncdu")
+    record("M1: an invalid package name is refused", ji.get("result", {}).get("error") == "invalid_package_name", json.dumps(ji)[:200])
+    rc, jn, _ = vm.guest("request-packages chatgpt-connector ncdu")
+    nrid = find_key(jn.get("result", {}), "request_id")
+    nsoft = find_key(jn.get("result", {}), "software")
+    record("M1: ChatGPT files an install request for ncdu by name", bool(nrid) and str(nsoft).startswith("apt-ncdu-"), json.dumps(jn)[:400])
+    record("M1: the owner's summary says the assistant chose it and that scripts run as root",
+           "run as root" in json.dumps(jn) and "ncdu" in json.dumps(jn), json.dumps(jn.get("result", {}).get("summary"))[:300])
+    rc, jna, _ = vm.guest("approve %s approve" % nrid, timeout=900)
+    rc, jnd, _ = vm.guest("status claude-connector %s done,failed,needs_owner_intervention 1500" % nrid, timeout=1700)
+    record("M1: after independent owner approval StyNpilot installs ncdu and the AI sees 'done'", req_state(jnd) == "done", json.dumps(jnd)[:500])
+    nroll = find_key(jnd, "rollback_id")
+    rc, out = vm.root("dpkg -s ncdu | grep -E '^Status'; which ncdu")
+    record("M1: ncdu is really installed", "install ok installed" in out, out)
+    rc, jv, _ = vm.guest("search claude-connector ncdu")
+    record("M1: the AI verifies it through the search tool (installed=true)", any(h.get("name") == "ncdu" and h.get("installed") for h in jv.get("result", {}).get("results", [])), json.dumps(jv)[:300])
+    rc, jd, _ = vm.guest("request-packages claude-connector ncdu")
+    record("M1: asking again reports already_installed and files nothing", jd.get("result", {}).get("already_installed") is True and not find_key(jd.get("result", {}), "request_id"), json.dumps(jd)[:300])
+    rc, jr2, _ = vm.guest("request-rollback chatgpt-connector %s %s" % (nsoft, nroll))
+    rrid2 = find_key(jr2.get("result", {}), "request_id")
+    record("M1: rollback of the non-catalog install can be requested", bool(rrid2), json.dumps(jr2)[:300])
+    rc, _, _ = vm.guest("approve %s approve" % rrid2, timeout=900)
+    rc, jrs2, _ = vm.guest("status chatgpt-connector %s done,failed,needs_owner_intervention 900" % rrid2, timeout=1000)
+    record("M1: rollback completes after owner approval", req_state(jrs2) == "done", json.dumps(jrs2)[:400])
+    rc, out = vm.root("dpkg -s ncdu 2>&1 | head -2")
+    record("M1: ncdu is gone again", "not installed" in out or "deinstall" in out or "config-files" in out, out)
+
     # ---------------------------------------------------------------- backups through real prompts + stop/start
     vm.login()
     rc, out = vm.serial("stynpilot backup --out ~/owner.tar", timeout=120)

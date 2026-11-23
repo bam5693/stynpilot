@@ -72,6 +72,69 @@ class RealAptTests(unittest.TestCase):
         for name in [p["name"] for p in payload["steps"][0]["packages"]]:
             self.assertIsNone(apt.installed_versions([name])[name], name)
 
+    def test_non_catalog_package_by_name_search_install_verify_rollback_for_real(self):
+        """M1 acceptance: an AI-named package that is NOT in the catalog (ncdu) goes through search -> plan -> approval
+        -> install -> verify -> rollback with real apt; blocked names are refused with nothing changed."""
+        import jwt
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from stynpilot import catalog
+        from stynpilot.broker import apt
+        from stynpilot.broker.executor import ExecutionDenied, Executor
+        from stynpilot.broker.proof import ProofVerifier, decision_nonce
+        from stynpilot.identity import account_id
+        from stynpilot.requests import request_id
+
+        name = os.environ.get("STYNPILOT_REAL_APT_PACKAGE", "ncdu")
+        self.assertIsNone(apt.installed_versions([name])[name], name + " must not be installed before this test")
+        found = apt.search(name)
+        self.assertIn(name, [f["name"] for f in found], found)
+        iss, app, sub, device = "https://issuer.example.test/", "approval-app", "auth0|disposable", "dtdev_TESTONLYdisposable2"
+        owner = account_id(verified_issuer=iss, verified_subject=sub)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        public = jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key(), as_dict=True)
+        public.update(kid="k1", use="sig", alg="RS256")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        executor = Executor(state_dir=Path(tmp.name) / "broker", owner=owner, device=device,
+                            verifier=ProofVerifier(issuer=iss, approval_client_id=app, jwks={"keys": [public]}))
+
+        def approval(payload):
+            rid, _ = request_id(payload)
+            challenge = executor.challenge(payload, "approve")
+            now = int(time.time())
+            token = jwt.encode({"iss": iss, "aud": app, "sub": sub, "iat": now, "exp": now + 300, "auth_time": now,
+                                "nonce": decision_nonce("approve", rid, rid, challenge["challenge"])},
+                               key, algorithm="RS256", headers={"kid": "k1"})
+            return challenge["challenge"], token
+
+        for blocked in ("sudo", "openssh-server", "docker.io", "linux-image-generic"):
+            with self.assertRaises(catalog.CatalogError, msg=blocked):
+                catalog.generic_install_plan([blocked], owner=owner, device=device, analyze=apt.analyze,
+                                             installed=apt.installed_versions)
+        plan, summary, info = catalog.generic_install_plan([name], owner=owner, device=device, analyze=apt.analyze,
+                                                           installed=apt.installed_versions)
+        payload = plan.content()
+        print("\nPlan the owner would approve:\n  " + "\n  ".join(summary))
+        challenge, token = approval(payload)
+        result = executor.install(payload, token, challenge)
+        print("Install result:", result)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(subprocess.run(["dpkg-query", "-W", "-f", "${Version}", name], capture_output=True, text=True).stdout,
+                         next(p["version"] for p in payload["steps"][0]["packages"] if p["name"] == name))
+        with self.assertRaises(catalog.CatalogError) as again:                       # now already installed: no new request
+            catalog.generic_install_plan([name], owner=owner, device=device, analyze=apt.analyze, installed=apt.installed_versions)
+        self.assertEqual(again.exception.code, "already_installed")
+        expires = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        back = {"kind": "rollback", "software": payload["software"], "rollback_id": result["rollback_id"],
+                "request_id": request_id(payload)[0], "snapshot_id": result["rollback_id"], "owner": owner,
+                "device": device, "expires_at": expires}
+        challenge, token = approval(back)
+        undone = executor.rollback(back, token, challenge)
+        print("Rollback result:", undone)
+        self.assertTrue(undone["ok"], undone)
+        for pkg in [p["name"] for p in payload["steps"][0]["packages"]]:
+            self.assertIsNone(apt.installed_versions([pkg])[pkg], pkg)
+
 
 if __name__ == "__main__":
     unittest.main()

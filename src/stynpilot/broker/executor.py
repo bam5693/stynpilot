@@ -52,8 +52,12 @@ from .. import catalog, impact, statelock
 from ..ledger import InstallLedger, LedgerError
 from ..plan import PlanError, validate_plan
 from ..requests import request_id as payload_hash
+from .. import backup, release
 from . import apt
 from .proof import ProofDenied, decision_nonce, render_summary, summary_hash
+from .upgrade import UpgradeRefused, Upgrader
+
+ReleaseErrorTypes = (release.ReleaseError,)
 
 CHALLENGE_LIFETIME = 600
 BACKUP_SCOPE = "packages_and_dpkg_tracked_settings_only"
@@ -148,7 +152,8 @@ def _sha256(path):
 
 class Executor:
     def __init__(self, *, state_dir, owner, device, verifier, run=apt.real_run, require_root=True,
-                 sources_root="/etc/apt", file_root="/"):
+                 sources_root="/etc/apt", file_root="/", owner_uid=None, release_keys=None, fetch_release=None,
+                 launch_worker=None, upgrade_options=None):
         self.dir = Path(state_dir)
         if require_root and not apt.is_root():
             raise ExecutionDenied("installer_must_run_as_root")
@@ -166,16 +171,33 @@ class Executor:
         self.ledger = InstallLedger(self.dir / "installs.sqlite3")
         for sub in ("snapshots", "downloads", "attention"):
             (self.dir / sub).mkdir(exist_ok=True, mode=0o700)
+        self.owner_uid = owner_uid
+        self.upgrader = Upgrader(self, keys=release_keys, fetch=fetch_release, launch=launch_worker,
+                                 options=upgrade_options)
         # A run still marked "running" means the installer died mid-change. We can't know what state
         # the machine is in, so record that durably and refuse new installs until the owner looks.
+        # An UPGRADE run is different: its worker runs on its own and outlives this installer's restart, so it is
+        # settled from its job folder (or left running while its worker is alive), never blamed on this restart.
         for rid in self.runs.running():
+            if self.upgrader.is_job(rid):
+                self.upgrader.reconcile(rid)
+                continue
             self._attention(rid, None, "interrupted_by_restart_or_crash", None)
             self.runs.finish(rid, "needs_owner_intervention", {"ok": False, "stopped": "interrupted_by_restart_or_crash",
                                                                "needs_owner_intervention": True})
 
     def status(self, request_id):
         """What the installer's own durable record says about this request (reconciliation source)."""
-        return self.runs.status(request_id)
+        record = self.runs.status(request_id)
+        if record["state"] == "running" and self.upgrader.is_job(request_id):
+            self.upgrader.reconcile(request_id)
+            record = self.runs.status(request_id)
+        return record
+
+    def _settle_upgrades(self):
+        for rid in self.runs.running():
+            if self.upgrader.is_job(rid):
+                self.upgrader.reconcile(rid)
 
     def needs_attention(self):
         """Durable records of runs that may have left the machine changed. New installs are refused while any exist."""
@@ -202,6 +224,14 @@ class Executor:
         self._check_payload(payload)
         rid, _ = payload_hash(payload)
         challenge = self.runs.issue(rid, decision)
+        if payload.get("kind") == "upgrade":
+            try:
+                summary = self.upgrader.summary(payload)
+            except UpgradeRefused as refused:
+                raise ExecutionDenied(refused.code) from None
+            return {"request_id": rid, "decision": decision, "challenge": challenge,
+                    "nonce": decision_nonce(decision, rid, rid, challenge),
+                    "summary": summary, "summary_sha256": summary_hash(summary), "expires_in": CHALLENGE_LIFETIME}
         summary = render_summary(payload)
         if payload.get("kind") != "rollback" and catalog.is_generic(payload.get("software")):
             try:
@@ -219,6 +249,11 @@ class Executor:
     def _check_payload(self, payload):
         if type(payload) is not dict:
             raise ExecutionDenied("plan_invalid_or_expired")
+        self._settle_upgrades()
+        if any(self.upgrader.is_job(r) for r in self.runs.running()):
+            raise ExecutionDenied("an_upgrade_is_still_running")
+        if payload.get("kind") == "upgrade":
+            return self._check_upgrade_payload(payload)
         if payload.get("kind") == "rollback":
             return self._check_rollback_payload(payload)
         return self._check_install_payload(payload)
@@ -241,6 +276,72 @@ class Executor:
         rid = self._decide(payload, proof_token, challenge, "deny", payload.get("kind", "install"))
         self.runs.finish(rid, "denied", {"ok": True, "denied_by_owner": True})
         return {"ok": True, "denied_by_owner": True}
+
+    # -- self-upgrade ---------------------------------------------------------------------------
+    def _check_upgrade_payload(self, payload):
+        try:
+            content, _, _ = self.upgrader.check(payload)
+        except UpgradeRefused as refused:
+            raise ExecutionDenied(refused.code) from None
+        if self.needs_attention():
+            raise ExecutionDenied("owner_intervention_required")
+        if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
+            raise ExecutionDenied("already_decided_or_used")
+        return content
+
+    def upgrade(self, payload, proof_token, challenge):
+        """Execute an approved, signed StyNpilot upgrade. Everything that can fail BEFORE the machine changes happens
+        first (proof check, records backup, download, package inspection, rollback copy); only then is the owner's
+        one-time challenge consumed and the detached worker started. Returns immediately with ``pending``: the
+        outcome is settled later from the worker's result (see status)."""
+        content = self._check_upgrade_payload(payload)
+        rid, _ = payload_hash(payload)
+        if type(challenge) is not str or len(challenge) != 64:
+            raise ExecutionDenied("challenge_unknown")
+        try:
+            nonce = decision_nonce("approve", rid, rid, challenge)
+            fingerprint = self.verifier.verify(proof_token, owner=self.owner, expected_nonce=nonce)
+        except ProofDenied as denied:
+            raise ExecutionDenied(denied.code) from None
+        try:
+            self._backup_records(rid)
+            _, _, installed = self.upgrader.check(payload)
+            with statelock.operation(self.dir):
+                job = self.upgrader.prepare(rid, content, installed)
+                try:
+                    self.runs.consume(challenge=challenge, request_id=rid, decision="approve", proof=fingerprint,
+                                      kind="upgrade")
+                    unit = self.upgrader.start(rid, job)
+                except BaseException:
+                    if self.runs.status(rid)["state"] == "not_started":
+                        shutil.rmtree(job, ignore_errors=True)
+                    raise
+        except statelock.Busy:
+            raise ExecutionDenied("a_backup_or_restore_is_running_try_again") from None
+        except UpgradeRefused as refused:
+            raise ExecutionDenied(refused.code) from None
+        except backup.BackupError as failed:
+            raise ExecutionDenied("records_backup_failed_%s" % str(failed)[:40]) from None
+        except ReleaseErrorTypes:
+            raise ExecutionDenied("release_download_failed") from None
+        except ExecutionDenied:
+            raise
+        except OSError as error:
+            raise ExecutionDenied("could_not_prepare_%s" % type(error).__name__) from None
+        return {"ok": None, "pending": True, "started": True, "request_id": rid, "unit": unit,
+                "from_version": installed, "to_version": content["manifest"]["version"],
+                "backup_scope": "installer_records_and_a_full_copy_of_the_current_version"}
+
+    def _backup_records(self, rid):
+        """The installer's own records (ledgers, snapshots) saved before an upgrade, hash-verified on the way."""
+        out = self.dir / "upgrade-backups" / ("records-%s.tar" % rid[:16])
+        if out.exists():
+            return
+        backup.make_backup(self.dir, out, kind="root")
+        backup.read_backup(out, expected_kind="root")             # read back and verify every hash
+        keep = sorted((self.dir / "upgrade-backups").glob("records-*.tar"), key=lambda p: p.stat().st_mtime)
+        for old in keep[:-5]:
+            old.unlink()
 
     # -- install ------------------------------------------------------------------------------
     def _check_install_payload(self, payload, now=None):
@@ -308,7 +409,15 @@ class Executor:
         except statelock.Busy:
             raise ExecutionDenied("a_backup_or_restore_is_running_try_again") from None
 
+    def _no_other_change(self):
+        if self.needs_attention():
+            raise ExecutionDenied("owner_intervention_required")
+        self._settle_upgrades()
+        if self.runs.running():
+            raise ExecutionDenied("another_change_is_still_running")
+
     def _install_locked(self, payload, proof_token, challenge, *, now=None):
+        self._no_other_change()
         content = self._check_install_payload(payload, now)
         rid = self._decide(payload, proof_token, challenge, "approve", "install")
         try:
@@ -577,6 +686,7 @@ class Executor:
             raise ExecutionDenied("a_backup_or_restore_is_running_try_again") from None
 
     def _rollback_locked(self, payload, proof_token, challenge):
+        self._no_other_change()
         entry = self._check_rollback_payload(payload)
         manifest = self._verify_backup(entry["snapshot_id"])
         self._rollback_preflight(manifest)                      # refuses before the approval is consumed

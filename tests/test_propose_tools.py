@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 from datetime import timedelta
 
+from stynpilot import release
 from stynpilot.broker import apt
 from tests.fake_machine import FakeMachine
 from stynpilot.identity import TokenDenied
@@ -90,12 +91,32 @@ class ProposeToolTests(unittest.TestCase):
                                    available={"ncdu": "2.3-1", "libncurses6": "6.4", "tree": "2.1-1", "sudo": "1.9",
                                                "openssh-server": "9", "nginx": "1.24", "docker.io": "26"},
                                    deps={"ncdu": ["libncurses6"]})
+        self.signing = release.new_private_key()
+        self.release_files = {}
         self.server = create_server(router=router, resource_url=AUDIENCE, propose=dict(
+            fetch_release=lambda url, limit: self.fetch_release(url), installed_version=lambda: "0.1.0~dev3",
+            release_keys={release.public_entry(self.signing)["key_id"]: self.signing.public_key()},
             clients=self.clients, store=self.store, ledger=self.ledger, resolve_apt=lambda names: [{"name": "htop", "version": "3.3.0-4build1"}, {"name": "libnl-3-200", "version": "3.7.0-0.3build1.1"}],
             approval_url="https://ryzen.example.test/app", clock=lambda: self.now[0],
             analyze_apt=lambda names: apt.analyze(names, self.machine),
             installed_apt=lambda names: apt.installed_versions(names, self.machine),
             search_apt=lambda q: apt.search(q, self.machine)))
+
+    def fetch_release(self, url):
+        if url not in self.release_files:
+            raise release.ReleaseError("download_failed")
+        return self.release_files[url]
+
+    def publish(self, version="0.1.0~dev4", key=None, manifest_version=None, **changes):
+        tag = release.tag_for_version(version)
+        manifest = {"schema": 1, "package": "stynpilot", "version": manifest_version or version, "tag": tag, "asset": "stynpilot-%s.deb" % tag,
+                    "sha256": "c" * 64, "size": 4096, "git_commit": "d" * 40, "from_min": "",
+                    "created": "2026-11-23T12:00:00Z", "notes": ["n"]}
+        manifest.update(changes)
+        manifest_url, signature_url = release.manifest_urls(tag)
+        self.release_files[manifest_url] = json.dumps(manifest).encode()
+        self.release_files[signature_url] = release.sign(manifest, key or self.signing).encode()
+        return manifest
 
     def call(self, name, arguments, token="chatgpt"):
         who = Tokens.valid.get(token)
@@ -117,8 +138,42 @@ class ProposeToolTests(unittest.TestCase):
         names = sorted(t.name for t in asyncio.run(self.server.list_tools()))
         self.assertEqual(names, sorted(["computer_health", "commander_software_catalog", "commander_software_search",
                                         "commander_request_software_install", "commander_software_install_status",
-                                        "commander_request_software_rollback"]))
+                                        "commander_request_software_rollback", "commander_request_stynpilot_upgrade"]))
         self.assertFalse(any(word in n for n in names for word in ("approve", "review", "execute", "run")))
+
+    def test_upgrade_request_files_a_signed_release_for_the_owner_and_nothing_else(self):
+        manifest = self.publish()
+        out = self.call("commander_request_stynpilot_upgrade", {"device_id": DEVICE, "version": "0.1.0~dev4"})
+        self.assertTrue(out["ok"], out)
+        result = out["result"]
+        self.assertEqual((result["kind"], result["state"], result["approved_by_ai"]), ("upgrade", "pending", False))
+        self.assertIn("/approve/" + result["request_id"], result["owner_approval_url"])
+        payload = self.store.payload(result["request_id"])
+        self.assertEqual(payload["manifest"], manifest)
+        self.assertEqual(payload["software"], "stynpilot-self")
+        again = self.call("commander_request_stynpilot_upgrade", {"device_id": DEVICE, "version": "0.1.0-dev4"}, "claude")
+        self.assertEqual(again["result"]["request_id"], result["request_id"])          # same ask, same request
+        status = self.call("commander_software_install_status", {"device_id": DEVICE, "request_id": result["request_id"]})
+        self.assertEqual(status["result"]["state"], "pending")
+
+    def test_upgrade_request_refuses_untrusted_mismatched_or_missing_releases(self):
+        self.publish(key=release.new_private_key())
+        self.assertEqual(self.call("commander_request_stynpilot_upgrade", {"device_id": DEVICE, "version": "0.1.0~dev4"}),
+                         {"ok": False, "error": "signature_not_trusted"})
+        self.publish("0.1.0~dev5", manifest_version="0.1.0~dev6")
+        self.assertEqual(self.call("commander_request_stynpilot_upgrade", {"device_id": DEVICE, "version": "0.1.0~dev5"})["error"],
+                         "release_does_not_match_requested_version")
+        self.assertEqual(self.call("commander_request_stynpilot_upgrade", {"device_id": DEVICE, "version": "0.1.0~dev9"})["error"],
+                         "download_failed")
+        for bad in ("../x", "1.0 --evil", "", "v"):
+            self.assertFalse(self.call("commander_request_stynpilot_upgrade", {"device_id": DEVICE, "version": bad})["ok"])
+
+    def test_upgrade_request_needs_the_propose_scope_and_the_device_grant(self):
+        self.publish()
+        out = self.call("commander_request_stynpilot_upgrade", {"device_id": DEVICE, "version": "0.1.0~dev4"}, "readonly")
+        self.assertEqual(out["error"], "insufficient_scope_workspace_propose")
+        out = self.call("commander_request_stynpilot_upgrade", {"device_id": DEVICE, "version": "0.1.0~dev4"}, "reviewer")
+        self.assertFalse(out["ok"])                                                     # reviewers never file requests
 
     def test_chatgpt_asks_claude_checks_and_nobody_approves(self):
         filed = self.install()

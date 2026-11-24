@@ -66,6 +66,7 @@ def stage(dest, cache):
              "usr/lib/systemd/user/stynpilot-owner.service": ("deploy/systemd/stynpilot-owner.service", 0o644),
              "usr/share/stynpilot/owner.example.json": ("deploy/owner.example.json", 0o644),
              "usr/share/stynpilot/installer.example.json": ("deploy/installer.example.json", 0o644),
+             "usr/share/stynpilot/release-keys.json": ("packaging/release-keys.json", 0o644),
              "usr/share/polkit-1/actions/org.stynpilot.policy": ("packaging/org.stynpilot.policy", 0o644),
              "usr/share/applications/stynpilot-setup.desktop": ("packaging/stynpilot-setup.desktop", 0o644),
              "usr/share/applications/stynpilot-doctor.desktop": ("packaging/stynpilot-doctor.desktop", 0o644),
@@ -81,6 +82,9 @@ def stage(dest, cache):
 
 
 def build(out_dir=None, cache=None):
+    # The result must not depend on the builder's umask (a private 0077 umask used to leave DEBIAN unreadable by dpkg-deb
+    # and could change file modes): fix it for the whole build, and set every mode explicitly below.
+    os.umask(0o022)
     out_dir = Path(out_dir or ROOT / "dist")
     out_dir.mkdir(parents=True, exist_ok=True)
     epoch = int(os.environ.get("SOURCE_DATE_EPOCH", "1763769600"))
@@ -96,6 +100,7 @@ def build(out_dir=None, cache=None):
         size = sum(p.stat().st_size for p in pkg.rglob("*") if p.is_file()) // 1024
         control = pkg / "DEBIAN"
         control.mkdir()
+        control.chmod(0o755)
         (control / "control").write_text(
             "Package: stynpilot\nVersion: %s\nSection: admin\nPriority: optional\nArchitecture: all\n"
             "Depends: %s\nInstalled-Size: %d\nMaintainer: StyNpilot owner <owner@invalid>\n"
@@ -106,6 +111,8 @@ def build(out_dir=None, cache=None):
         for path in sorted(p for p in pkg.rglob("*") if p.is_file() and "DEBIAN" not in p.parts):
             sums.append("%s  %s" % (hashlib.md5(path.read_bytes()).hexdigest(), path.relative_to(pkg)))
         (control / "md5sums").write_text("\n".join(sums) + "\n")
+        for path in (control / "control", control / "md5sums"):
+            path.chmod(0o644)
         for path in (control, control / "control", control / "md5sums"):
             os.utime(path, (epoch, epoch))
         target = out_dir / ("stynpilot_%s_all.deb" % deb_version())

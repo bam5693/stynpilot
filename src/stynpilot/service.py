@@ -26,6 +26,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .approval import ApprovalFlow
+from . import release
 from .broker import apt
 from .requests import RequestStore
 from .server import run
@@ -198,6 +199,26 @@ def provision_owner_state(config, *, resume=False):
     return sorted(created if resume else PROVISIONED)
 
 
+def _installed_stynpilot_version():
+    from .diagnostics import real_run
+    code, out = real_run(["dpkg-query", "-W", "-f", "${Version}", "stynpilot"], 15)
+    return out.strip() or "unknown"
+
+
+def _owner_backup_before_upgrade(state):
+    """Before an upgrade runs, save the owner's own records (request queue, revocations) with integrity hashes."""
+    def before(payload, rid):
+        if payload.get("kind") != "upgrade":
+            return
+        from . import backup
+        folder = state / "backups"
+        backup.make_backup(state, folder / ("pre-upgrade-%s.tar" % rid[:16]), kind="owner")
+        old = sorted(folder.glob("pre-upgrade-*.tar"), key=lambda p: p.stat().st_mtime)
+        for extra in old[:-5]:
+            extra.unlink()
+    return before
+
+
 def start_owner_service(config, *, broker=None, exchange=None, start_listener=None, start_mcp=None, tokens=None,
                         clock=time.time, monotonic=time.monotonic, reconcile_interval=5.0, give_up_after=600.0,
                         resolve_apt=None):
@@ -225,7 +246,7 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
                                                             redirect_uri=config.redirect_uri),
                         authorize={"endpoint": config.authorize_endpoint, "client_id": config.approval_client_id,
                                    "redirect_uri": config.redirect_uri},
-                        clock=clock, background=True)
+                        clock=clock, background=True, before_run=_owner_backup_before_upgrade(state))
     recovered, waiting = flow.recover(patient=True)        # settle what the installer already knows, BEFORE accepting anything
     service = OwnerService(flow, None, None, recovered, waiting)
     try:
@@ -246,9 +267,15 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
                        store=store, ledger=BrokerLedger(config.broker_socket),
                        resolve_apt=resolve_apt or apt.resolve,
                        analyze_apt=apt.analyze, installed_apt=apt.installed_versions, search_apt=apt.search,
-                       approval_url="https://%s" % config.approval_public_host)
+                       approval_url="https://%s" % config.approval_public_host,
+                       fetch_release=release.https_get, installed_version=_installed_stynpilot_version)
+        from . import safefs
+        from .diagnostics import Diagnostics
+        diag = dict(policy=safefs.Policy(home=os.path.expanduser("~"),
+                                         extra_deny=[config.state_dir, config.pairing_db, config.broker_socket]),
+                    diagnostics=Diagnostics())
         service.mcp = (start_mcp or run.start)(router=router, public_host=config.mcp_public_host,
-                                               port=config.mcp_port, propose=propose)
+                                               port=config.mcp_port, propose=propose, diag=diag)
     except Exception:
         service.stop()
         raise
@@ -349,6 +376,7 @@ def build_installer(config, *, jwks, jwks_loader=None, run_command=apt.real_run,
     from .broker.service import BrokerService
     verifier = ProofVerifier(issuer=config.issuer, approval_client_id=config.approval_client_id, jwks=jwks,
                              jwks_loader=jwks_loader)
+    executor_options.setdefault("owner_uid", config.owner_uid)
     executor = Executor(state_dir=config.state_dir, owner=config.owner, device=config.device, verifier=verifier,
                         run=run_command, require_root=require_root, **executor_options)
     return BrokerService(socket_path=config.socket_path, executor=executor, allowed_uid=config.owner_uid)

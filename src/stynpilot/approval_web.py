@@ -177,6 +177,15 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
             extra += "<p>Reason: <code>%s</code></p>" % html.escape(str(result["stopped"])[:80])
         if result.get("limits"):
             extra += "<p>%s</p>" % html.escape(str(result["limits"]))
+        if result.get("to_version"):
+            extra += "<p>StyNpilot %s &rarr; %s</p>" % (html.escape(str(result.get("from_version", ""))[:40]),
+                                                     html.escape(str(result["to_version"])[:40]))
+        if result.get("rolled_back"):
+            extra += ("<p>The new version did not pass its checks, so StyNpilot put the previous version back "
+                      "automatically.</p>")
+        if state in ("approved", "running"):
+            extra += ("<p>An upgrade restarts StyNpilot for about a minute. If this page stops loading, wait a "
+                      "minute and reload it.</p>")
         refresh = "<meta http-equiv=refresh content=3>" if state in ("approved", "running") else ""
         return _page("Status", "%s<h1>%s</h1><p>%s</p>%s" % (refresh, html.escape(state.replace("_", " ").title()),
                                                           html.escape(_STATUS_TEXT.get(state, state)), extra))

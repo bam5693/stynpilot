@@ -76,7 +76,7 @@ class ChallengeTests(unittest.TestCase):
 
     def test_request_tools_without_the_scope_get_a_standard_step_up_challenge(self):
         for name in ("commander_request_software_install", "commander_software_install_status",
-                     "commander_request_software_rollback"):
+                     "commander_request_software_rollback", "commander_request_stynpilot_upgrade"):
             with self.subTest(name):
                 r = self.post(call(name, {"device_id": t.DEVICE}))
                 self.assertEqual(r.status_code, 403)
@@ -115,6 +115,46 @@ class ChallengeTests(unittest.TestCase):
         self.assertNotEqual(self.post(None, raw=big).status_code, 403)
         r = self.post(call("commander_request_software_install", {"device_id": t.DEVICE}), headers={"host": "evil.test"})
         self.assertNotEqual(r.status_code, 403)
+
+    def test_bodies_are_only_held_for_genuine_small_requests(self):
+        """An anonymous caller, a bad token, a chunked or oversized body must never make the wrapper read the body."""
+        import asyncio
+        reads = []
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 204, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+        wrapper = run.ScopeChallenge(app, scopes={"health.read", "workspace.propose"}, resource="https://%s/mcp" % HOST,
+                                     hosts={HOST}, tokens=self.tokens, guarded_tools={"commander_request_software_install"})
+
+        def attempt(headers, body=b'{"jsonrpc":"2.0"}'):
+            scope = {"type": "http", "method": "POST", "path": "/mcp",
+                     "headers": [(k.encode(), v.encode()) for k, v in headers.items()]}
+            sent, count = [], [0]
+
+            async def receive():
+                count[0] += 1
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            async def send(message):
+                sent.append(message)
+            asyncio.run(wrapper(scope, receive, send))
+            return count[0]
+        base = {"host": HOST, "content-length": "20"}
+        self.assertEqual(attempt(base), 0)                                                       # no token
+        self.assertEqual(attempt({**base, "authorization": "Bearer nobody"}), 0)                  # bad token
+        self.assertEqual(attempt({"host": HOST, "authorization": "Bearer readonly"}), 0)          # no length (chunked)
+        self.assertEqual(attempt({**base, "authorization": "Bearer readonly",
+                                  "content-length": str(run.MAX_STEP_UP_BODY + 1)}), 0)           # too big
+        self.assertEqual(attempt({**base, "authorization": "Bearer claude"}), 0)                  # already has the scope
+        self.assertEqual(attempt({**base, "host": "evil.test", "authorization": "Bearer readonly"}), 0)
+        self.assertGreaterEqual(attempt({**base, "authorization": "Bearer readonly"}), 1)         # the one case we read
+
+    def test_buffering_is_capped_in_parallel(self):
+        import threading
+        self.assertIsInstance(run.MAX_STEP_UP_BUFFERS, int)
+        self.assertLessEqual(run.MAX_STEP_UP_BUFFERS, 16)
+        self.assertLessEqual(run.MAX_STEP_UP_BODY, 65536)
 
     def test_the_metadata_document_is_unchanged(self):
         r = self.client.get("/.well-known/oauth-protected-resource/mcp")

@@ -6,6 +6,7 @@ It talks to the installer with one JSON line per call:
   {"op": "challenge",    "payload": {...}, "decision": "approve"|"deny"}   -> challenge, nonce, summary
   {"op": "install",      "payload": {...}, "proof": "<ID token>", "challenge": "<64 hex>"}
   {"op": "rollback",     "payload": {...}, "proof": "<ID token>", "challenge": "<64 hex>"}
+  {"op": "upgrade",      "payload": {...}, "proof": "<ID token>", "challenge": "<64 hex>"}   -> returns at once (pending)
   {"op": "deny",         "payload": {...}, "proof": "<ID token>", "challenge": "<64 hex>"}
   {"op": "status",       "request_id": "<64 hex>"}
   {"op": "rollbackable", "rollback_id": "<hex>", "software": "<catalog id>"}
@@ -74,7 +75,7 @@ class BrokerService:
                 rid = message.get("request_id")
                 if type(rid) is not str or not _HEX64.fullmatch(rid):
                     return {"ok": False, "error": "invalid_request"}
-                return {"ok": True, "status": self.executor.runs.status(rid)}
+                return {"ok": True, "status": self.executor.status(rid)}
             if op == "challenge":
                 if not self._busy.acquire(blocking=False):
                     return {"ok": False, "error": "busy"}          # no new decisions while a change is running
@@ -93,12 +94,12 @@ class BrokerService:
                 except LedgerError as refused:
                     return {"ok": False, "error": refused.code}
                 return {"ok": True, "request_id": entry["request_id"], "snapshot_id": entry["snapshot_id"]}
-            if op in ("install", "rollback", "deny"):
+            if op in ("install", "rollback", "upgrade", "deny"):
                 if not self._busy.acquire(blocking=False):
                     return {"ok": False, "error": "busy"}          # one change at a time
                 try:
                     method = {"install": self.executor.install, "rollback": self.executor.rollback,
-                              "deny": self.executor.deny}[op]
+                              "upgrade": self.executor.upgrade, "deny": self.executor.deny}[op]
                     result = method(message.get("payload"), message.get("proof"), message.get("challenge"))
                 finally:
                     self._busy.release()
@@ -229,6 +230,9 @@ class BrokerClient:
 
     def rollback(self, payload, proof, challenge):
         return self._ask({"op": "rollback", "payload": payload, "proof": proof, "challenge": challenge})["result"]
+
+    def upgrade(self, payload, proof, challenge):
+        return self._ask({"op": "upgrade", "payload": payload, "proof": proof, "challenge": challenge}, 600)["result"]
 
     def deny(self, payload, proof, challenge):
         return self._ask({"op": "deny", "payload": payload, "proof": proof, "challenge": challenge}, 60)["result"]

@@ -33,6 +33,10 @@ VIEW_LIFETIME = 600
 MAX_VIEWS = 64
 
 
+class _PreflightFailed(Exception):
+    pass
+
+
 class ApprovalError(Exception):
     def __init__(self, code):
         super().__init__(code)
@@ -48,7 +52,7 @@ class ApprovalFlow:
     ``exchange``: callable(code, code_verifier) -> Auth0 ID token string.
     ``authorize``: dict(endpoint, client_id, redirect_uri)."""
 
-    def __init__(self, *, store, broker, exchange, authorize, clock=time.time, background=False):
+    def __init__(self, *, store, broker, exchange, authorize, clock=time.time, background=False, before_run=None):
         if (type(authorize) is not dict or type(authorize.get("endpoint")) is not str
                 or not authorize["endpoint"].startswith("https://")
                 or type(authorize.get("redirect_uri")) is not str
@@ -57,6 +61,7 @@ class ApprovalFlow:
             raise ValueError("authorize needs an https endpoint, a client_id and an https (or loopback) redirect_uri")
         self.store, self.broker, self.exchange, self.authorize = store, broker, exchange, dict(authorize)
         self.clock, self._lock = clock, threading.Lock()
+        self.before_run = before_run          # optional owner-side step (e.g. an owner-state backup) before an upgrade runs
         # background=True: the install runs on ONE worker thread, so the approval page and its other requests
         # stay responsive during a long install. Progress is the request's durable state (running -> done...).
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stynpilot-approve") if background else None
@@ -157,7 +162,10 @@ class ApprovalFlow:
                 return {"state": "denied", "request_id": rid, "recorded_by_installer": False,
                         "note": getattr(error, "code", "unavailable")}
             return {"state": "denied", "request_id": rid, "recorded_by_installer": bool(result.get("ok"))}
-        method = self.broker.rollback if payload.get("kind") == "rollback" else self.broker.install
+        wanted = {"rollback": "rollback", "upgrade": "upgrade"}.get(payload.get("kind"), "install")
+        method = getattr(self.broker, wanted, None)
+        if method is None:
+            return self._uncertain(rid)
         try:
             self.store.transition(rid, "approved", "running")
             if self._pool is not None:
@@ -171,9 +179,18 @@ class ApprovalFlow:
         """Run the approved action and settle the request's durable state. Never raises."""
         try:
             try:
+                if self.before_run is not None:
+                    try:
+                        self.before_run(payload, rid)
+                    except Exception:
+                        raise _PreflightFailed() from None
                 result = method(payload, id_token, challenge)
+            except _PreflightFailed:
+                result = {"ok": False, "stopped": "owner_state_backup_failed", "changed_anything": False}
             except Exception as error:
-                result = self._after_error(rid, error)
+                result = self._after_error(rid, error, payload.get("kind"))
+            if result.get("pending"):
+                return {"state": "running", "request_id": rid, "ok": None}   # settled later from the installer's record
             state_ = self._state_for(result)
             self.store.transition(rid, "running", state_, result=result)
             return {"state": state_, "request_id": rid, "ok": bool(result.get("ok"))}
@@ -205,12 +222,16 @@ class ApprovalFlow:
             return "needs_owner_intervention"
         return "done" if result.get("ok") else "failed"
 
-    def _after_error(self, rid, error):
+    def _after_error(self, rid, error, kind=None):
         """The installer call raised. A refusal code alone proves nothing (the installer may have installed
         packages and then failed to save its result), so ask the installer's own durable record:
         no run recorded -> verified nothing ran; a finished record -> its real result; anything else
         (still 'running', unreachable, unknown) -> the owner must verify."""
         code = getattr(error, "code", None)
+        if kind == "upgrade":
+            seen, record = self._root_record(rid)
+            if seen == "record" and (record or {}).get("state") == "running":
+                return {"ok": None, "pending": True}       # the upgrade worker is running; its result settles this
         result = self._root_result(rid)
         if result.get("stopped") == "installer_never_received_it":
             stopped = code if code and code != "installer_unavailable" else "installer_never_received_it"

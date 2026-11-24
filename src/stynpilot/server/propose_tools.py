@@ -20,7 +20,9 @@ from datetime import datetime, timedelta, timezone
 
 from mcp.types import ToolAnnotations
 
-from .. import catalog, impact
+import json
+
+from .. import catalog, impact, release
 from ..identity import TokenDenied
 from ..ledger import LedgerError
 from ..plan import PlanError
@@ -33,10 +35,11 @@ _LOG = logging.getLogger("stynpilot.propose")
 _SLUG = re.compile(r"[a-z][a-z0-9-]{0,47}\Z")
 _ROLLBACK_ID = re.compile(r"[a-f0-9]{16,64}\Z")
 REQUEST_TOOLS = ("commander_software_catalog", "commander_software_search", "commander_request_software_install",
-                 "commander_software_install_status", "commander_request_software_rollback")
+                 "commander_software_install_status", "commander_request_software_rollback",
+                 "commander_request_stynpilot_upgrade")
 # Tools that file or read requests need workspace.propose; search and the catalog list are read-only (GREEN).
 PROPOSE_ONLY_TOOLS = frozenset({"commander_request_software_install", "commander_software_install_status",
-                                "commander_request_software_rollback"})
+                                "commander_request_software_rollback", "commander_request_stynpilot_upgrade"})
 FILES_A_REQUEST = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 
@@ -74,7 +77,7 @@ class ProposeGate:
 
 
 def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt=None, approval_url=None, clock=None,
-             analyze_apt=None, installed_apt=None, search_apt=None):
+             analyze_apt=None, installed_apt=None, search_apt=None, fetch_release=None, installed_version=None, release_keys=None):
     """Add the request tools. ``bearer()`` returns the verified request's bearer header or None."""
     gate = ProposeGate(router=router, clients=clients)
     now = clock or (lambda: datetime.now(timezone.utc))
@@ -232,6 +235,45 @@ def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt
             return _error(denied.code)
         except Exception as error:
             _LOG.warning("rollback request failed type=%s", type(error).__name__)
+            return _error("request_refused")
+        return receipt(result)
+
+    @server.tool(name="commander_request_stynpilot_upgrade", title="Ask the owner to approve a StyNpilot upgrade",
+                 annotations=FILES_A_REQUEST,
+                 description=("Ask the owner to approve upgrading StyNpilot itself to a published, SIGNED release "
+                              "(version like 0.1.0~dev5). StyNpilot downloads the release manifest from the project's "
+                              "fixed release address, checks its signature against keys it already trusts, and files the "
+                              "request; the owner sees the version, checksum and signing key on his phone and signs in to "
+                              "approve. After approval StyNpilot backs up, installs, restarts, checks itself and "
+                              "automatically rolls back if anything fails. You cannot approve, and cannot choose the "
+                              "download address or the key."))
+    def request_upgrade(device_id: str, version: str) -> dict:
+        try:
+            proposer, owner = guarded(device_id)
+            if fetch_release is None or installed_version is None:
+                return _error("upgrade_not_available")
+            tag = release.tag_for_version(version)
+            manifest_url, signature_url = release.manifest_urls(tag)
+            try:
+                manifest = json.loads(fetch_release(manifest_url, release.MAX_MANIFEST_BYTES).decode("utf-8"))
+                signature = fetch_release(signature_url, 1024).decode("ascii").strip()
+                key = release.verify(manifest, signature, release_keys or release.load_trusted_keys())
+            except (ValueError, UnicodeError):
+                return _error("release_manifest_unreadable")
+            if manifest["tag"] != tag or manifest["version"].replace("~", "-") != version.replace("~", "-"):
+                return _error("release_does_not_match_requested_version")
+            installed = installed_version()
+            expires = now() + timedelta(hours=1)
+            payload = {"kind": "upgrade", "software": "stynpilot-self", "owner": owner, "device": device_id,
+                       "manifest": manifest, "signature": signature,
+                       "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            summary = release.summary_lines(manifest, key, installed)
+            result, _ = store.submit(kind="upgrade", software="stynpilot-self", device=device_id, owner=owner,
+                                     proposer=proposer, payload=payload, summary=summary, expires=expires.timestamp())
+        except (ClientDenied, RequestError, release.ReleaseError) as denied:
+            return _error(denied.code)
+        except Exception as error:
+            _LOG.warning("upgrade request failed type=%s", type(error).__name__)
             return _error("request_refused")
         return receipt(result)
 

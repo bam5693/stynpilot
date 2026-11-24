@@ -59,7 +59,7 @@ def _bearer():
     return "Bearer " + raw
 
 
-def create_server(*, router, resource_url, allowed_hosts=None, propose=None):
+def create_server(*, router, resource_url, allowed_hosts=None, propose=None, diag=None):
     """``propose``: optional dict(clients=EnrolledClients, store=RequestStore, resolve_apt=..., approval_url=...)
     that adds the YELLOW request tools. Without it the server is read-only."""
     if not isinstance(router, ReadRouter):
@@ -85,6 +85,7 @@ def create_server(*, router, resource_url, allowed_hosts=None, propose=None):
     server = FastMCP(
         name="StyNpilot",
         instructions=("Read the paired computer's health and the status of StyNpilot-installed software"
+                      + (", plus diagnostics, service logs and protected text-file reads" if diag else "")
                       + (", and ask the owner to approve catalog software installs or rollbacks" if propose else "")
                       + ". This server cannot approve anything; the owner approves separately on his phone."),
         auth=AuthSettings(issuer_url=router.tokens.issuer, resource_server_url=exact,
@@ -145,6 +146,10 @@ def create_server(*, router, resource_url, allowed_hosts=None, propose=None):
                 _LOG.warning("service_status_internal_failure type=%s", type(error).__name__)
                 return {"ok": False, "error": "service_status_temporarily_unavailable"}
             return {"ok": True, "device_id": device_id, "scope": READ_SCOPE, "status": report}
+
+    if diag is not None:
+        from .diag_tools import register as register_diag
+        register_diag(server, router=router, bearer=_bearer, **diag)
 
     if propose is not None:
         from .propose_tools import register

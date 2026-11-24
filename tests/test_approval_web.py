@@ -49,13 +49,24 @@ class WebTests(unittest.TestCase):
         self.assertIn("exact version 3.3.0-4build1", reply.text)
         self.assertIn("not a full system snapshot", reply.text)
         self.assertIn(rid[:12], reply.text)
-        for header, value in (("cache-control", "no-store"), ("x-frame-options", "DENY"), ("referrer-policy", "no-referrer")):
+        for header, value in (("cache-control", "no-store"), ("x-frame-options", "DENY"), ("referrer-policy", "same-origin")):
             self.assertEqual(reply.headers[header], value)
         self.assertIn("frame-ancestors 'none'", reply.headers["content-security-policy"])
         cookie = reply.headers["set-cookie"].lower()
         for part in ("httponly", "secure", "samesite=lax", "path=/approve"):
             self.assertIn(part, cookie)
         self.assertEqual(self.machine.changes(), [])
+
+    def test_a_real_browser_form_post_is_accepted(self):
+        """Regression (live Android Chrome got a bare 'Refused.' on Approve): browsers send the literal Origin 'null' on a form
+        POST when the page's Referrer-Policy is no-referrer. Send what a browser would send for the page's actual policy."""
+        payload, rid = self.file()
+        reply, fields = self.open(rid)
+        policy = reply.headers.get("referrer-policy", "")
+        self.assertNotEqual(policy, "no-referrer")
+        browser_origin = "null" if policy == "no-referrer" else "https://" + HOST
+        self.assertNotEqual(self.choose(fields, "approve", origin=browser_origin).status_code, 403)
+        self.assertEqual(self.choose(fields, "approve", origin="null").status_code, 403)   # old browser behaviour stays refused
 
     def test_full_approve_flow_through_the_browser_steps(self):
         payload, rid = self.file()

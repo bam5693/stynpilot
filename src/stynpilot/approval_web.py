@@ -46,7 +46,7 @@ def _page(title, body, status=200, extra_origin=""):
     response.headers["Content-Security-Policy"] = ("default-src 'none'; style-src 'unsafe-inline'; "
                                                    "form-action 'self' %s; frame-ancestors 'none'" % extra_origin)
     response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Referrer-Policy"] = "same-origin"
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response
 

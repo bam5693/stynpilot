@@ -14,6 +14,7 @@ public resource URL.
 """
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
@@ -60,12 +61,110 @@ def www_authenticate(resource):
 PROPOSE_SCOPES = frozenset({"health.read", "workspace.propose"})
 
 
+MAX_STEP_UP_BODY = 262144
+
+
+class ScopeChallenge:
+    """ASGI wrapper that makes the OAuth challenge say which scopes the endpoint needs (RFC 6750 ``scope``).
+
+    ChatGPT chooses its scopes from the challenge, not from ``scopes_supported``; the SDK's challenge names none, so a
+    connector could be authorized with health.read only. Two additions, both purely informational:
+    1. every ``WWW-Authenticate: Bearer`` the endpoint sends also carries ``scope="..."``;
+    2. a tools/call for a request tool made with a token that VERIFIES but lacks workspace.propose gets an HTTP 403
+       ``insufficient_scope`` challenge naming the scopes, so the client can ask the owner for them (step-up).
+    It never admits anything: tokens are still verified by the SDK and every tool still runs its own checks. On any
+    doubt (bad body, bad token, unknown host, big body) the request passes through unchanged.
+    """
+
+    def __init__(self, app, *, scopes, resource, hosts, tokens, guarded_tools):
+        self.app, self.resource, self.hosts, self.tokens = app, resource, frozenset(hosts), tokens
+        self.scope_text = " ".join(sorted(scopes))
+        self.guarded = frozenset(guarded_tools)
+        self.path = urlsplit(resource).path
+        self.metadata = metadata_url(resource)
+
+    def _challenge(self, error=None, description=None):
+        parts = []
+        if error:
+            parts += ['error="%s"' % error, 'error_description="%s"' % description]
+        parts += ['resource_metadata="%s"' % self.metadata, 'scope="%s"' % self.scope_text]
+        return "Bearer " + ", ".join(parts)
+
+    def _needs_step_up(self, scope, body):
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        host = headers.get(b"host", b"").decode("latin-1").lower()
+        auth = headers.get(b"authorization", b"").decode("latin-1")
+        if host not in self.hosts or not auth.startswith("Bearer "):
+            return False
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            return False
+        messages = data if isinstance(data, list) else [data]
+        called = set()
+        for message in messages[:32]:
+            if isinstance(message, dict) and message.get("method") == "tools/call":
+                params = message.get("params")
+                name = params.get("name") if isinstance(params, dict) else None
+                if isinstance(name, str):
+                    called.add(name)
+        if not called & self.guarded:
+            return False
+        try:
+            who = self.tokens.authorize(auth, required_scope="health.read")
+        except Exception:                    # an unverifiable token is the SDK's to refuse (plain 401)
+            return False
+        return "workspace.propose" not in (getattr(who, "scopes", None) or ())
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def tell(message):
+            if message["type"] == "http.response.start":
+                headers = []
+                for key, value in message.get("headers", []):
+                    if key.lower() == b"www-authenticate" and b"scope=" not in value:
+                        value = value + b', scope="' + self.scope_text.encode() + b'"'
+                    headers.append((key, value))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        if scope["method"] == "POST" and scope["path"] == self.path and self.guarded:
+            held, body, more = [], b"", True
+            while more:
+                message = await receive()
+                held.append(message)
+                if message["type"] != "http.request":
+                    break
+                body += message.get("body", b"")
+                more = message.get("more_body", False)
+                if len(body) > MAX_STEP_UP_BODY:
+                    body, more = None, True            # too big to judge: pass through untouched
+                    break
+            if body is not None and not more and self._needs_step_up(scope, body):
+                reply = json.dumps({"error": "insufficient_scope",
+                                    "error_description": "Required scope: workspace.propose"}).encode()
+                await send({"type": "http.response.start", "status": 403, "headers": [
+                    (b"content-type", b"application/json"), (b"content-length", str(len(reply)).encode()),
+                    (b"www-authenticate", self._challenge("insufficient_scope",
+                                                          "Required scope: workspace.propose").encode())]})
+                return await send({"type": "http.response.body", "body": reply})
+            queue = list(held)
+
+            async def replay():
+                return queue.pop(0) if queue else await receive()
+            return await self.app(scope, replay, tell)
+        return await self.app(scope, receive, tell)
+
+
 def build_app(*, router, public_host, port, scopes=None, propose=None):
     """The ASGI app: MCP at /mcp plus its metadata document, both host-checked."""
     from starlette.responses import JSONResponse
     from starlette.routing import Route
 
     from .app import create_server
+    from .propose_tools import PROPOSE_ONLY_TOOLS
 
     public_host = check_public_host(public_host)
     resource = "https://%s/mcp" % public_host
@@ -82,7 +181,8 @@ def build_app(*, router, public_host, port, scopes=None, propose=None):
         return JSONResponse(document, headers={"Cache-Control": "no-store"})
 
     app.routes.insert(0, Route(urlsplit(metadata_url(resource)).path, metadata, methods=["GET"]))
-    return app
+    return ScopeChallenge(app, scopes=scopes, resource=resource, hosts=allowed, tokens=router.tokens,
+                          guarded_tools=PROPOSE_ONLY_TOOLS if "workspace.propose" in scopes else frozenset())
 
 
 @dataclass

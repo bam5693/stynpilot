@@ -228,8 +228,21 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(call(self.token(scope=both, azp="not-enrolled"), "commander_request_software_install",
                               {"device_id": DEVICE, "software": "htop"}),
                          {"ok": False, "error": "client_not_enrolled_or_revoked"})
-        self.assertEqual(call(self.token(scope="health.read"), "commander_request_software_install",
-                              {"device_id": DEVICE, "software": "htop"}), {"ok": False, "error": "insufficient_scope_workspace_propose"})
+        # dev3: a genuine health-only token gets a standard HTTP step-up challenge naming the scopes (not a tool result)
+        denied = client.post("/mcp", headers={**MCP_HEADERS, "Authorization": self.token(scope="health.read")}, json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "commander_request_software_install", "arguments": {"device_id": DEVICE, "software": "htop"}}})
+        self.assertEqual(denied.status_code, 403)
+        self.assertIn('error="insufficient_scope"', denied.headers["www-authenticate"])
+        self.assertIn('scope="health.read workspace.propose"', denied.headers["www-authenticate"])
+        # ...and it still reads (health) and searches (GREEN) with that token
+        self.assertEqual(client.post("/mcp", headers={**MCP_HEADERS, "Authorization": self.token(scope="health.read")}, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "commander_software_catalog", "arguments": {}}}).status_code, 200)
+        # an unauthenticated call gets the plain 401 whose challenge names both scopes
+        plain = client.post("/mcp", headers=MCP_HEADERS, json={"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})
+        self.assertEqual(plain.status_code, 401)
+        self.assertIn('scope="health.read workspace.propose"', plain.headers["www-authenticate"])
 
 
 if __name__ == "__main__":

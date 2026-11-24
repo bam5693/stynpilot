@@ -34,6 +34,9 @@ _SLUG = re.compile(r"[a-z][a-z0-9-]{0,47}\Z")
 _ROLLBACK_ID = re.compile(r"[a-f0-9]{16,64}\Z")
 REQUEST_TOOLS = ("commander_software_catalog", "commander_software_search", "commander_request_software_install",
                  "commander_software_install_status", "commander_request_software_rollback")
+# Tools that file or read requests need workspace.propose; search and the catalog list are read-only (GREEN).
+PROPOSE_ONLY_TOOLS = frozenset({"commander_request_software_install", "commander_software_install_status",
+                                "commander_request_software_rollback"})
 FILES_A_REQUEST = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 

@@ -180,6 +180,19 @@ def _owner_can_edit(path, uid, gid):
 _DIAG = re.compile(r"DIAG ([a-z_]{1,32}) ([A-Za-z0-9_:=,.|;\-]{1,80}) ([A-Za-z0-9_:=,.|;\-]{0,200})")
 
 
+def clean_diagnostics(raw):
+    """Re-validate diagnostics wherever they cross a boundary: known check names, short safe tokens only, bounded count."""
+    out = {}
+    if isinstance(raw, dict):
+        for name, pair in raw.items():
+            if name in DIAG_NAMES and isinstance(pair, dict) and len(out) < 24:
+                text = "DIAG %s %s %s" % (name, pair.get("expected"), pair.get("actual"))
+                got = _DIAG.fullmatch(text)
+                if got:
+                    out[name] = {"expected": got.group(2), "actual": got.group(3)}
+    return out
+
+
 def _judge(lines, owner_ok, strict_limits=False):
     seen, diagnostics = {}, {}
     for line in lines:
@@ -197,10 +210,11 @@ def _judge(lines, owner_ok, strict_limits=False):
     passed = sorted(n for n, w in seen.items() if w == "PASS")
     need = REQUIRED + (OPTIONAL if strict_limits else ())
     failed = sorted({n for n in need if seen.get(n) != "PASS"} | {n for n in OPTIONAL if seen.get(n) == "FAIL"})
-    unverified = sorted(n for n in OPTIONAL if seen.get(n) in (None, "SKIP") and not strict_limits)
+    # A limit that could not be SEEN is "unverified" in every mode; under systemd (strict) it ALSO fails the gate.
+    unverified = sorted(n for n in OPTIONAL if seen.get(n) in (None, "SKIP"))
     if "limit_io" in OPTIONAL and strict_limits and "limit_io" in failed and diagnostics.get("limit_io", {}).get("expected") == "no_device":
         failed.remove("limit_io")                                   # no resolvable disk: the start gate already refuses jobs (fail closed)
-    return {"ok": not failed, "passed": passed, "failed": failed, "unverified": unverified, "diagnostics": diagnostics}
+    return {"ok": not failed, "passed": passed, "failed": failed, "unverified": unverified, "diagnostics": clean_diagnostics(diagnostics)}
 
 
 def _create_late_files(ws, uid, gid, delay):

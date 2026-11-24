@@ -30,6 +30,16 @@ state paths inaccessible). Tests: `tests/test_runner_core.py` (hostile folders, 
 S3b root-door job kinds (create runner user, enroll workspace, run, status, cancel, selftest) with approval and a job
 table; S3c MCP tools (workspace request, file edits inside workspaces, job run/status/output/cancel); S3d one-off command.
 
+## dev13: ChatGPT's review of dev12 (dae11c0): diagnostics must reach the assistants
+
+dev12 was never installed; dev13 replaces it. Reporting only: no limit, gate rule or confinement changed.
+
+- *Oversight fixed:* `Executor._safe_selftest` rebuilt the self-test answer from a fixed list of fields and dropped `diagnostics`, so neither `runner_status` nor `runner_selftest`
+  showed expected/actual values. It now passes them through `clean_diagnostics` (known check names only, short safe tokens, at most 24), which also re-validates whatever the state file holds.
+- *Unverified under systemd:* a limit that could not be seen is now listed in `unverified` in every mode. Under systemd (strict) it ALSO stays in `failed`, so the gate stays closed.
+- *Test of the whole path:* `tests/test_selftest_diagnostics_path.py` drives the real probe-line judge, the real `Executor` and the real MCP tools and checks the complete tool response
+  (diagnostics present, hostile or oversized entries removed, gate closed). It fails if the executor change is reverted.
+
 ## dev12: diagnostics for the live `limits` failure (dev11 live test: 13 of 14 checks passed)
 
 dev11 on the Ryzen passed every confinement check except `limits`, which was one compound check (pids, memory, file-size, /tmp size, write rate). A failure there could not say

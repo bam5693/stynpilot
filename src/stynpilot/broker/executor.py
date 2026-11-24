@@ -59,6 +59,7 @@ from .. import backup, release
 from . import apt
 from .. import runner as runner_policy
 from .jobs import JobError
+from .selftest import clean_diagnostics
 from .proof import ProofDenied, decision_nonce, render_summary, summary_hash
 from .upgrade import UpgradeRefused, Upgrader
 
@@ -407,6 +408,7 @@ class Executor:
     def _safe_selftest(state):
         return {"ok": state.get("ok") is True, "ran": bool(state.get("ran")), "passed": list(state.get("passed", [])),
                 "failed": list(state.get("failed", [])), "unverified": list(state.get("unverified", [])),
+                "diagnostics": clean_diagnostics(state.get("diagnostics")),
                 "version": str(state.get("version", ""))[:40], "at": state.get("at")}
 
     def runner_call(self, call, args):

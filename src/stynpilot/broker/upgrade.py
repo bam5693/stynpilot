@@ -317,7 +317,8 @@ class Upgrader:
                     "new_deb": str(new_deb), "new_sha256": hashlib.sha256(new_deb.read_bytes()).hexdigest(),
                     "old_deb": str(old_deb), "old_sha256": hashlib.sha256(old_deb.read_bytes()).hexdigest(),
                     "previous_copy": how, "installer_unit": "stynpilot-installer.service",
-                    "owner_unit": "stynpilot-owner.service", "owner_user": user, "socket_path": self.socket_path,
+                    "owner_unit": "stynpilot-owner.service", "owner_user": user, "owner_uid": pwd.getpwnam(user).pw_uid,
+                    "owner_gid": pwd.getpwnam(user).pw_gid, "socket_path": self.socket_path,
                     "restart_installer": bool(restart_installer), "restart_owner": bool(restart_owner),
                     "config_hashes": hashes, "doctor_command": doctor, "baseline_doctor_code": baseline,
                     "endpoint": endpoint, "baseline_endpoint_ok": baseline_endpoint_ok,
@@ -394,6 +395,55 @@ class Upgrader:
         if state == "done":
             self._keep(rid)
         self.ex.runs.finish(rid, state, result)
+
+    # -- 6. a stale "owner must look" record -------------------------------------------------------------
+    # Only a failure the installer can PROVE is over is ever released: the worker's own health check failed (not a
+    # crash, not a dpkg error, not an interrupted run), and right now every check below passes on the real machine.
+    RESOLVABLE = ("health_check_failed",)
+
+    def verify_recovered(self, rid):
+        """(True, checks) only if this failed upgrade left a package-consistent, healthy, unchanged-config machine."""
+        checks = {}
+        job = self.job_dir(rid)
+        try:
+            data = json.loads((job / "job.json").read_text())
+            result = json.loads((job / "result.json").read_text())
+            hashes, from_version = data["config_hashes"], data["from_version"]
+            if type(data) is not dict or type(result) is not dict or type(hashes) is not dict:
+                raise ValueError
+        except (OSError, ValueError, KeyError):
+            return False, {"job_record": False}
+        checks["failure_kind"] = result.get("ok") is False and result.get("stopped") in self.RESOLVABLE
+        checks["no_unfinished_change"] = result.get("rolled_back") is False and not job.is_symlink()
+        if not (checks["failure_kind"] and checks["no_unfinished_change"]):
+            return False, checks
+        try:
+            installed = self.installed_version()
+        except UpgradeRefused:
+            return False, dict(checks, installed=False)
+        checks["version_not_older_than_before_the_upgrade"] = self.version_ge(installed, from_version)
+        status = self._installed_field("db:Status-Status") or self._installed_field("Status")
+        checks["package_state_installed"] = status.split()[-1:] == ["installed"] or status == "installed"
+        audit_code, audit_out = self._run(["dpkg", *self.dpkg_extra, "--audit"], 60)
+        checks["package_database_clean"] = audit_code == 0 and not audit_out.strip()
+        checks["installer_service_active"] = (not data.get("restart_installer")) or self._is_active("system", data["installer_unit"])
+        checks["owner_service_active"] = (not data.get("restart_owner")) or self._is_active("user", data["owner_unit"])
+        same = True
+        for path, digest in hashes.items():
+            try:
+                same = same and hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest
+            except OSError:
+                same = False
+        checks["settings_unchanged"] = same
+        doctor = data.get("doctor_command")
+        if doctor:
+            code = self._run(doctor, 120)[0]
+            baseline = data.get("baseline_doctor_code", 0)
+            checks["doctor_not_worse"] = code == 0 or (baseline != 0 and code == baseline)
+        target = self._endpoint_target() if data.get("baseline_endpoint_ok") else None
+        if target:
+            checks["mcp_endpoint_answers"] = bool(self.endpoint_check(target))
+        return all(v is True for v in checks.values()), checks
 
     def _keep(self, rid):
         """After a good upgrade the exact package that ran becomes the next rollback source."""

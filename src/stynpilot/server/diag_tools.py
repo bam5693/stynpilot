@@ -95,8 +95,8 @@ def register(server, *, router, bearer, policy, diagnostics=None, limiter=None):
             unit, lines=lines, since=since, priority=priority or None, contains=contains or None))
 
     @server.tool(name="files_list", title="List a folder", annotations=READ_ONLY,
-                 description=("List one folder (names, types, sizes, times). Works in the owner's home, /etc, /var/log, /opt, "
-                              "/srv, /usr/local and /usr/share. Credential stores, keys, browser profiles and StyNpilot's "
+                 description=("List one folder (names, types, sizes, times). Works only in /var/log, a few system files under /etc and "
+                              "the project folders the owner has explicitly authorized. Credential stores, keys, browser profiles and StyNpilot's "
                               "own state are marked protected and cannot be read."))
     def files_list(device_id: str, path: str) -> dict:
         return guarded("files_list", device_id, lambda: safefs.list_dir(policy, path))

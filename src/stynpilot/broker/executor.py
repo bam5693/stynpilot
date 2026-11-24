@@ -169,7 +169,7 @@ class Executor:
         self.sources_root, self.file_root = sources_root, Path(file_root)
         self.runs = Runs(self.dir / "runs.sqlite3")
         self.ledger = InstallLedger(self.dir / "installs.sqlite3")
-        for sub in ("snapshots", "downloads", "attention"):
+        for sub in ("snapshots", "downloads", "attention", "attention-resolved"):
             (self.dir / sub).mkdir(exist_ok=True, mode=0o700)
         self.owner_uid = owner_uid
         self.upgrader = Upgrader(self, keys=release_keys, fetch=fetch_release, launch=launch_worker,
@@ -200,8 +200,45 @@ class Executor:
                 self.upgrader.reconcile(rid)
 
     def needs_attention(self):
-        """Durable records of runs that may have left the machine changed. New installs are refused while any exist."""
+        """Durable records of runs that may have left the machine changed. New installs are refused while any exist.
+        A record about a failed UPGRADE is first re-checked against the real machine (at most every 30 s): if the
+        failure is provably over, it is moved (never deleted) to ``attention-resolved`` with the proof attached."""
+        self._resolve_stale_attention()
         return sorted(p.name for p in (self.dir / "attention").glob("*.json"))
+
+    RESOLVE_EVERY = 30
+
+    def _resolve_stale_attention(self):
+        if not any((self.dir / "attention").glob("*.json")):
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_resolve_at", -1e9) < self.RESOLVE_EVERY:
+            return
+        self._resolve_at = now
+        for path in sorted((self.dir / "attention").glob("*.json")):
+            try:
+                record = json.loads(path.read_text())
+                rid = record["request_id"]
+                if path.is_symlink() or path.name != "%s.json" % rid or not self.upgrader.is_job(rid):
+                    continue
+                if record.get("reason") not in self.upgrader.RESOLVABLE:
+                    continue
+                ok, checks = self.upgrader.verify_recovered(rid)
+                if not ok:
+                    continue
+                record["resolution"] = {"resolved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                        "by": "installer_verification", "checks": checks,
+                                        "installed_version": self.upgrader.installed_version()}
+                target = self.dir / "attention-resolved" / path.name
+                fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                try:
+                    os.write(fd, json.dumps(record, sort_keys=True).encode())
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                path.unlink()                    # only after the audit copy is safely on disk
+            except (OSError, ValueError, KeyError, TypeError, UpgradeRefused):
+                continue                         # anything unclear: the record stays and the owner is still asked
 
     def _attention(self, rid, rollback_id, reason, detail):
         record = {"request_id": rid, "rollback_id": rollback_id, "reason": reason, "detail": detail,

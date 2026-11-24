@@ -369,14 +369,69 @@ class UpgradeTests(unittest.TestCase):
         self.executor.challenge(self.good("0.1.0~dev5"), "approve")          # a later request is allowed
 
     def test_an_unrecovered_failure_blocks_everything_until_the_owner_looks(self):
+        cfg = self.tmp / "installer.json"
+        cfg.write_text('{"owner":"x"}')
+        self.executor.upgrader.config_files = [str(cfg)]
         payload, go = self.attempt()
         go()
+        cfg.write_text('{"owner":"CHANGED"}')                   # the machine is NOT provably back as it was
         rid = request_id(payload)[0]
         self.finish_with(payload, {"ok": False, "stopped": "health_check_failed", "rolled_back": False,
                                    "needs_owner_intervention": True, "changed_anything": True})
         self.assertEqual(self.executor.status(rid)["state"], "needs_owner_intervention")
         self.assertEqual(len(self.executor.needs_attention()), 1)
         self.denied("owner_intervention_required", self.executor.challenge, self.good("0.1.0~dev5"), "approve")
+
+    def failed_unrecovered(self, **result):
+        payload, go = self.attempt()
+        go()
+        rid = request_id(payload)[0]
+        data = {"ok": False, "stopped": "health_check_failed", "rolled_back": False, "needs_owner_intervention": True,
+                "changed_anything": True}
+        data.update(result)
+        self.finish_with(payload, data)
+        self.assertEqual(self.executor.status(rid)["state"], "needs_owner_intervention")
+        return rid
+
+    def test_a_stale_health_check_failure_is_released_only_after_the_real_machine_proves_healthy_and_is_kept_for_audit(self):
+        rid = self.failed_unrecovered()                           # the dev5 shape: probe failed, machine actually fine
+        record = json.loads((self.tmp / ("broker/attention/%s.json" % rid)).read_text())
+        self.assertEqual(self.executor.needs_attention(), [])
+        self.assertFalse((self.tmp / ("broker/attention/%s.json" % rid)).exists())
+        kept = json.loads((self.tmp / ("broker/attention-resolved/%s.json" % rid)).read_text())
+        for key, value in record.items():                         # the original record is preserved word for word
+            self.assertEqual(kept[key], value)
+        self.assertEqual(kept["resolution"]["by"], "installer_verification")
+        self.assertTrue(all(v is True for v in kept["resolution"]["checks"].values()), kept["resolution"])
+        self.assertEqual(self.executor.runs.status(rid)["state"], "needs_owner_intervention")   # the run history is untouched
+        self.executor.challenge(self.good("0.1.0~dev5"), "approve")                                # and upgrades work again
+
+    def test_a_record_is_not_released_while_any_check_fails_and_the_check_is_repeated_later(self):
+        cfg = self.tmp / "installer.json"
+        cfg.write_text('{"owner":"x"}')
+        self.executor.upgrader.config_files = [str(cfg)]
+        payload, go = self.attempt()
+        go()
+        rid = request_id(payload)[0]
+        self.finish_with(payload, {"ok": False, "stopped": "health_check_failed", "rolled_back": False,
+                                   "needs_owner_intervention": True, "changed_anything": True})
+        self.executor.status(rid)
+        cfg.write_text('{"owner":"CHANGED"}')
+        self.assertEqual(len(self.executor.needs_attention()), 1)
+        cfg.write_text('{"owner":"x"}')
+        self.assertEqual(len(self.executor.needs_attention()), 1)            # rate limited: not re-checked at once
+        self.executor._resolve_at = -1e9
+        self.assertEqual(self.executor.needs_attention(), [])
+
+    def test_other_kinds_of_attention_are_never_released_automatically(self):
+        for stopped in ("restart_failed", "upgrade_worker_vanished_without_a_result", "dpkg_install_failed"):
+            self.setUp()
+            rid = self.failed_unrecovered(stopped=stopped)
+            self.assertEqual(len(self.executor.needs_attention()), 1, stopped)
+            self.assertTrue((self.tmp / ("broker/attention/%s.json" % rid)).exists())
+        self.setUp()
+        rid = self.failed_unrecovered(rolled_back=True)                      # claims a rollback: not this path's business
+        self.assertEqual(len(self.executor.needs_attention()), 1)
 
     def test_after_the_installer_restarts_a_finished_upgrade_is_settled_not_blamed_on_the_restart(self):
         payload, go = self.attempt()
@@ -545,7 +600,7 @@ class WorkerTests(unittest.TestCase):
             self.clock[0] += 1.0
             return self.clock[0]
         extra = {"endpoint": endpoint_fn} if endpoint_fn else {}
-        worker = Worker(job, run=self.system, answers=answers if callable(answers) else (lambda p: answers),
+        worker = Worker(job, run=self.system, answers=answers if callable(answers) else (lambda p, *a: answers),
                         sleep=lambda s: None, monotonic=tick, **extra)
         return worker.execute()
 
@@ -577,7 +632,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.system.version, "0.1.0~dev3")
 
     def test_an_installer_that_never_answers_triggers_rollback(self):
-        result = self.run_job(answers=lambda p: self.system.version == "0.1.0~dev3", health_wait=6)   # only the OLD one answers
+        result = self.run_job(answers=lambda p, *a: self.system.version == "0.1.0~dev3", health_wait=6)   # only the OLD one answers
         self.assertEqual((result["ok"], result["stopped"], result["rolled_back"]), (False, "health_check_failed", True))
         self.assertEqual(self.system.version, "0.1.0~dev3")
 

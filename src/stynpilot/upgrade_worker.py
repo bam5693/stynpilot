@@ -72,16 +72,32 @@ def endpoint_answers(target, timeout=10):
         return False
 
 
-def socket_answers(path, timeout=5):
-    """The installer's own door answers a harmless status question. Proves the NEW installer is up."""
+_PROBE = (
+    "import json,socket,sys\n"
+    "try:\n"
+    "    c=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);c.settimeout(float(sys.argv[2]));c.connect(sys.argv[1])\n"
+    "    c.sendall(json.dumps({'op':'status','request_id':'0'*64}).encode()+b'\\n')\n"
+    "    r=json.loads(c.recv(65536).split(b'\\n',1)[0].decode())\n"
+    "    sys.exit(0 if r.get('ok') is True else 1)\n"
+    "except (OSError,ValueError):\n"
+    "    sys.exit(1)\n")
+
+
+def socket_answers(path, uid=None, gid=None, timeout=5):
+    """The installer's own door answers a harmless status question. Proves the NEW installer is up.
+
+    The installer admits ONLY the enrolled owner (kernel-checked SO_PEERCRED), and must keep doing so. So the
+    worker, which runs as root, asks AS THE OWNER: a short-lived child process drops to the owner's uid/gid (no
+    supplementary groups) before it connects. Nothing about the installer's permissions is widened.
+    """
+    if uid is None or gid is None:
+        return False                               # never guess an identity; no owner identity = not proven
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-            conn.settimeout(timeout)
-            conn.connect(path)
-            conn.sendall(json.dumps({"op": "status", "request_id": "0" * 64}).encode() + b"\n")
-            reply = json.loads(conn.recv(65536).split(b"\n", 1)[0].decode())
-        return reply.get("ok") is True
-    except (OSError, ValueError):
+        done = subprocess.run([sys.executable, "-I", "-c", _PROBE, path, str(timeout)], timeout=timeout + 5, env=ENV,
+                              user=int(uid), group=int(gid), extra_groups=[], capture_output=True, check=False,
+                              stdin=subprocess.DEVNULL, cwd="/")
+        return done.returncode == 0
+    except (OSError, ValueError, subprocess.SubprocessError):
         return False
 
 
@@ -149,7 +165,8 @@ class Worker:
             if self.installed_version() != expected_version:
                 why = "wrong_version_installed"
             elif self.job["restart_installer"] and not (self.is_active("system", self.job["installer_unit"])
-                                                        and self.answers(self.job["socket_path"])):
+                                                        and self.answers(self.job["socket_path"], self.job.get("owner_uid"),
+                                                                         self.job.get("owner_gid"))):
                 why = "installer_not_answering"
             elif self.job["restart_owner"] and not self.is_active("user", self.job["owner_unit"]):
                 why = "owner_service_not_running"

@@ -30,8 +30,17 @@ _TOKENS = (
 _URL_PASSWORD = re.compile(r"(?i)\b([a-z][a-z0-9+.-]{1,15}://[^\s/:@]{1,80}:)([^\s/@]{1,200})(@)")
 _ASSIGNMENT = re.compile(
     r"(?i)\b((?:[a-z0-9_.-]*?)(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|"
-    r"private[_-]?key|client[_-]?secret|credential|authorization|auth[_-]?token)[a-z0-9_.-]*)([ \t]*[:=][ \t]*)"
-    r"(\"[^\"\n]{1,300}\"|'[^'\n]{1,300}'|[^\s\"',;]{1,300})")
+    r"private[_-]?key|client[_-]?secret|credential|authorization|auth[_-]?token)[a-z0-9_.-]*[\"']?)([ \t]*[:=][ \t]*)"
+    r"(\"(?:[^\"\\\n]|\\.){1,300}\"|'(?:[^'\\\n]|\\.){1,300}'|[^\s\"',;]{1,300})")
+# Command-line flags such as ``--password hunter2`` or ``--token=abc`` (logs and process lists show these).
+_FLAG = re.compile(r"(?i)(--?[a-z0-9-]*(?:password|passwd|passphrase|secret|token|api-?key|access-?key|credential)[a-z0-9-]*)"
+                   r"([ \t=]+)(\"(?:[^\"\\\n]|\\.){1,300}\"|'[^'\n]{1,300}'|[^\s\"',;-][^\s\"',;]{0,299})")
+# YAML block scalars: ``password: |`` followed by indented secret lines.
+_BLOCK_SCALAR = re.compile(r"(?im)^([ \t]*[a-z0-9_.-]*(?:password|secret|token|private[_-]?key|credential|api[_-]?key)[a-z0-9_.-]*"
+                           r"[ \t]*:[ \t]*[|>][-+]?[ \t]*\n)((?:[ \t]+[^\n]*\n?)+)")
+# Two or more consecutive long base64-only lines look like key material (a key cut off from its BEGIN line).
+_KEY_BODY = re.compile(r"(?m)(?:^[ \t]*(?![0-9a-fA-F]+[ \t]*$)[A-Za-z0-9+/]{40,}={0,2}[ \t]*\n){2,}(?:^[ \t]*[A-Za-z0-9+/]{1,}={0,2}[ \t]*$)?")
+_STRAY_END = re.compile(r"\A.*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----", re.S)
 _CANDIDATE = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
 _PLACEHOLDER = re.compile(r"(?i)^(?:|\*+|x+|null|none|true|false|changeme|change-me|example|your[-_ ].*|<.*>|\$\{?.*|%\(.*|"
                           r"\[redacted.*|todo|redacted)$")
@@ -65,12 +74,24 @@ def redact(text):
 
     text = sub("private-key", _PRIVATE_BLOCK, text)
     text = sub("private-key", _PGP_BLOCK, text)
+    text = sub("private-key", _STRAY_END, text)            # the BEGIN line was cut off: nothing before END is safe
     for kind, pattern in _TOKENS:
         if kind == "bearer":
             text = sub(kind, pattern, text, lambda m: m.group(1) + " " + MARK % kind)
         else:
             text = sub(kind, pattern, text)
     text = sub("url-password", _URL_PASSWORD, text, lambda m: m.group(1) + MARK % "url-password" + m.group(3))
+
+    text = sub("secret-assignment", _BLOCK_SCALAR, text, lambda m: m.group(1) + "  " + MARK % "secret-assignment" + "\n")
+    text = sub("key-material", _KEY_BODY, text)
+
+    def flag(match):
+        bare = match.group(3).strip("\"'")
+        if _PLACEHOLDER.fullmatch(bare) or bare.startswith("[REDACTED"):
+            return match.group(0)
+        found["secret-assignment"] += 1
+        return match.group(1) + match.group(2) + MARK % "secret-assignment"
+    text = _FLAG.sub(flag, text)
 
     def assignment(match):
         value = match.group(3)
@@ -98,6 +119,6 @@ def mostly_secret(original_length, clean_text, found):
         return False
     removed = sum(len(m) for m in re.findall(r"\[REDACTED:[a-z-]+\]", clean_text))
     marks = sum(found.values())
-    if found.get("private-key"):
+    if found.get("private-key") or found.get("key-material"):
         return True
     return marks >= 8 and removed * 2 >= max(1, len(clean_text))

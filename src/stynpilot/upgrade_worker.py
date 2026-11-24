@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -75,10 +76,14 @@ class Worker:
         self.job, self.run, self.answers, self.sleep, self.monotonic, self.hash_file = job, run, answers, sleep, monotonic, hash_file
         self.dir = job["job_dir"]
         self.notes = []
+        self.touched = False             # True from the moment we ask dpkg to change the installed package
 
     # -- plumbing ---------------------------------------------------------------------------------------
     def state(self, name):
-        write_json(os.path.join(self.dir, "state.json"), {"step": name, "at": int(time.time())})
+        try:
+            write_json(os.path.join(self.dir, "state.json"), {"step": name, "at": int(time.time())})
+        except OSError:
+            pass                                          # progress notes must never stop an upgrade or a rollback
 
     def note(self, text):
         self.notes.append(text[:200])
@@ -183,23 +188,56 @@ class Worker:
         return None
 
     def roll_back(self, reason):
+        """Reinstall the saved previous package. ``rolled_back`` is True ONLY when dpkg reinstalled it, the
+        services restarted and the health checks passed on the old version; anything less asks for the owner."""
         self.state("rolling_back")
-        code, out = self.dpkg(["-i", "--force-downgrade", "--force-confold", self.job["old_deb"]])
-        if code != 0:
-            self.note("dpkg could not reinstall the previous package")
-        self.restart_services()
-        restored = self.healthy(self.job["from_version"])
+        self.touched = True
+        installed = restarted = healthy = False
+        try:
+            code, out = self.dpkg(["-i", "--force-downgrade", "--force-confold", self.job["old_deb"]])
+            installed = code == 0
+            if not installed:
+                self.note("dpkg could not reinstall the previous package")
+        except Exception as error:
+            self.note("rollback install error: %s" % type(error).__name__)
+        try:
+            restarted = bool(self.restart_services())
+            healthy = bool(self.healthy(self.job["from_version"]))
+        except Exception as error:
+            self.note("rollback check error: %s" % type(error).__name__)
+        restored = installed and restarted and healthy
         return {"ok": False, "stopped": reason, "rolled_back": restored, "changed_anything": True,
                 "from_version": self.job["from_version"], "to_version": self.job["to_version"],
                 "needs_owner_intervention": not restored, "notes": self.notes}
 
     def execute(self):
+        """Run the upgrade. An unexpected error never ends the run silently: once the package may have been
+        modified, a verified rollback is attempted; before that nothing was changed."""
+        try:
+            return self._execute()
+        except Exception as error:
+            reason = "unexpected_%s" % type(error).__name__
+            self.note("unexpected error: %s" % type(error).__name__)
+            if self.touched:
+                try:
+                    return self.roll_back(reason)
+                except Exception:
+                    pass
+                return {"ok": False, "stopped": reason, "rolled_back": False, "changed_anything": True,
+                        "needs_owner_intervention": True, "from_version": self.job.get("from_version"),
+                        "to_version": self.job.get("to_version"), "notes": self.notes}
+            return {"ok": False, "stopped": reason, "rolled_back": False, "changed_anything": False,
+                    "from_version": self.job.get("from_version"), "to_version": self.job.get("to_version"),
+                    "notes": self.notes}
+
+    def _execute(self):
         self.state("checking_inputs")
         problem = self.verify_inputs()
         if problem:
             return {"ok": False, "stopped": problem, "changed_anything": False, "rolled_back": False,
                     "from_version": self.job["from_version"], "to_version": self.job["to_version"], "notes": self.notes}
         self.state("installing")
+        self.touched = True                                   # from here on a failure must be rolled back
         code, out = self.dpkg(["-i", "--force-confold", self.job["new_deb"]])
         if code != 0:
             self.note("dpkg refused the new package")
@@ -221,6 +259,10 @@ def main(argv=None):
     with open(os.path.join(job_dir, "job.json")) as handle:
         job = json.load(handle)
     job["job_dir"] = job_dir
+
+    def stopped(signum, frame):                       # a stop request mid-upgrade becomes a verified rollback
+        raise RuntimeError("stopped_by_signal_%d" % signum)
+    signal.signal(signal.SIGTERM, stopped)
     try:
         result = Worker(job).execute()
     except Exception as error:                         # never leave without a recorded outcome

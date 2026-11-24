@@ -163,14 +163,18 @@ class Diagnostics:
             raise DiagnosticsError("logs_unavailable")
         if "insufficient permissions" in text.lower():
             raise DiagnosticsError("journal_permission_denied")
-        rows = text.splitlines()
+        # Redact the WHOLE output first, then filter: filtering raw rows would let a caller probe for a secret's
+        # value (does a row containing this guess exist?), and cutting rows first could split a multi-row key.
+        clean_all, found = redact.redact(text)
+        if redact.mostly_secret(len(text), clean_all, found):
+            raise DiagnosticsError("logs_withheld_contain_secrets")
+        rows = clean_all.splitlines()
         if contains:
             needle = contains.lower()
             rows = [r for r in rows if needle in r.lower()]
         rows = rows[-lines:]
-        body = "\n".join(rows)
-        if len(body.encode("utf-8", "replace")) > MAX_LOG_BYTES:
-            body = body.encode("utf-8", "replace")[-MAX_LOG_BYTES:].decode("utf-8", "replace")
-        clean, found = redact.redact(body)
+        while rows and sum(len(r.encode("utf-8", "replace")) + 1 for r in rows) > MAX_LOG_BYTES:
+            rows = rows[1:]                                    # drop whole oldest rows, never cut one in half
+        clean = "\n".join(rows)
         return {"unit": unit, "lines_returned": len(clean.splitlines()), "text": clean, "redactions": found,
                 "note": UNTRUSTED}

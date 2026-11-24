@@ -38,6 +38,7 @@ OWNER_KEYS = {"issuer", "approval_client_id", "authorize_endpoint", "token_endpo
               "approval_port", "state_dir", "broker_socket", "pairing_db", "mcp_public_host", "mcp_port",
               "enrolled_clients"}
 PROVISIONED = ("requests.sqlite3", "revoked-clients.json", "token-revocations.sqlite3", "provisioned.json")
+PROJECT_ROOTS_FILE = "read-roots.json"        # optional, owner-private; absent = no project folders readable
 INSTALLER_KEYS = {"issuer", "approval_client_id", "owner", "device", "owner_uid", "state_dir", "socket_path"}
 
 
@@ -271,7 +272,9 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
                        fetch_release=release.https_get, installed_version=_installed_stynpilot_version)
         from . import safefs
         from .diagnostics import Diagnostics
-        diag = dict(policy=safefs.Policy(home=os.path.expanduser("~"),
+        home = os.path.expanduser("~")
+        diag = dict(policy=safefs.Policy(home=home,
+                                         project_roots=safefs.load_project_roots(state / PROJECT_ROOTS_FILE, home),
                                          extra_deny=[config.state_dir, config.pairing_db, config.broker_socket]),
                     diagnostics=Diagnostics())
         service.mcp = (start_mcp or run.start)(router=router, public_host=config.mcp_public_host,

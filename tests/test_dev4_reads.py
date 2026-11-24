@@ -69,7 +69,8 @@ class SafeFsTests(unittest.TestCase):
         (self.etc / "hosts").write_text("127.0.0.1 localhost\n")
         (self.outside / "secret.txt").write_text("outside\n")
         self.state = self.home / ".local/state/stynpilot"
-        self.policy = Policy(home=self.home, roots=(self.etc,), extra_deny=[self.etc / "shadow", self.state])
+        self.policy = Policy(home=self.home, roots=(self.etc,), project_roots=[self.home / "proj"],
+                             extra_deny=[self.etc / "shadow", self.state])
 
     def code(self, call, *args, **kw):
         with self.assertRaises(FileDenied) as caught:
@@ -83,9 +84,9 @@ class SafeFsTests(unittest.TestCase):
         self.assertEqual(safefs.read_text(self.policy, str(self.etc / "hosts"))["text"], "127.0.0.1 localhost\n")
 
     def test_protected_locations_names_and_binaries_are_refused(self):
-        for path, code in ((self.home / ".ssh/id_ed25519", "protected_location"),
-                           (self.home / ".config/stynpilot/owner.json", "protected_location"),
-                           (self.state / "requests.sqlite3", "protected_location"),
+        for path, code in ((self.home / ".ssh/id_ed25519", "outside_allowed_places"),
+                           (self.home / ".config/stynpilot/owner.json", "outside_allowed_places"),
+                           (self.state / "requests.sqlite3", "outside_allowed_places"),
                            (self.home / "proj/.env", "protected_file_name"),
                            (self.home / "proj/server.pem", "protected_file_name"),
                            (self.etc / "shadow", "protected_location"),
@@ -102,9 +103,9 @@ class SafeFsTests(unittest.TestCase):
         for name in ("link-key", "link-out", "link-shadow", "innocent.txt"):
             self.assertIn(self.code(safefs.read_text, str(self.home / "proj" / name)),
                           ("protected_location", "outside_allowed_places", "protected_file_name"), name)
-        self.assertIn(self.code(safefs.list_dir, str(self.home / "proj/link-dir")), ("protected_location",))
-        self.assertIn(self.code(safefs.read_text, str(self.home / "proj/link-dir/id_ed25519")), ("protected_location",))
-        self.assertIn(self.code(safefs.read_text, str(self.home / "proj/../.ssh/id_ed25519")), ("protected_location",))
+        self.assertIn(self.code(safefs.list_dir, str(self.home / "proj/link-dir")), ("protected_location", "outside_allowed_places"))
+        self.assertIn(self.code(safefs.read_text, str(self.home / "proj/link-dir/id_ed25519")), ("protected_location", "outside_allowed_places"))
+        self.assertIn(self.code(safefs.read_text, str(self.home / "proj/../.ssh/id_ed25519")), ("protected_location", "outside_allowed_places"))
 
     def test_a_path_swapped_for_a_link_after_the_check_is_not_followed(self):
         real = safefs.Policy.judge(self.policy, str(self.home / "proj/readme.txt"))
@@ -133,17 +134,17 @@ class SafeFsTests(unittest.TestCase):
         self.assertTrue(names[".env"].get("protected"))
         self.assertTrue(names["server.pem"].get("protected"))
         self.assertNotIn("protected", names["readme.txt"])
-        top = {e["name"]: e for e in safefs.list_dir(self.policy, str(self.home))["entries"]}
-        self.assertTrue(top[".ssh"].get("protected"))
-        self.assertTrue(safefs.list_dir(self.policy, str(self.home), limit=2)["truncated"])
+        self.assertTrue(safefs.list_dir(self.policy, str(self.home / "proj"), limit=2)["truncated"])
+        # the home folder itself is not an authorized place at all
+        self.assertEqual(self.code(safefs.list_dir, str(self.home)), "outside_allowed_places")
 
     def test_search_skips_protected_files_and_cannot_probe_secret_values(self):
-        hits = safefs.search(self.policy, str(self.home), "second line")["hits"]
+        hits = safefs.search(self.policy, str(self.home / "proj"), "second line")["hits"]
         self.assertEqual([h["path"] for h in hits], [str(self.home / "proj/readme.txt")])
-        self.assertEqual(safefs.search(self.policy, str(self.home), "AAAA")["hits"], [])        # inside ~/.ssh: skipped
-        self.assertEqual(safefs.search(self.policy, str(self.home), "TOKEN=abc")["hits"], [])    # .env: skipped
-        self.assertEqual(safefs.search(self.policy, str(self.home), "SuperSecret99")["hits"], [])  # redacted before matching
-        named = safefs.search(self.policy, str(self.home), "readme", name_only=True)["hits"]
+        self.assertEqual(safefs.search(self.policy, str(self.home / "proj"), "AAAA")["hits"], [])        # inside ~/.ssh: skipped
+        self.assertEqual(safefs.search(self.policy, str(self.home / "proj"), "TOKEN=abc")["hits"], [])    # .env: skipped
+        self.assertEqual(safefs.search(self.policy, str(self.home / "proj"), "SuperSecret99")["hits"], [])  # redacted before matching
+        named = safefs.search(self.policy, str(self.home / "proj"), "readme", name_only=True)["hits"]
         self.assertEqual(len(named), 1)
 
     def test_invalid_input_is_refused(self):
@@ -151,8 +152,8 @@ class SafeFsTests(unittest.TestCase):
             self.code(safefs.read_text, path)
         self.code(safefs.read_text, str(self.home / "proj/readme.txt"), offset=-1)
         self.code(safefs.read_text, str(self.home / "proj/readme.txt"), max_bytes=10 ** 9)
-        self.code(safefs.search, str(self.home), "")
-        self.code(safefs.search, str(self.home), "x", glob="../*")
+        self.code(safefs.search, str(self.home / "proj"), "")
+        self.code(safefs.search, str(self.home / "proj"), "x", glob="../*")
 
     def test_reading_in_pieces_continues_where_it_stopped(self):
         first = safefs.read_text(self.policy, str(self.home / "proj/readme.txt"), 0, 5)
@@ -272,7 +273,7 @@ class DiagToolTests(unittest.TestCase):
         router = ReadRouter(tokens=Tokens(), ownership=LocalOwnership(grants=Grants(), owner_id=OWNER, device_id=DEVICE),
                             read_health=lambda: {"cpu_usage_percent": 1.0})
         self.server = create_server(router=router, resource_url=AUDIENCE, diag=dict(
-            policy=Policy(home=home, roots=()), diagnostics=Diagnostics(run=FakeRun(journal="ok line\n")),
+            policy=Policy(home=home, roots=(), project_roots=[home / "proj"]), diagnostics=Diagnostics(run=FakeRun(journal="ok line\n")),
             limiter=self.limiter))
 
     def call(self, name, arguments, token="readonly"):
@@ -298,7 +299,7 @@ class DiagToolTests(unittest.TestCase):
 
     def test_protected_files_are_refused_through_the_tool(self):
         out = self.call("files_read", {"device_id": DEVICE, "path": str(self.home / ".ssh/id_rsa")})
-        self.assertEqual(out, {"ok": False, "error": "protected_location"})
+        self.assertEqual(out, {"ok": False, "error": "outside_allowed_places"})
 
     def test_wrong_device_or_missing_scope_is_not_authorized(self):
         out = self.call("files_read", {"device_id": "dtdev_NOTMINE1234", "path": str(self.home / "proj/a.txt")})

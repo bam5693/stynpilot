@@ -229,7 +229,7 @@ class StartupTests(unittest.TestCase):
                               {"device_id": DEVICE, "software": "htop"}),
                          {"ok": False, "error": "client_not_enrolled_or_revoked"})
         self.assertEqual(call(self.token(scope="health.read"), "commander_request_software_install",
-                              {"device_id": DEVICE, "software": "htop"}), {"ok": False, "error": "not_authorized"})
+                              {"device_id": DEVICE, "software": "htop"}), {"ok": False, "error": "insufficient_scope_workspace_propose"})
 
 
 if __name__ == "__main__":

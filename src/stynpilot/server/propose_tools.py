@@ -26,6 +26,7 @@ from ..ledger import LedgerError
 from ..plan import PlanError
 from ..requests import RequestError
 from .clients import PROPOSE_SCOPE, ClientDenied
+READ_SCOPE = "health.read"
 from .router import AccessDenied
 
 _LOG = logging.getLogger("stynpilot.propose")
@@ -51,7 +52,16 @@ class ProposeGate:
         try:
             who = self.router.tokens.authorize(header, required_scope=PROPOSE_SCOPE)
         except TokenDenied:
-            raise ClientDenied("not_authorized") from None
+            # A token that is genuine but was granted only health.read (an assistant connected before the owner allowed
+            # requests) gets a distinct, honest code and a log line naming the client and its scopes (never the token).
+            # A token that does not verify at all still gets the plain code: no hint to a stranger.
+            try:
+                seen = self.router.tokens.authorize(header, required_scope=READ_SCOPE)
+            except TokenDenied:
+                raise ClientDenied("not_authorized") from None
+            _LOG.warning("request tools refused: token lacks %s client=%s scopes=%s", PROPOSE_SCOPE,
+                         getattr(seen, "client", None), sorted(getattr(seen, "scopes", ()) or ()))
+            raise ClientDenied("insufficient_scope_workspace_propose") from None
         proposer = self.clients.proposer(who)
         self.router._require_device(who.account, device_id)        # owner, unrevoked, unexpired
         grant = self.router.ownership.grants.get(owner_id=who.account, device_id=device_id)

@@ -178,11 +178,20 @@ class ProposeToolTests(unittest.TestCase):
                          "give_software_or_packages")
         self.assertEqual(self.store.pending() if hasattr(self.store, "pending") else [], [])
 
+    def test_search_with_a_health_only_token_says_which_scope_is_missing(self):
+        """ChatGPT's live search returned a bare not_authorized: its token held only health.read. Same answer for every
+        request tool, a distinct code for a genuine token, and the plain code for one that does not verify."""
+        for tool, args in (("commander_software_search", {"device_id": DEVICE, "query": "htop"}),
+                           ("commander_request_software_install", {"device_id": DEVICE, "software": "htop"})):
+            with self.subTest(tool):
+                self.assertEqual(self.call(tool, args, "readonly"), {"ok": False, "error": "insufficient_scope_workspace_propose"})
+                self.assertEqual(self.call(tool, args, "nobody"), {"ok": False, "error": "not_authorized"})
+
     def test_every_refusal(self):
         cases = {
             "anon": "client_identity_missing",
             "reviewer": "assistant_session_must_not_have_review_scope",
-            "readonly": "not_authorized",
+            "readonly": "insufficient_scope_workspace_propose",
             "stranger": "device_unavailable_or_not_authorized",
             "nobody": "not_authorized",
         }

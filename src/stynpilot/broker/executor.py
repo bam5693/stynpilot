@@ -41,6 +41,7 @@ import json
 import os
 import secrets
 import shutil
+import sys
 import sqlite3
 import threading
 import time
@@ -208,6 +209,14 @@ class Executor:
 
     RESOLVE_EVERY = 30
 
+    @staticmethod
+    def _log(line):
+        """One audit line to the installer's journal (visible through the read-only logs tool). Names and counts only."""
+        try:
+            print("stynpilot-installer: " + line, file=sys.stderr, flush=True)
+        except OSError:
+            pass
+
     def _resolve_stale_attention(self):
         if not any((self.dir / "attention").glob("*.json")):
             return
@@ -225,6 +234,8 @@ class Executor:
                     continue
                 ok, checks = self.upgrader.verify_recovered(rid)
                 if not ok:
+                    self._log("attention_kept request=%s failed_checks=%s" % (
+                        rid[:12], ",".join(sorted(k for k, v in checks.items() if v is not True)) or "none"))
                     continue
                 record["resolution"] = {"resolved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                                         "by": "installer_verification", "checks": checks,
@@ -237,6 +248,8 @@ class Executor:
                 finally:
                     os.close(fd)
                 path.unlink()                    # only after the audit copy is safely on disk
+                self._log("attention_released request=%s reason=%s installed=%s checks=%s" % (
+                    rid[:12], record.get("reason"), record["resolution"]["installed_version"], ",".join(sorted(checks))))
             except (OSError, ValueError, KeyError, TypeError, UpgradeRefused):
                 continue                         # anything unclear: the record stays and the owner is still asked
 

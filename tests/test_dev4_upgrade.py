@@ -394,9 +394,14 @@ class UpgradeTests(unittest.TestCase):
         return rid
 
     def test_a_stale_health_check_failure_is_released_only_after_the_real_machine_proves_healthy_and_is_kept_for_audit(self):
+        import contextlib
+        import io
         rid = self.failed_unrecovered()                           # the dev5 shape: probe failed, machine actually fine
         record = json.loads((self.tmp / ("broker/attention/%s.json" % rid)).read_text())
-        self.assertEqual(self.executor.needs_attention(), [])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.executor.needs_attention(), [])
+        self.assertIn("attention_released request=%s" % rid[:12], err.getvalue())    # visible in the journal for verification
         self.assertFalse((self.tmp / ("broker/attention/%s.json" % rid)).exists())
         kept = json.loads((self.tmp / ("broker/attention-resolved/%s.json" % rid)).read_text())
         for key, value in record.items():                         # the original record is preserved word for word

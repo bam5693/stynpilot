@@ -152,6 +152,103 @@ def insecure_config(run=real_run):
     return bad
 
 
+_QUERY = re.compile(r"[A-Za-z0-9][A-Za-z0-9 +._-]{0,39}\Z")
+SEARCH_SCAN = 40            # candidates examined per search (each needs an origin check)
+
+
+def check_query(query):
+    if not isinstance(query, str) or not _QUERY.fullmatch(query.strip()):
+        raise ValueError("invalid search text")
+    return query.strip()
+
+
+def package_info(names, run=real_run):
+    """{name: {version, essential, priority, section, installed_size_kb, description}} for the CANDIDATE version.
+
+    Reads the local signed package indexes only (``apt-cache show``); never the network.
+    """
+    code, out = run(["apt-cache", "show", "--no-all-versions", "--", *_check_names(names)])
+    info = {}
+    for stanza in out.split("\n\n"):
+        fields = {}
+        for line in stanza.splitlines():
+            if line[:1] in (" ", "\t") or ":" not in line:
+                continue
+            key, _, value = line.partition(":")
+            fields.setdefault(key.strip(), value.strip())
+        name = fields.get("Package")
+        if name and name not in info:
+            try:
+                size = int(fields.get("Installed-Size", "0"))
+            except ValueError:
+                size = 0
+            info[name] = {"version": fields.get("Version", ""), "essential": fields.get("Essential", "").lower() == "yes",
+                          "priority": fields.get("Priority", ""), "section": fields.get("Section", ""),
+                          "installed_size_kb": size, "description": fields.get("Description", "")[:160]}
+    return info
+
+
+def search(query, run=real_run, *, limit=8):
+    """Ubuntu-archive packages whose NAME matches the text. [{name, version, summary, section, installed}]
+
+    Only packages whose candidate version is offered by the signed Ubuntu archive are listed. Bounded.
+    """
+    query = check_query(query)
+    code, out = run(["apt-cache", "search", "--names-only", "--", query])
+    if code != 0:
+        raise RuntimeError("apt_search_failed")
+    names = []
+    for line in out.splitlines():
+        name = line.split(" - ", 1)[0].strip()
+        if _PKG.fullmatch(name) and name not in names:
+            names.append(name)
+    names.sort(key=lambda n: (n != query.lower(), len(n), n))
+    names = names[:SEARCH_SCAN]
+    if not names:
+        return []
+    info = package_info(names, run)
+    installed = installed_versions([n for n in names if n in info], run) if info else {}
+    found = []
+    for name in names:
+        meta = info.get(name)
+        if meta and meta["version"] and origin_is_ubuntu(name, meta["version"], run):
+            found.append({"name": name, "version": meta["version"], "summary": meta["description"],
+                          "section": meta["section"], "installed": installed.get(name)})
+        if len(found) >= limit:
+            break
+    return found
+
+
+def analyze(names, run=real_run):
+    """Simulate installing exactly these names (no changes made). Everything the impact gate and the owner need.
+
+    {"installs": {name: version}, "upgrades": {name: old_version}, "removals": [...], "origins": {name: [...]},
+     "meta": {name: package_info}}. Raises RuntimeError("apt_simulation_failed") if apt cannot resolve them.
+    """
+    argv = ["apt-get", "-s", "-q", "-y", "--no-install-recommends", *SAFE_OPTS, "install", "--", *_check_names(names)]
+    code, out = run(argv)
+    if code != 0:
+        raise RuntimeError("apt_simulation_failed")
+    installs, olds, removals, origins = parse_transaction(out)
+    meta = package_info(sorted(installs), run) if installs else {}
+    return {"installs": installs, "upgrades": {n: o for n, o in olds.items() if o}, "removals": removals,
+            "origins": origins, "meta": meta}
+
+
+def deb_listing(path, run=real_run):
+    """``dpkg-deb -c`` of a downloaded package (a list of the files it will install); '' if unreadable."""
+    code, out = run(["dpkg-deb", "-c", str(path)])
+    return out if code == 0 else ""
+
+
+def deb_script(path, which="postinst", run=real_run):
+    """Text of one maintainer script of a downloaded package ('' if it has none)."""
+    if which not in ("preinst", "postinst"):
+        raise ValueError("invalid script")
+    code, out = run(["dpkg-deb", "-I", str(path), which])
+    return out if code == 0 else ""
+
+
 def sha256_of_version(name, version, run=real_run):
     """The set of SHA256 values the package indexes list for this exact version (one value if unambiguous)."""
     code, out = run(["apt-cache", "show", "--", "%s=%s" % (name, version)])

@@ -1,0 +1,10 @@
+== 1. install the baseline (currently installed) package
+baseline 0.1.0~dev0
+== 2. create realistic owner state (settings, pairing DB, approvals, request history, installer state)
+state a6c62f562186ebdfbe2a7ae967bbbf7672baee08d3f17b59938df93d9df60d7f
+== 3. upgrade to the new package
+upgraded 0.1.0~dev0 -> 0.1.0~dev1
+== 4. roll back: install the saved baseline package over it
+== 5. upgrade again (repeatable)
+
+RESULT: PASS upgrade 0.1.0~dev0 -> 0.1.0~dev1, rollback to 0.1.0~dev0, re-upgrade; state untouched

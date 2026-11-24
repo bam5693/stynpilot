@@ -1,0 +1,179 @@
+PASS VM boots to a login prompt with real systemd
+PASS machine is Ubuntu 26.04 and the payload is mounted :: running
+PRETTY_NAME="Ubuntu 26.04 LTS"
+NAME="Ubuntu"
+fake_idp.py
+guest.py
+lost+found
+p26_check.py
+preview26
+stynpilot-preview.deb
+stynpilot.deb
+tests
+walholder.py
+
+PASS test identity provider reachable over trusted TLS :: {"issuer": "https://auth.g8test.example/", "authorization_endpoint": "https://auth.g8test.example/authorize", "token_endpoint": "https://auth.g8test.example/oauth/token", "jwks_uri": "https://auth.g8t
+PASS package installs with apt on 26.04 :: 0.1.0.dev1
+Status: install ok installed
+Version: 0.1.0~dev1
+
+PASS installing started and enabled nothing :: disabled
+inactive
+ls: cannot access '/etc/stynpilot': No such file or directory
+no-listeners
+
+PASS systemd-analyze verify accepts both unit files :: rc=0
+
+INFO installer exposure:                                              Files created by service are world-readable by default                       0.1
+
+→ Overall exposure level for stynpilot-installer.service: 8.3 EXPOSED :-(
+PASS legacy pairing database created for the owner :: {"ok": true, "owner": "acct_e3f7d65021afe4c3d246af2f4377ca0f8ee1abf0", "pairing": "/home/owner/.local/state/stynpilot-owner/pairing.sqlite3"}
+
+PASS doctor before setup says 'not set up yet' and creates nothing ::              not set up yet: open StyNpilot Setup from the menu
+OK   unit installer               installed
+OK   unit owner                   installed
+OK   existing Preview26 service   not found (nothing to preserve)
+
+Result: healthy with warnings (0 problem(s), 1 warning(s)). Nothing was changed.
+
+PASS owner logs in on a real local session
+PASS that login is a local active session (what polkit's allow_active needs) :: ;machineid=950f3ef12928414e8bbf2e53ecd55605;user=owner;hostname=g8vm;bootid=8602d0e3-2758-4c0a-84c5-8ef2e81bde11;pid=00000000000000000587;type=command;cwd=/home/owner\Remote=no Class=user Active=yes 
+PASS polkit prompt shows 'StyNpilot wants to copy ONE settings fil' :: 
+[1;31m==== AUTHENTICATING FOR org.stynpilot.root-setup ====
+[0mStyNpilot wants to copy ONE settings file to /etc/stynpilot/installer.json, for your account only. It installs nothing and starts nothing.
+Authenticating as: owner
+
+PASS polkit prompt shows 'StyNpilot wants to START its software in' :: 
+[1;31m==== AUTHENTICATION COMPLETE ====
+[0m[1;31m==== AUTHENTICATING FOR org.stynpilot.root-start ====
+[0mStyNpilot wants to START its software installer and have it start at every boot. It only changes software after you approve each request separately.
+Authenticating as: owner
+
+PASS wizard drove setup to the end through the real polkit prompt :: {"pairing_found": "/home/owner/.local/state/stynpilot-owner/pairing.sqlite3", "step": "saved"}
+{"finished": true, "page": "", "step": "system"}
+{"page": "t:600}input{width:100%;padding:.5rem;font-size:1rem}button{font-size:1.1rem;padding:.7rem 1.4rem;margin-top:1rem}small{color:#555}li{margin:.3rem 0}</style><h1>StyNpilot is running</h1><p>StyNpilot is running.\n</p><p>Next: connect ChatGPT or Cla
+PASS wizard Start button started StyNpilot :: ;font-size:1rem}button{font-size:1.1rem;padding:.7rem 1.4rem;margin-top:1rem}small{color:#555}li{margin:.3rem 0}</style><h1>StyNpilot is running</h1><p>StyNpilot is running.\n</p><p>Next: connect ChatGPT or Claude. Anything they ask for waits for your approval.</p>", "status": 200, "step": "start"}
+
+PASS root settings 0600 + public receipt; installer and owner service running :: root 600 /etc/stynpilot/installer.json
+root 644 /etc/stynpilot/setup-receipt.json
+enabled
+active
+active
+Linger=yes
+127.0.0.1:18444
+127.0.0.1:18443
+
+PASS listeners are loopback only :: root 600 /etc/stynpilot/installer.json
+root 644 /etc/stynpilot/setup-receipt.json
+enabled
+active
+active
+Linger=yes
+127.0.0.1:18444
+127.0.0.1:18443
+
+PASS doctor after start: no FAIL lines :: vate
+OK   state file token-revocations.sqlite3 private
+OK   state file provisioned.json  private
+OK   approval page listener       127.0.0.1:18444
+OK   AI endpoint listener         127.0.0.1:18443
+OK   installer socket             0600, owner only
+OK   pairing database             1 paired device(s); exactly one is required
+OK   installer answers            status call works
+OK   unit installer   
+PASS Claude files an install request (htop) and gets an owner approval link :: {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795476167, "kind": "install", "next": "The owner reviews and approves this on his phone. Check progress with commander_software_install_status.", "owner_approval_url": "https://g8vm.example:8444/approve/8eb90696e3b00909df734668e559eef73
+PASS ChatGPT sees the same pending request :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795476167, "kind": "install", "request_id": "8eb90696e3b00909df734668e559eef73d9ba6759661e8e125e1bf3806e885c7", "requested_by"
+PASS AI side has no approve/decide tool and cannot reach the approval page :: {"routes": {"/approve/8eb90696e3b00909df734668e559eef73d9ba6759661e8e125e1bf3806e885c7": 404, "/approve/callback": 404, "/approve/choose": 404}, "step": "ai-cannot-approve", "tools": ["computer_health", "computer_inventory", "software_service_status", "commander_software_catalog", "commander_softwar
+PASS a forged AI token is refused :: {"result": {"error": {"error": "invalid_token", "error_description": "Authentication required"}, "http": 401}, "step": "bad-token"}
+PASS owner approves in the approval page (provider sign-in, PKCE, nonce-bound proof) :: {"http": 303, "location": "/approve/status/8eb90696e3b00909df734668e559eef73d9ba6759661e8e125e1bf3806e885c7", "step": "approval", "summary": "<li>Install htop on device ending ...ce00.</li><li>Package htop, exact version 3.4.1-5build2, from the Ubuntu archive.</li><li>Backup limits: this saves the packages it changes and their tracked settings files so they can be rolled back. It is not a full sys
+PASS the root installer installed htop and both AIs can see 'done' :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795476167, "kind": "install", "request_id": "8eb90696e3b00909df734668e559eef73d9ba6759661e8e125e1bf3806e885c7", "requested_by": "claude", "result": {"backup_scope": "packages_and_dpkg_tracked_settings_only", "installed": [{"name": "htop", "version": "3.4.1-5build2"}], "limits": "This is a bounded package rollback, not a syst
+PASS htop is really installed on the machine :: Status: install ok installed
+/usr/bin/htop
+
+PASS ChatGPT reports the same accurate result :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795476167, "kind": "install", "request_id": "8eb90696e3b00909df734668e559eef73d9ba6759661e8e125e1bf3806e885c7", "requested_by"
+PASS VM boots again after reboot
+PASS after reboot the installer and owner service came back by themselves (nobody logged in) :: active
+active
+socket-ok
+
+PASS the finished request is still reported 'done' after the reboot :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795476167, "kind": "install", "request_id": "8eb90696e3b00909df734668e559eef73d9ba6759661e8e125e1bf3806e885c7", "requested_by"
+PASS systemd restarts the installer after it is killed :: active
+
+PASS owner service restarts cleanly :: inactive
+
+PASS request state survives both restarts :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795476167, "kind": "install", "request_id": "8eb90696e3b00909df734668e559eef73d9ba6759661e8e125e1bf3806e885c7", "requested_by"
+PASS ChatGPT files a rollback request for that install :: {"result": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795476395, "kind": "rollback", "next": "The owner reviews and approves this on his phone. Check progress with commander_software_install_status.", "owner_approval_url": "https://g8vm.example:8444/approve/fbf9a9f2b41309aa44759
+PASS rollback completes after the owner's approval :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795476395, "kind": "rollback", "request_id": "fbf9a9f2b41309aa447591aa9de02fc7b45c79808596c3a82f0f40b7b67f3874", "requested_by": "chatgpt", "result": {"limits": "This is a bounded package rollback, not a system snapshot. It restores the packages this install added or upgraded, their dpkg-tracked settings files and their auto
+PASS htop is gone again :: dpkg-query: package 'htop' is not installed and no information is available
+Use dpkg --info (= dpkg-deb --info) to examine archive files.
+
+PASS M1: read-only hardware/software inventory works and leaks no identifiers :: {"cpu": {"logical_cpus": 2, "max_mhz": null, "model": "QEMU TCG CPU version 2.5+", "physical_cores": 2}, "gpu": {"adapters": [], "drivers": ["bochs-drm"], "note": "Video memory size is not read.", "vram": null}, "memory": {"modules": null, "note": "DIMM count, slot layout and speed need administrato
+PASS M1: AI searches the signed Ubuntu lists and finds a non-catalog package :: {"result": {"note": "Ubuntu archive only. To install, call commander_request_software_install with packages=[names].", "ok": true, "results": [{"ai_may_request": true, "installed": false, "installed_version": null, "name": "ncdu", "section": "universe/admin", "summary": "", "version": "1.22-1build1"
+PASS M1: search marks sudo as not requestable by an AI :: {"result": {"note": "Ubuntu archive only. To install, call commander_request_software_install with packages=[names].", "ok": true, "results": [{"ai_may_request": false, "blocked_reason": "StyNpilot does not let an AI install login, sudo, polkit and the login screen.", "installed": true, "installed_v
+PASS M1: requesting sudo is refused before any request exists :: {"result": {"error": "blocked_package", "ok": false, "reason": "StyNpilot does not let an AI install login, sudo, polkit and the login screen."}, "step": "request-packages"}
+PASS M1: requesting openssh-server is refused before any request exists :: {"result": {"error": "blocked_package", "ok": false, "reason": "StyNpilot does not let an AI install remote-access and file-sharing servers."}, "step": "request-packages"}
+PASS M1: requesting linux-image-generic is refused before any request exists :: {"result": {"error": "blocked_package", "ok": false, "reason": "StyNpilot does not let an AI install kernels, boot loaders and firmware."}, "step": "request-packages"}
+PASS M1: an invalid package name is refused :: {"result": {"error": "invalid_package_name", "ok": false}, "step": "request-packages"}
+PASS M1: ChatGPT files an install request for ncdu by name :: {"result": {"ok": true, "result": {"already_installed": [], "approved_by_ai": false, "expires_at": 1795476493, "kind": "install", "next": "The owner reviews and approves this on his phone. Check progress with commander_software_install_status.", "owner_approval_url": "https://g8vm.example:8444/approve/068b4b7bf470d6c289913397ea8ca1c217559d5bfc1e9eba3386be51e4b3f3d3", "request_id": "068b4b7bf470d6c
+PASS M1: the owner's summary says the assistant chose it and that scripts run as root :: null
+PASS M1: after independent owner approval StyNpilot installs ncdu and the AI sees 'done' :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795476493, "kind": "install", "request_id": "068b4b7bf470d6c289913397ea8ca1c217559d5bfc1e9eba3386be51e4b3f3d3", "requested_by": "chatgpt", "result": {"backup_scope": "packages_and_dpkg_tracked_settings_only", "installed": [{"name": "ncdu", "version": "1.22-1build1"}], "limits": "This is a bounded package rollback, not a syst
+PASS M1: ncdu is really installed :: Status: install ok installed
+/usr/bin/ncdu
+
+PASS M1: the AI verifies it through the search tool (installed=true) :: {"result": {"note": "Ubuntu archive only. To install, call commander_request_software_install with packages=[names].", "ok": true, "results": [{"ai_may_request": true, "installed": true, "installed_version": "1.22-1build1", "name": "ncdu", "section": "universe/admin", "summary": "", "version": "1.22
+PASS M1: asking again reports already_installed and files nothing :: {"result": {"already_installed": true, "next": "Nothing to install: those packages are already installed. No request was filed.", "ok": true, "result": {"already_installed": true}}, "step": "request-packages"}
+PASS M1: rollback of the non-catalog install can be requested :: {"result": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795476601, "kind": "rollback", "next": "The owner reviews and approves this on his phone. Check progress with commander_software_install_status.", "owner_approval_url": "https://g8vm.example:8444/approve/d7b4d9917d43cd686ee34
+PASS M1: rollback completes after owner approval :: {"state": {"ok": true, "result": {"approved_by_ai": false, "expires_at": 1795476601, "kind": "rollback", "request_id": "d7b4d9917d43cd686ee345d8ab7aefd5c7c330403da55069c3b61f655022ad32", "requested_by": "chatgpt", "result": {"limits": "This is a bounded package rollback, not a system snapshot. It restores the packages this install added or upgraded, their dpkg-tracked settings files and their auto
+PASS M1: ncdu is gone again :: dpkg-query: package 'ncdu' is not installed and no information is available
+Use dpkg --info (= dpkg-deb --info) to examine archive files.
+
+PASS owner-state backup works without a password :: \owner-state backup written to /home/owner/owner.tar (4 files, integrity hashes recorded). This covers YOUR request queue and revoked connectors only; use root-backup for software-rollback records.
+
+PASS polkit prompt shows 'StyNpilot wants to READ its software-ins' :: command;cwd=/home/owner\[1;31m==== AUTHENTICATING FOR org.stynpilot.root-backup ====
+[0mStyNpilot wants to READ its software-install rollback records and save a private copy in your folder. Nothing is changed or installed. It is refused while an install is running.
+Authenticating as: owner
+
+PASS root backup through the real password prompt :: 
+[1;31m==== AUTHENTICATION COMPLETE ====
+[0mbackup written to /home/owner/root.tar (6 files)
+
+PASS root backup file is owned by the owner and private :: runs.sqlite3
+installs.sqlite3
+snapshots/0b979faa1b73e4e808c3bd0797c67df5/manifest.json
+snapshots/abc123/debs/htop_1.deb
+snapshots/abc123/manifest.json
+owner 600
+
+PASS polkit prompt shows 'StyNpilot wants to WRITE back' :: ;31m==== AUTHENTICATING FOR org.stynpilot.root-restore ====
+[0mStyNpilot wants to WRITE back its software-install rollback records from your backup file into its empty records folder. It never overwrites existing records and is refused while the installer is running.
+Authenticating as: owner
+
+PASS restore is refused while the installer is running (or destination not empty) :: 
+[1;31m==== AUTHENTICATION COMPLETE ====
+[0mstynpilot-root-helper: BackupError: installer_is_running_stop_it_first
+
+PASS polkit prompt shows 'StyNpilot wants to STOP its software ins' :: ame=g8vm;bootid=ef58bee9-590e-49e9-acaf-4485b5cfc0c2;pid=00000000000000001295;type=command;cwd=/home/owner\[1;31m==== AUTHENTICATING FOR org.stynpilot.root-stop ====
+[0mStyNpilot wants to STOP its software installer and stop it starting at boot. Nothing is removed.
+Authenticating as: owner
+
+PASS stop works through its own prompt :: 
+[1;31m==== AUTHENTICATION COMPLETE ====
+[0mStyNpilot is stopped. Your settings, requests and backups are untouched.
+
+PASS after stop nothing is running or enabled :: inactive
+disabled
+inactive
+
+PASS polkit prompt shows 'StyNpilot wants to START its software in' :: pid=00000000000000001295;type=command;cwd=/home/owner\[1;31m==== AUTHENTICATING FOR org.stynpilot.root-start ====
+[0mStyNpilot wants to START its software installer and have it start at every boot. It only changes software after you approve each request separately.
+Authenticating as: owner
+
+PASS start again works :: 
+[1;31m==== AUTHENTICATION COMPLETE ====
+[0mStyNpilot is running.
+
+PASS the root helper refuses anyone but the configured owner :: rc=1
+stynpilot-root-helper: ConfigError: this_installer_belongs_to_another_user
+
+
+RESULT: PASS  (62 checks, 0 failed)

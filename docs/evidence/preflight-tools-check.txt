@@ -1,0 +1,35 @@
+== A. normal backup, permissions, re-verify, tamper detection
+ok: complete and restricted
+ok: tamper detected on both sides
+== B. injection attempts through the root-side reference (an owner-writable file)
+ok: no injected command ran: ROOT_DEST=/var/backups/stynpilot-pre-m1-20261123-1
+ok: no injected command ran: ROOT_DEST=$(touch /tmp/INJECTED_subst)
+ok: no injected command ran: ROOT_DEST=`touch /tmp/INJECTED_tick`
+ok: no injected command ran: ROOT_DEST=/var/backups/x"; touch /tmp/INJECTED_dq;
+ok: no injected command ran: ROOT_DEST=/var/backups/stynpilot-pre-m1-20261123-1
+ok: no injected command ran: ROOT_DEST=/var/backups/stynpilot-pre-m1-20261123-1
+ok: no injected command ran: ROOT_DEST=/var/backups/../etc
+ok: no injected command ran: ROOT_DEST=/var/backups/stynpilot-pre-m1-20260101-0
+ok: no injected command ran: ROOT_DEST=/var/backups/stynpilot-pre-m1-2026*
+ok: no injected command ran: ROOT_DEST=-n
+ok: no injected command ran: ROOT_DEST=
+ok: no injected command ran: ROOT_DEST=/etc/stynpilot
+ok: symlinked root-side folder refused
+ok: root-side folder with wrong mode refused
+ok: restored valid reference verifies again
+ok: unexpected checksum list refused
+== C. injection through environment and paths
+ok: no injected command ran: environment variables
+ok: environment cannot redirect the root folder
+ok: no injected command ran: owner destination path
+ok: owner folder with quotes and metacharacters handled as plain text
+ok: no injected command ran: settings file values
+ok: invalid owner settings fail closed and create nothing
+== D. state layout is enforced (flat, audited)
+ok: unexpected layouts refused before anything is written; known side files tolerated
+== E. root-side source checks
+ok: symlinked source refused; optional receipt tolerated
+== F. baseline verification
+ok: baseline verification: pass, unit/program tamper refused, version change refused
+
+RESULT: PASS

@@ -46,8 +46,9 @@ class BrokerTests(unittest.TestCase):
         (self.root / "etc/apt/sources.list").write_text("deb http://archive.ubuntu.com/ubuntu noble main\n")
         (self.root / "etc/libnl.conf").write_text("old config\n")
         self.machine = FakeMachine(installed=installed or {"bash": "5.2"},
-                                   available={"htop": "3.3.0-4build1", "libnl-3-200": "3.7.0"},
-                                   deps={"htop": ["libnl-3-200"]}, file_root=self.root)
+                                   available={"htop": "3.3.0-4build1", "libnl-3-200": "3.7.0", "ncdu": "2.3-1",
+                                              "libncurses6": "6.4", "sudo": "1.9", "nginx": "1.24"},
+                                   deps={"htop": ["libnl-3-200"], "ncdu": ["libncurses6"]}, file_root=self.root)
         self.machine.archive = archive or {}
         self.verifier = ProofVerifier(issuer=ISS, approval_client_id=APP, jwks=self.jwks)
         self.executor = Executor(state_dir=self.tmp / "broker", owner=OWNER, device=DEVICE, verifier=self.verifier,
@@ -90,6 +91,155 @@ class BrokerTests(unittest.TestCase):
         with self.assertRaises(ExecutionDenied) as caught:
             fn(*args)
         self.assertEqual(caught.exception.code, code)
+
+    # --- M1: AI-named Ubuntu packages ----------------------------------------------------------
+    def generic_plan(self, names=("ncdu",)):
+        from stynpilot.broker import apt
+        validated, _, _ = catalog.generic_install_plan(
+            list(names), owner=OWNER, device=DEVICE, analyze=lambda n: apt.analyze(n, self.machine),
+            installed=lambda n: apt.installed_versions(n, self.machine))
+        self.machine.commands.clear()
+        return validated.content()
+
+    def forged(self, payload, **changes):
+        """Same shape, different content, validly hashed (what a hostile owner-side process could file)."""
+        from stynpilot.plan import validate_plan
+        raw = {k: v for k, v in payload.items()}
+        raw.update(changes)
+        return validate_plan(raw, expected_owner=OWNER, expected_device=DEVICE).content()
+
+    def test_generic_install_runs_exact_closure_and_rolls_back(self):
+        payload = self.generic_plan()
+        self.assertTrue(payload["software"].startswith("apt-ncdu-"))
+        result = self.install(payload)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.machine.installed, {"bash": "5.2", "ncdu": "2.3-1", "libncurses6": "6.4"})
+        self.assertEqual(self.machine.changes()[0][-2:], ["libncurses6=6.4", "ncdu=2.3-1"])
+        self.last_request = request_id(payload)[0]
+        back = self.rollback_payload(result, software=payload["software"])
+        challenge, token = self.approval(back)
+        self.assertTrue(self.executor.rollback(back, token, challenge)["ok"])
+        self.assertEqual(self.machine.installed, {"bash": "5.2"})
+
+    def test_owner_sees_which_packages_the_assistant_chose_and_the_root_warning(self):
+        shown = " ".join(self.executor.challenge(self.generic_plan(), "approve")["summary"])
+        self.assertIn("Package ncdu, exact version 2.3-1, from the Ubuntu archive (asked for by the assistant).", shown)
+        self.assertIn("Package libncurses6, exact version 6.4, from the Ubuntu archive (needed by it).", shown)
+        self.assertIn("run as root", shown)
+
+    def test_generic_plan_with_extra_or_missing_packages_refused_before_approval(self):
+        payload = self.generic_plan()
+        extra = self.forged(payload, steps=[{"kind": "apt", "requested": ["ncdu"], "packages": [
+            {"name": "libncurses6", "version": "6.4"}, {"name": "ncdu", "version": "2.3-1"}, {"name": "nginx", "version": "1.24"}]}])
+        self.denied("plan_is_not_the_exact_package_closure", self.executor.challenge, extra, "approve")
+        missing = self.forged(payload, steps=[{"kind": "apt", "requested": ["ncdu"], "packages": [{"name": "ncdu", "version": "2.3-1"}]}])
+        self.denied("plan_is_not_the_exact_package_closure", self.executor.challenge, missing, "approve")
+        self.assertEqual(self.machine.changes(), [])
+
+    def test_generic_slug_must_match_requested_names(self):
+        payload = self.generic_plan()
+        self.denied("generic_install_not_well_formed", self.executor.challenge,
+                    self.forged(payload, software="apt-ncdu-00000000"), "approve")
+        no_requested = self.forged(payload, steps=[{"kind": "apt", "packages": payload["steps"][0]["packages"]}])
+        self.denied("generic_install_not_well_formed", self.executor.challenge, no_requested, "approve")
+
+    def test_root_refuses_blocked_names_even_if_the_owner_side_was_fooled(self):
+        for name in ("sudo",):
+            forged = self.forged(self.generic_plan(), software=catalog.generic_slug([name]),
+                                 steps=[{"kind": "apt", "requested": [name], "packages": [{"name": name, "version": "1.9"}]}])
+            self.denied("blocked_package:login_or_privilege", self.executor.challenge, forged, "approve")
+        self.assertEqual(self.machine.changes(), [])
+
+    def raw_generic(self, requested, packages):
+        return {"schema": 1, "owner": OWNER, "device": DEVICE, "backup": "required-before-mutation",
+                "rollback": "restore-verified-snapshot", "software": catalog.generic_slug(requested),
+                "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "steps": [{"kind": "apt", "requested": requested,
+                           "packages": [{"name": n, "version": v} for n, v in sorted(packages.items())]}]}
+
+    def test_root_refuses_a_blocked_dependency_and_removals(self):
+        from stynpilot.plan import validate_plan
+        self.machine.deps["ncdu"] = ["libncurses6", "sudo"]
+        payload = validate_plan(self.raw_generic(["ncdu"], {"libncurses6": "6.4", "ncdu": "2.3-1", "sudo": "1.9"}),
+                                expected_owner=OWNER, expected_device=DEVICE).content()
+        self.denied("blocked_package:login_or_privilege", self.executor.challenge, payload, "approve")
+        self.machine.deps["ncdu"] = ["libncurses6"]
+        self.machine.removes_on_install = ["vim"]
+        payload = validate_plan(self.raw_generic(["ncdu"], {"libncurses6": "6.4", "ncdu": "2.3-1"}),
+                                expected_owner=OWNER, expected_device=DEVICE).content()
+        self.denied("blocked_package:would_remove_packages", self.executor.challenge, payload, "approve")
+
+    def test_package_shipping_login_files_is_refused_before_approval_and_again_at_install(self):
+        payload = self.generic_plan()
+        bad = "-rw-r--r-- root/root 10 2026-01-01 00:00 ./etc/sudoers.d/ncdu\n"
+        self.machine.deb_files["ncdu"] = bad
+        self.denied("blocked_package:package_touches_login_or_boot_files", self.executor.challenge, payload, "approve")
+        self.machine.deb_files.pop("ncdu")
+        challenge, token = self.approval(payload)                       # safe at preview time...
+        self.machine.deb_files["ncdu"] = bad                            # ...different by install time
+        result = self.executor.install(payload, token, challenge)
+        self.assertEqual(result["stopped"], "blocked_package:package_touches_login_or_boot_files")
+        self.assertEqual((result["changed_anything"], self.machine.changes(), self.machine.installed), (False, [], {"bash": "5.2"}))
+
+    def test_unreadable_package_contents_refuse_install_and_approval(self):
+        payload = self.generic_plan()
+        for listing in ("", "garbage\n", "-rw-r--r-- root/root 1 2026-01-01 00:00 ./ok\nnot a line\n"):
+            self.machine.deb_files["ncdu"] = listing
+            self.denied("blocked_package:package_contents_unreadable", self.executor.challenge, payload, "approve")
+            self.assertEqual(self.machine.changes(), [])
+        real = self.machine.__call__
+        self.machine.deb_files.pop("ncdu")
+        calls = []
+
+        def failing(argv):
+            if argv[0] == "dpkg-deb":
+                calls.append(argv)
+                return 2, ""
+            return real(argv)
+        self.executor.run = failing
+        self.denied("blocked_package:package_contents_unreadable", self.executor.challenge, payload, "approve")
+        self.assertTrue(calls)
+        self.executor.run = real
+
+    def test_install_itself_fails_closed_when_contents_become_unreadable(self):
+        payload = self.generic_plan()
+        challenge, token = self.approval(payload)                       # preview was fine
+        self.machine.deb_files["ncdu"] = ""                             # then the downloaded file cannot be listed
+        result = self.executor.install(payload, token, challenge)
+        self.assertEqual((result["ok"], result["stopped"], result["changed_anything"]),
+                         (False, "blocked_package:package_contents_unreadable", False))
+        self.assertEqual((self.machine.changes(), self.machine.installed), ([], {"bash": "5.2"}))
+
+    def test_services_and_privileged_programs_are_shown_before_approval(self):
+        payload = self.generic_plan()
+        self.machine.deb_files["ncdu"] = ("-rwxr-xr-x root/root 1 2026-01-01 00:00 ./usr/bin/ncdu\n"
+                                          "-rwsr-xr-x root/root 1 2026-01-01 00:00 ./usr/bin/ncdu-helper\n"
+                                          "-rw-r--r-- root/root 1 2026-01-01 00:00 ./usr/lib/systemd/system/ncdu.service\n")
+        shown = " ".join(self.executor.challenge(payload, "approve")["summary"])
+        self.assertIn("ncdu: Ships background service files: ncdu.service.", shown)
+        self.assertIn("setuid/setgid): /usr/bin/ncdu-helper", shown)
+        self.machine.deb_scripts["ncdu"] = "#!/bin/sh\nchmod u+s /usr/bin/ncdu\n"
+        self.assertIn("ncdu: Its install script sets setuid/setgid permissions on files.",
+                      " ".join(self.executor.challenge(payload, "approve")["summary"]))
+        self.machine.deb_scripts.clear()
+        self.machine.deb_files["ncdu"] = "-rwxr-xr-x root/root 1 2026-01-01 00:00 ./usr/bin/ncdu\n"
+        self.assertIn("no background services or privileged programs found", " ".join(self.executor.challenge(payload, "approve")["summary"]))
+        self.assertEqual(self.machine.changes(), [])
+
+    def test_missing_package_metadata_cannot_bypass_the_gate_at_root(self):
+        from stynpilot.plan import validate_plan
+        self.machine.meta_hidden = {"libncurses6"}
+        payload = validate_plan(self.raw_generic(["ncdu"], {"libncurses6": "6.4", "ncdu": "2.3-1"}),
+                                expected_owner=OWNER, expected_device=DEVICE).content()
+        self.denied("blocked_package:package_metadata_missing", self.executor.challenge, payload, "approve")
+
+    def test_package_from_a_third_party_source_is_refused_at_request_time(self):
+        from stynpilot.broker import apt
+        self.machine.sim_origin["ncdu"] = "Evil:ppa"
+        with self.assertRaises(catalog.CatalogError) as caught:
+            catalog.generic_install_plan(["ncdu"], owner=OWNER, device=DEVICE, analyze=lambda n: apt.analyze(n, self.machine),
+                                         installed=lambda n: apt.installed_versions(n, self.machine))
+        self.assertEqual(caught.exception.code, "package_not_available")
 
     # --- happy path -------------------------------------------------------------------------
     def test_approved_install_runs_exactly_the_plan_with_a_verified_backup(self):

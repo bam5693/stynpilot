@@ -48,7 +48,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .. import catalog, statelock
+from .. import catalog, impact, statelock
 from ..ledger import InstallLedger, LedgerError
 from ..plan import PlanError, validate_plan
 from ..requests import request_id as payload_hash
@@ -203,6 +203,15 @@ class Executor:
         rid, _ = payload_hash(payload)
         challenge = self.runs.issue(rid, decision)
         summary = render_summary(payload)
+        if payload.get("kind") != "rollback" and catalog.is_generic(payload.get("software")):
+            try:
+                found = self.package_notes(payload)
+            except ExecutionDenied:
+                raise
+            except Exception:
+                raise ExecutionDenied("package_contents_unreadable") from None
+            summary += (["What these packages would install (checked by StyNpilot before you decide):"]
+                        + (["  - " + n for n in found] if found else ["  - no background services or privileged programs found."]))
         return {"request_id": rid, "decision": decision, "challenge": challenge,
                 "nonce": decision_nonce(decision, rid, rid, challenge),
                 "summary": summary, "summary_sha256": summary_hash(summary), "expires_in": CHALLENGE_LIFETIME}
@@ -247,15 +256,18 @@ class Executor:
         content = plan.content()
         if any(step["kind"] != "apt" for step in content["steps"]):
             raise ExecutionDenied("step_kind_not_supported_yet")
+        if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
+            raise ExecutionDenied("already_decided_or_used")
+        wanted = {p["name"]: p["version"] for step in content["steps"] for p in step["packages"]}
+        if catalog.is_generic(content.get("software")):
+            self._check_generic(content, wanted)
+            return content
         try:
             entry = catalog.entry(content.get("software"))
         except catalog.CatalogError:
             raise ExecutionDenied("software_not_in_plan_or_catalog") from None
-        names = {p["name"] for step in content["steps"] for p in step["packages"]}
-        if entry["kind"] != "apt" or not set(entry["packages"]) <= names:
+        if entry["kind"] != "apt" or not set(entry["packages"]) <= set(wanted):
             raise ExecutionDenied("plan_does_not_match_catalog_entry")
-        if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
-            raise ExecutionDenied("already_decided_or_used")
         # The root installer derives the allowed package set ITSELF: the catalog's packages plus
         # exactly the dependencies apt resolves for them now. Extra packages, even real Ubuntu ones,
         # are refused before anyone is asked to approve.
@@ -263,10 +275,29 @@ class Executor:
             allowed = {p["name"]: p["version"] for p in apt.resolve(list(entry["packages"]), self.run)}
         except (RuntimeError, ValueError):
             raise ExecutionDenied("catalog_resolution_failed") from None
-        wanted = {p["name"]: p["version"] for step in content["steps"] for p in step["packages"]}
         if wanted != allowed:
             raise ExecutionDenied("plan_is_not_the_exact_catalog_closure")
         return content
+
+    def _check_generic(self, content, wanted):
+        """AI-named Ubuntu packages: the root side re-derives everything from the requested names alone."""
+        steps = content["steps"]
+        requested = steps[0].get("requested") if len(steps) == 1 else None
+        if not requested or content["software"] != catalog.generic_slug(requested):
+            raise ExecutionDenied("generic_install_not_well_formed")
+        for name in requested:
+            code = impact.refusal_for(name)
+            if code:
+                raise ExecutionDenied("blocked_package:" + code)
+        try:
+            analysis = apt.analyze(list(requested), self.run)
+        except (RuntimeError, ValueError):
+            raise ExecutionDenied("catalog_resolution_failed") from None
+        code, _ = impact.check_transaction(requested, analysis)
+        if code:
+            raise ExecutionDenied("blocked_package:" + code)
+        if not set(requested) <= set(analysis["installs"]) or wanted != analysis["installs"]:
+            raise ExecutionDenied("plan_is_not_the_exact_package_closure")
 
     def install(self, payload, proof_token, challenge, *, now=None):
         """Execute an approved install. Raises ExecutionDenied before any change; else returns a result.
@@ -306,9 +337,8 @@ class Executor:
                     pass
             raise
 
-    def _install_apt(self, rid, content):
-        wanted = {p["name"]: p["version"] for step in content["steps"] for p in step["packages"]}
-        pins = sorted(wanted.items())
+    def _fetch_verified(self, pins, cache):
+        """Source checks, then download the exact files and prove each is the one the signed index lists."""
         if apt.untrusted_sources(self.sources_root) or apt.insecure_config(self.run):
             raise ExecutionDenied("untrusted_package_source_configured")
         for name, version in pins:
@@ -320,17 +350,54 @@ class Executor:
             if len(found) != 1:
                 raise ExecutionDenied("package_source_ambiguous")
             hashes[name] = next(iter(found))
-        before = apt.state(self.run)
-        manual_before = apt.manual_packages(self.run)
-        upgraded = sorted(n for n in wanted if n in before and before[n] != wanted[n])
-        expected = {n: v for n, v in wanted.items() if before.get(n) != v}
-        cache = self.dir / "downloads" / rid
         if not apt.download(pins, cache, self.run):
             raise ExecutionDenied("download_failed")
         for name, version in pins:                                   # the file apt fetched is the indexed one
             files = sorted(cache.glob("%s_*.deb" % name))
             if len(files) != 1 or _sha256(files[0]) != hashes[name]:
                 raise ExecutionDenied("downloaded_file_does_not_match_the_signed_index")
+
+    def _inspect_downloads(self, pins, cache):
+        """Notes about what the downloaded packages ship. Refuses (fail closed) on anything unreadable or dangerous."""
+        notes = []
+        for name, version in pins:
+            files = sorted(cache.glob("%s_*.deb" % name))
+            if len(files) != 1:
+                raise ExecutionDenied("package_contents_unreadable")
+            code, found = impact.inspect_listing(apt.deb_listing(files[0], self.run))
+            if code:
+                raise ExecutionDenied("blocked_package:" + code)
+            notes += ["%s: %s" % (name, n) for n in found]
+            try:
+                notes += ["%s: %s" % (name, n) for n in impact.inspect_scripts(
+                    apt.deb_script(files[0], "preinst", self.run), apt.deb_script(files[0], "postinst", self.run))]
+            except Exception:
+                pass                                                     # notes only; the listing check above is the gate
+        return notes
+
+    def package_notes(self, content):
+        """Findings the owner must see BEFORE approving an assistant-named install: downloads the exact files into a
+        private folder, verifies them against the signed index and inspects them. Nothing is installed."""
+        wanted = {p["name"]: p["version"] for step in content["steps"] for p in step["packages"]}
+        pins = sorted(wanted.items())
+        cache = self.dir / "preview" / secrets.token_hex(8)
+        try:
+            self._fetch_verified(pins, cache)
+            return self._inspect_downloads(pins, cache)
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+
+    def _install_apt(self, rid, content):
+        wanted = {p["name"]: p["version"] for step in content["steps"] for p in step["packages"]}
+        pins = sorted(wanted.items())
+        before = apt.state(self.run)
+        manual_before = apt.manual_packages(self.run)
+        upgraded = sorted(n for n in wanted if n in before and before[n] != wanted[n])
+        expected = {n: v for n, v in wanted.items() if before.get(n) != v}
+        cache = self.dir / "downloads" / rid
+        self._fetch_verified(pins, cache)
+        if catalog.is_generic(content.get("software")):               # what the downloaded files would put on disk
+            self._inspect_downloads(pins, cache)
         try:
             would, removals, chosen = apt.simulate_install(apt._pins(pins), self.run, cache=cache, no_download=True,
                                                            with_origins=True)

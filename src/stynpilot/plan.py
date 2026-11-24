@@ -24,6 +24,7 @@ from typing import Any, Mapping
 SCHEMA = 1
 MAX_STEPS = 20
 MAX_PACKAGES = 32
+MAX_REQUESTED = 3
 MAX_HORIZON_SECONDS = 86400
 
 
@@ -57,7 +58,7 @@ _PLAN_FIELDS = {"schema", "owner", "device", "steps", "backup", "rollback", "exp
 # "software" (the catalog id) is optional for this validator, but the root executor
 # requires it: it is hashed with the plan, so the recorded software name is the approved one.
 _REQUIRED_PLAN_FIELDS = _PLAN_FIELDS - {"software"}
-_STEP_FIELDS = {"kind", "packages", "app", "image", "bind_ip", "host_port", "container_port", "data_subdir"}
+_STEP_FIELDS = {"kind", "packages", "requested", "app", "image", "bind_ip", "host_port", "container_port", "data_subdir"}
 _CONTAINER_FIELDS = {"kind", "app", "image", "bind_ip", "host_port", "container_port", "data_subdir"}
 
 
@@ -94,10 +95,22 @@ def _check_step(step: Any, index: int, packages_seen: set[str], apps: set[str], 
     _only(step, _STEP_FIELDS, {"kind"}, f"step[{index}]")
     kind = step["kind"]
     if kind == "apt":
-        _only(step, {"kind", "packages"}, {"kind", "packages"}, f"apt[{index}]")
+        _only(step, {"kind", "packages", "requested"}, {"kind", "packages"}, f"apt[{index}]")
         packages = step["packages"]
         if type(packages) is not list or not 1 <= len(packages) <= MAX_PACKAGES:
             raise PlanError(f"apt[{index}]: 1..{MAX_PACKAGES} packages required")
+        if "requested" in step:
+            # The package names the owner was actually asked about; the root installer derives the full dependency set
+            # from exactly these names, never from the AI layer's list. Every one must be in the plan.
+            requested = step["requested"]
+            if (type(requested) is not list or not 1 <= len(requested) <= MAX_REQUESTED
+                    or len(set(requested)) != len(requested)):
+                raise PlanError(f"apt[{index}]: 1..{MAX_REQUESTED} distinct requested package names required")
+            planned = {p.get("name") for p in packages if type(p) is dict}
+            for name in requested:
+                _match(name, _PKG, "requested package name")
+                if name not in planned:
+                    raise PlanError(f"apt[{index}]: a requested package is not in the plan")
         for package in packages:
             _only(package, {"name", "version"}, {"name", "version"}, "apt package")
             name = _match(package["name"], _PKG, "apt name")

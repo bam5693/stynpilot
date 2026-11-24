@@ -88,6 +88,11 @@ class ReadRouter:
         self._require_device(identity.account, device_id)
         return identity
 
+    def authorize_read(self, header, device_id):
+        """The read-only (GREEN) check: a genuine token with health.read for one of the owner's live devices. Nothing more,
+        so a read-only tool never needs the scope that files install requests."""
+        return self._authorize(header, device_id)
+
     def _recheck(self, header, identity, device_id):
         """A read can outlast a revocation; check again before anything leaves."""
         again = self._authorize(header, device_id)

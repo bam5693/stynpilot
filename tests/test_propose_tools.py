@@ -147,7 +147,10 @@ class ProposeToolTests(unittest.TestCase):
 
     def test_search_refuses_bad_text_and_unauthorised(self):
         self.assertEqual(self.call("commander_software_search", {"device_id": DEVICE, "query": "a;b"})["error"], "invalid_search_text")
-        self.assertFalse(self.call("commander_software_search", {"device_id": DEVICE, "query": "ncdu"}, "readonly")["ok"])
+        q = {"device_id": DEVICE, "query": "ncdu"}
+        self.assertFalse(self.call("commander_software_search", q, "nobody")["ok"])
+        self.assertEqual(self.call("commander_software_search", {**q, "device_id": DEVICE.replace("O", "0")}), 
+                         {"ok": False, "error": "device_unavailable_or_not_authorized"})
         self.assertEqual(self.machine.changes(), [])
 
     def test_non_catalog_package_request_files_exact_plan(self):
@@ -178,14 +181,19 @@ class ProposeToolTests(unittest.TestCase):
                          "give_software_or_packages")
         self.assertEqual(self.store.pending() if hasattr(self.store, "pending") else [], [])
 
-    def test_search_with_a_health_only_token_says_which_scope_is_missing(self):
-        """ChatGPT's live search returned a bare not_authorized: its token held only health.read. Same answer for every
-        request tool, a distinct code for a genuine token, and the plain code for one that does not verify."""
-        for tool, args in (("commander_software_search", {"device_id": DEVICE, "query": "htop"}),
-                           ("commander_request_software_install", {"device_id": DEVICE, "software": "htop"})):
-            with self.subTest(tool):
-                self.assertEqual(self.call(tool, args, "readonly"), {"ok": False, "error": "insufficient_scope_workspace_propose"})
-                self.assertEqual(self.call(tool, args, "nobody"), {"ok": False, "error": "not_authorized"})
+    def test_read_only_search_needs_only_the_read_scope_but_requests_still_need_propose(self):
+        """Permission split (owner policy: discovery is GREEN). ChatGPT's live search failed because its token held only
+        health.read and search wrongly required workspace.propose. Search now needs only the read scope, like inventory;
+        filing a request still needs workspace.propose, and a genuine health-only token is told which scope is missing."""
+        q = {"device_id": DEVICE, "query": "ncdu"}
+        found = self.call("commander_software_search", q, "readonly")
+        self.assertTrue(found["ok"], found)
+        req = {"device_id": DEVICE, "software": "htop"}
+        self.assertEqual(self.call("commander_request_software_install", req, "readonly"),
+                         {"ok": False, "error": "insufficient_scope_workspace_propose"})
+        self.assertEqual(self.call("commander_request_software_install", req, "nobody"), {"ok": False, "error": "not_authorized"})
+        self.assertEqual(self.call("commander_software_search", q, "nobody")["error"], "device_unavailable_or_not_authorized")
+        self.assertEqual(self.store.pending() if hasattr(self.store, "pending") else [], [])    # search filed nothing
 
     def test_every_refusal(self):
         cases = {

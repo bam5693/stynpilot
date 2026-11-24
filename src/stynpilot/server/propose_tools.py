@@ -105,7 +105,13 @@ def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt
                               "may request it. Changes nothing."))
     def software_search(device_id: str, query: str) -> dict:
         try:
-            guarded(device_id)
+            header = bearer()
+            if header is None:
+                raise ClientDenied("not_authorized")
+            try:
+                router.authorize_read(header, device_id)                  # GREEN: read scope only, like inventory
+            except AccessDenied:
+                raise ClientDenied("device_unavailable_or_not_authorized") from None
             if search_apt is None:
                 return _error("search_unavailable")
             try:
@@ -122,6 +128,10 @@ def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt
                                 "installed_version": item.get("installed"),
                                 "ai_may_request": blocked is None,
                                 **({"blocked_reason": impact.explain(blocked)} if blocked else {})})
+            try:
+                router.authorize_read(header, device_id)                  # a read can outlast a revocation
+            except AccessDenied:
+                raise ClientDenied("device_unavailable_or_not_authorized") from None
             return {"ok": True, "results": results,
                     "note": "Ubuntu archive only. To install, call commander_request_software_install with packages=[names]."}
         except ClientDenied as denied:

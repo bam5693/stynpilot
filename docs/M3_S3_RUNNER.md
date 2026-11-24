@@ -30,6 +30,16 @@ state paths inaccessible). Tests: `tests/test_runner_core.py` (hostile folders, 
 S3b root-door job kinds (create runner user, enroll workspace, run, status, cancel, selftest) with approval and a job
 table; S3c MCP tools (workspace request, file edits inside workspaces, job run/status/output/cancel); S3d one-off command.
 
+## dev12: diagnostics for the live `limits` failure (dev11 live test: 13 of 14 checks passed)
+
+dev11 on the Ryzen passed every confinement check except `limits`, which was one compound check (pids, memory, file-size, /tmp size, write rate). A failure there could not say
+WHICH limit, nor whether it was real enforcement or a visibility problem. dev12 changes ONLY the self-test reporting; the gate stays closed on any failure and no confinement changed.
+
+- `limits` is split into `limit_pids`, `limit_memory`, `limit_fsize`, `limit_tmp`, `limit_io`; each is its own PASS/FAIL and all are required on a backend that enforces limits.
+- The verdict now carries `diagnostics`: the expected and actual value of each limit (numbers and short tokens only, filtered; nothing from the filesystem is echoed) plus the probe's cgroup path.
+- The old duplicate `["limits","limits"]` in `failed` is gone (names are listed once).
+- If the cgroup files cannot be read at all the result is SKIP (visibility), which still fails the gate under systemd: it is reported as `unverified`, distinct from FAIL (enforcement mismatch).
+
 ## dev11: fix from ChatGPT's independent review of dev10 (3c6080f)
 
 One blocker, nothing added. dev10 was never installed: dev11 replaces it as the dev7 upgrade target.

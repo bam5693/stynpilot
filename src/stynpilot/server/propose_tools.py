@@ -245,7 +245,7 @@ def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt
     @server.tool(name="commander_request_stynpilot_upgrade", title="Ask the owner to approve a StyNpilot upgrade",
                  annotations=FILES_A_REQUEST,
                  description=("Ask the owner to approve upgrading StyNpilot itself to a published, SIGNED release "
-                              "(version like 0.1.0~dev11). StyNpilot downloads the release manifest from the project's "
+                              "(version like 0.1.0~dev12). StyNpilot downloads the release manifest from the project's "
                               "fixed release address, checks its signature against keys it already trusts, and files the "
                               "request; the owner sees the version, checksum and signing key on his phone and signs in to "
                               "approve. After approval StyNpilot backs up, installs, restarts, checks itself and "

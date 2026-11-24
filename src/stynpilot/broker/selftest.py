@@ -15,6 +15,7 @@ import pwd
 import shutil
 import socket
 import subprocess
+import re
 import threading
 import time
 from pathlib import Path
@@ -23,10 +24,11 @@ from .. import runner
 
 REQUIRED = ("identity", "no_capabilities", "no_new_privs", "hidden_paths", "home_invisible", "network_isolated",
             "writes_confined", "workspace_writable", "owner_edits_runner_files", "credentials_masked", "host_sockets_hidden", "new_files_isolated", "other_jobs_isolated")
-OPTIONAL = ("limits",)               # must match when readable; REQUIRED (fails if unseen) on a backend that enforces limits
+OPTIONAL = ("limit_pids", "limit_memory", "limit_fsize", "limit_tmp", "limit_io")              # must match when readable; REQUIRED (fails if unseen) on a backend that enforces limits
 SOCKET_GLOBS = ("/run/*.sock", "/run/*/*.sock", "/run/dbus/system_bus_socket", "/run/systemd/private", "/run/systemd/*/private",
                 "/run/user/*/bus", "/run/user/*/*/bus", "/var/run/docker.sock", "/run/containerd/containerd.sock")
 TASKS, MEMORY_MB, SECONDS = 64, 256, 40
+DIAG_NAMES = OPTIONAL + ("cgroup_path", "limits_unreadable")
 
 PROBE = r'''
 import json, os, pwd, socket, sys
@@ -129,21 +131,41 @@ try:
 except OSError:
     ok = False
 say(ok, "workspace_writable")
-try:
-    cg = open("/proc/self/cgroup").read().strip().split("::", 1)[1]
-    base = "/sys/fs/cgroup" + cg
-    pids, mem = open(base + "/pids.max").read().strip(), open(base + "/memory.max").read().strip()
-    import resource
-    fs_ok = resource.getrlimit(resource.RLIMIT_FSIZE)[0] == c["fsize"]
-    sv = os.statvfs("/tmp")
-    tmp_ok = sv.f_blocks * sv.f_frsize <= c["tmp_bytes"] if c["tmp_bytes"] else True
-    io_ok = True
-    if c["io_devs"]:
-        text = open(base + "/io.max").read()
-        io_ok = all(any(line.startswith(d + " ") and ("wbps=%d" % c["wbps"]) in line for line in text.splitlines()) for d in c["io_devs"])
-    print(("PASS " if pids == str(c["tasks"]) and mem == str(c["memory_mb"] * 1024 * 1024) and fs_ok and tmp_ok and io_ok else "FAIL ") + "limits", flush=True)
-except (OSError, IndexError):
+def diag(name, expected, actual):
+    text = "%s %s %s" % (name, str(expected).replace(" ", "_"), str(actual).replace(" ", "_").replace("\n", ";"))
+    print("DIAG " + text[:300], flush=True)
+def limit(ok, name, expected, actual):
+    say(ok, name)
+    diag(name, expected, actual)
+def readable(path):
+    try:
+        return open(path).read().strip()
+    except OSError as e:
+        return "unreadable:" + type(e).__name__
+cg_text = readable("/proc/self/cgroup")
+base = "/sys/fs/cgroup" + cg_text.split("::", 1)[1] if "::" in cg_text else ""
+diag("cgroup_path", "-", (cg_text.split("::", 1)[1] if "::" in cg_text else cg_text).replace("/", ":"))
+pids = readable(base + "/pids.max") if base else "no_cgroup"
+mem = readable(base + "/memory.max") if base else "no_cgroup"
+if pids.startswith(("unreadable", "no_cgroup")) and mem.startswith(("unreadable", "no_cgroup")):
     print("SKIP limits", flush=True)
+    diag("limits_unreadable", "-", pids)
+else:
+    limit(pids == str(c["tasks"]), "limit_pids", c["tasks"], pids)
+    limit(mem == str(c["memory_mb"] * 1024 * 1024), "limit_memory", c["memory_mb"] * 1024 * 1024, mem)
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    limit(soft == c["fsize"] and hard == c["fsize"], "limit_fsize", c["fsize"], "%s/%s" % (soft, hard))
+    sv = os.statvfs("/tmp")
+    size = sv.f_blocks * sv.f_frsize
+    limit(size <= c["tmp_bytes"] if c["tmp_bytes"] else True, "limit_tmp", c["tmp_bytes"], size)
+    if c["io_devs"]:
+        text = readable(base + "/io.max")
+        found = [l for l in text.splitlines() if l]
+        ok = all(any(l.startswith(d + " ") and ("wbps=%d" % c["wbps"]) in l for l in found) for d in c["io_devs"])
+        limit(ok, "limit_io", ",".join(c["io_devs"]) + ":wbps=%d" % c["wbps"], "|".join(l.split(" rbps")[0] + ":" + [w for w in l.split() if w.startswith("wbps=")][0] if "wbps=" in l else l[:40] for l in found) or text[:80])
+    else:
+        diag("limit_io", "no_device", "skipped")
 '''
 
 
@@ -155,18 +177,30 @@ def _owner_can_edit(path, uid, gid):
     return done.returncode == 0
 
 
+_DIAG = re.compile(r"DIAG ([a-z_]{1,32}) ([A-Za-z0-9_:=,.|;\-]{1,80}) ([A-Za-z0-9_:=,.|;\-]{0,200})")
+
+
 def _judge(lines, owner_ok, strict_limits=False):
-    seen = {}
+    seen, diagnostics = {}, {}
     for line in lines:
-        word, _, name = line.strip().partition(" ")
+        line = line.strip()
+        word, _, name = line.partition(" ")
+        if word == "SKIP" and name == "limits":                     # the cgroup files were not readable at all
+            for n in OPTIONAL:
+                seen.setdefault(n, "SKIP")
         if word in ("PASS", "FAIL", "SKIP") and name in REQUIRED + OPTIONAL:
             seen[name] = word
+        got = _DIAG.fullmatch(line)
+        if got and got.group(1) in DIAG_NAMES and len(diagnostics) < 24:
+            diagnostics[got.group(1)] = {"expected": got.group(2), "actual": got.group(3)}          # numbers and short tokens only
     seen["owner_edits_runner_files"] = "PASS" if owner_ok else "FAIL"
     passed = sorted(n for n, w in seen.items() if w == "PASS")
     need = REQUIRED + (OPTIONAL if strict_limits else ())
-    failed = sorted([n for n in need if seen.get(n) != "PASS"] + [n for n in OPTIONAL if seen.get(n) == "FAIL"])
+    failed = sorted({n for n in need if seen.get(n) != "PASS"} | {n for n in OPTIONAL if seen.get(n) == "FAIL"})
     unverified = sorted(n for n in OPTIONAL if seen.get(n) in (None, "SKIP") and not strict_limits)
-    return {"ok": not failed, "passed": passed, "failed": failed, "unverified": unverified}
+    if "limit_io" in OPTIONAL and strict_limits and "limit_io" in failed and diagnostics.get("limit_io", {}).get("expected") == "no_device":
+        failed.remove("limit_io")                                   # no resolvable disk: the start gate already refuses jobs (fail closed)
+    return {"ok": not failed, "passed": passed, "failed": failed, "unverified": unverified, "diagnostics": diagnostics}
 
 
 def _create_late_files(ws, uid, gid, delay):

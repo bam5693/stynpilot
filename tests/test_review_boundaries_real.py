@@ -214,16 +214,30 @@ class Boundary(unittest.TestCase):
         self.assertTrue(os.listdir(self.app / "d"))
 
     def test_the_selftest_requires_limits_to_be_seen_where_the_backend_enforces_them(self):
-        from stynpilot.broker.selftest import REQUIRED, _judge
+        from stynpilot.broker.selftest import OPTIONAL, REQUIRED, _judge
         lines = ["PASS " + n for n in REQUIRED if n != "owner_edits_runner_files"]
+        every = ["PASS " + n for n in OPTIONAL]
         self.assertTrue(_judge(lines, True)["ok"])
         self.assertTrue(_judge(lines + ["SKIP limits"], True)["ok"])
         self.assertFalse(_judge(lines + ["SKIP limits"], True, strict_limits=True)["ok"])
         self.assertFalse(_judge(lines, True, strict_limits=True)["ok"])
-        self.assertFalse(_judge(lines + ["FAIL limits"], True)["ok"])
-        self.assertTrue(_judge(lines + ["PASS limits"], True, strict_limits=True)["ok"])
+        self.assertFalse(_judge(lines + ["FAIL limit_io"], True)["ok"])
+        self.assertTrue(_judge(lines + every, True, strict_limits=True)["ok"])
+        self.assertFalse(_judge(lines + [l for l in every if "limit_tmp" not in l], True, strict_limits=True)["ok"])
         self.assertFalse(_judge([l for l in lines if "credentials_masked" not in l], True)["ok"])
         self.assertFalse(_judge([l for l in lines if "host_sockets_hidden" not in l], True)["ok"])
+
+    def test_each_limit_is_its_own_check_with_safe_diagnostic_values_and_no_duplicates(self):
+        from stynpilot.broker.selftest import REQUIRED, OPTIONAL, _judge
+        lines = ["PASS " + n for n in REQUIRED if n != "owner_edits_runner_files"] + ["PASS " + n for n in OPTIONAL if n != "limit_io"]
+        lines += ["FAIL limit_io", "DIAG limit_io 259:0:wbps=67108864 259:0:wbps=max", "DIAG limit_pids 64 64", "DIAG evil /etc/shadow x",
+                  "DIAG limit_tmp 268439552 " + "9" * 300]
+        verdict = _judge(lines, True, strict_limits=True)
+        self.assertEqual(verdict["failed"], ["limit_io"])                       # named once, and only the check that failed
+        self.assertEqual(verdict["diagnostics"]["limit_io"], {"expected": "259:0:wbps=67108864", "actual": "259:0:wbps=max"})
+        self.assertNotIn("evil", verdict["diagnostics"])                         # only short safe tokens pass the filter
+        self.assertNotIn("limit_tmp", verdict["diagnostics"])
+        self.assertFalse(verdict["ok"])
 
     def test_setup_schedules_one_owner_service_restart_when_it_creates_the_folder_so_an_old_upgrade_worker_is_enough(self):
         from stynpilot.broker.jobs import SystemdBackend

@@ -4,12 +4,13 @@ import json
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from stynpilot.board import Board, Denied
-from stynpilot.runner import ClaudeCodeRunner, RunnerConfigurationError
+from stynpilot.runner import REQUIRED_FLAGS, ClaudeCodeRunner, RunnerConfigurationError
 
 
 class CancelBoard:
@@ -42,6 +43,21 @@ class FinishCancelBoard:
         return self.board.finish(client_id, task_id, lease_id, outcome, summary, verdict=verdict)
 
 
+class LateInstructionBoard:
+    """Delivers one coordinator follow-up while the one-shot CLI session is running."""
+    def __init__(self, board):
+        self.board, self.sent = board, False
+
+    def __getattr__(self, name):
+        return getattr(self.board, name)
+
+    def progress(self, client_id, task_id, lease_id, percent, note=""):
+        if not self.sent:
+            self.sent = True
+            self.board.instruct("owner-client", task_id, "Also check the tests folder")
+        return self.board.progress(client_id, task_id, lease_id, percent, note)
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -56,11 +72,18 @@ class RunnerTests(unittest.TestCase):
         self.board.enroll_assistant("claude-runner-client", "claude-runner", "claude", ["stynpilot"])
         self.cli = self.root / "claude-stub"
 
-    def stub(self, body, auth_method="claude.ai"):
+    def stub(self, body, auth_method="claude.ai", version="2.1.270 (Claude Code)", help_flags=None):
+        flags = " ".join(help_flags if help_flags is not None else REQUIRED_FLAGS)
         auth = ("import json, sys\n"
+                "if sys.argv[1:] == ['--version']:\n"
+                "    print(%r)\n"
+                "    raise SystemExit(0)\n"
+                "if sys.argv[1:] == ['--help']:\n"
+                "    print('Usage: claude [options] ' + %r)\n"
+                "    raise SystemExit(0)\n"
                 "if sys.argv[1:] == ['auth', 'status', '--json']:\n"
                 "    print(json.dumps({'loggedIn': True, 'authMethod': %r}))\n"
-                "    raise SystemExit(0)\n" % auth_method)
+                "    raise SystemExit(0)\n" % (version, flags, auth_method))
         self.cli.write_text("#!/usr/bin/python3\n" + auth + textwrap.dedent(body), encoding="utf-8")
         self.cli.chmod(0o700)
 
@@ -71,6 +94,8 @@ class RunnerTests(unittest.TestCase):
     def runner(self, board=None, **kwargs):
         options = {"poll_interval": 0.02, "stop_grace": 0.2}
         options.update(kwargs)
+        options.setdefault("report_interval", options["poll_interval"])
+        options.setdefault("cancel_check_interval", options["poll_interval"])
         return ClaudeCodeRunner(board or self.board, "claude-runner-client",
                                 {"stynpilot": self.workspace}, self.home, self.cli, **options)
 
@@ -197,6 +222,140 @@ class RunnerTests(unittest.TestCase):
     def test_empty_queue_does_not_start_a_process(self):
         self.stub("raise SystemExit('task process must not start')")
         self.assertIsNone(self.runner().run_once())
+
+    def test_long_session_survives_board_rate_limit(self):
+        now = [time.time()]
+        board = Board(self.root / "limited.sqlite", clock=lambda: now[0])
+        board.enroll_assistant("owner-client", "owner", "chatgpt", ["stynpilot"], can_assign=True)
+        board.enroll_assistant("slow-runner", "slow-runner", "claude", ["stynpilot"], rate_per_minute=3)
+        board.create("owner-client", "stynpilot", "Inspect project", assignee="slow-runner",
+                     claims=("path:src",))
+        waits = []
+
+        def sleep(seconds):          # waiting advances the board's clock instead of real time
+            waits.append(seconds)
+            now[0] += seconds
+        self.stub("""
+            import sys, time
+            sys.stdin.read(); time.sleep(0.6); print("plan ready")
+        """)
+        runner = ClaudeCodeRunner(board, "slow-runner", {"stynpilot": self.workspace}, self.home, self.cli,
+                                  poll_interval=0.02, report_interval=0.02, stop_grace=0.2, sleep=sleep)
+        result = runner.run_once()
+        self.assertEqual(result.state, "done")
+        self.assertIn("plan ready", result.output)
+        self.assertTrue(waits)       # the final report waited out the limit rather than being lost
+        rows = board.list_tasks("owner-client", "stynpilot", include_finished=True)
+        rows = rows.get("tasks", rows) if isinstance(rows, dict) else rows
+        self.assertEqual(rows[0]["state"], "done")
+
+    def test_default_report_interval_is_well_inside_rate_limit_and_lease(self):
+        self.stub("print('x')")
+        runner = ClaudeCodeRunner(self.board, "claude-runner-client", {"stynpilot": self.workspace},
+                                  self.home, self.cli)
+        self.assertGreaterEqual(runner.report_interval, 6.0)   # <= 10 reports/min vs default 20/min
+        with self.assertRaises(RunnerConfigurationError):
+            ClaudeCodeRunner(self.board, "claude-runner-client", {"stynpilot": self.workspace},
+                             self.home, self.cli, report_interval=900)
+
+    def test_late_instruction_is_reported_not_silently_dropped(self):
+        self.task()
+        self.stub("""
+            import sys, time
+            sys.stdin.read(); time.sleep(0.3); print("plan")
+        """)
+        result = self.runner(LateInstructionBoard(self.board)).run_once()
+        self.assertEqual(result.state, "done")
+        rows = self.board.list_tasks("owner-client", "stynpilot", include_finished=True)
+        rows = rows.get("tasks", rows) if isinstance(rows, dict) else rows
+        summary = next(r for r in rows if r["task_id"] == result.task_id).get("result", "")
+        self.assertIn("1 follow-up instruction(s) were not applied", summary)
+
+    def test_instruction_arriving_just_before_finish_is_still_reported(self):
+        """PR #5 review: an instruction after the last checkpoint must not vanish when finish voids it."""
+        self.task()
+        board = self.board
+
+        class LastMomentBoard:
+            def __getattr__(self, name):
+                return getattr(board, name)
+
+            def finish(self, client_id, task_id, lease_id, outcome, summary="", *, verdict=None):
+                board.instruct("owner-client", task_id, "One more thing")   # races the finish
+                return board.finish(client_id, task_id, lease_id, outcome, summary, verdict=verdict)
+        self.stub("""
+            import sys
+            sys.stdin.read(); print("quick plan")
+        """)
+        result = self.runner(LastMomentBoard(), report_interval=30).run_once()   # no checkpoint ever ran
+        self.assertEqual(result.state, "done")
+        rows = self.board.list_tasks("owner-client", "stynpilot", include_finished=True)
+        rows = rows.get("tasks", rows) if isinstance(rows, dict) else rows
+        summary = next(r for r in rows if r["task_id"] == result.task_id)["result"]
+        self.assertIn("1 follow-up instruction(s) were not applied", summary)
+
+    def test_finish_note_fits_the_result_limit(self):
+        created = self.task()
+        claimed = self.board.claim("claude-runner-client")
+        self.board.instruct("owner-client", claimed["task_id"], "late")
+        view = self.board.finish("claude-runner-client", claimed["task_id"], claimed["lease_id"], "done", "x" * 1000)
+        self.assertEqual(view["unapplied_instructions"], 1)
+        self.assertLessEqual(len(view["result"]), 1000)
+        self.assertTrue(view["result"].endswith("send them as a new task.]"))
+
+    def test_owner_cancellation_stops_the_cli_within_seconds_not_the_report_interval(self):
+        """PR #5 review: withdraw is detected by the cheap probe, not the 30 s progress report."""
+        import threading
+        created = self.task()
+        task_id = created["task_id"]
+        self.stub("""
+            import sys, time
+            sys.stdin.read(); time.sleep(20); print("too late")
+        """)
+        timer = threading.Timer(0.4, lambda: self.board.withdraw("owner-client", task_id))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        began = time.monotonic()
+        result = self.runner(report_interval=30, cancel_check_interval=0.1).run_once()
+        elapsed = time.monotonic() - began
+        self.assertEqual((result.state, result.note), ("cancelled", "lease_lost"))
+        self.assertLess(elapsed, 3.0)
+
+    def test_cancellation_probe_does_not_take_the_write_lock(self):
+        import sqlite3
+        self.task()
+        claimed = self.board.claim("claude-runner-client")
+        writer = sqlite3.connect(self.board.path, isolation_level=None, timeout=0.1)
+        writer.execute("BEGIN IMMEDIATE")        # someone else holds the write lock
+        try:
+            self.assertTrue(self.board.still_leased("claude-runner-client", claimed["task_id"], claimed["lease_id"]))
+        finally:
+            writer.execute("ROLLBACK")
+            writer.close()
+
+    def test_cancellation_probe_does_not_spend_the_rate_limit(self):
+        self.board.enroll_assistant("probe-runner", "probe-runner", "claude", ["stynpilot"], rate_per_minute=3)
+        self.board.create("owner-client", "stynpilot", "Inspect", assignee="probe-runner", claims=("path:src",))
+        claimed = self.board.claim("probe-runner")
+        for _ in range(200):
+            self.assertTrue(self.board.still_leased("probe-runner", claimed["task_id"], claimed["lease_id"]))
+        self.board.progress("probe-runner", claimed["task_id"], claimed["lease_id"], 10)   # still allowed
+        self.assertFalse(self.board.still_leased("probe-runner", claimed["task_id"], "wrong-lease"))
+        self.assertFalse(self.board.still_leased("claude-runner-client", claimed["task_id"], claimed["lease_id"]))
+
+    def test_old_cli_is_refused_before_claiming(self):
+        self.task()
+        self.stub("print('should not run')", version="2.1.100 (Claude Code)")
+        result = self.runner().run_once()
+        self.assertEqual((result.state, result.note), ("blocked", "claude_cli_too_old"))
+        self.assertIsNone(result.task_id)
+        self.assertIsNotNone(self.board.claim("claude-runner-client"))  # task still queued
+
+    def test_cli_missing_a_required_flag_is_refused(self):
+        self.task()
+        self.stub("print('x')", help_flags=[f for f in REQUIRED_FLAGS if f != "--restricted"])
+        result = self.runner().run_once()
+        self.assertEqual((result.state, result.note), ("blocked", "claude_cli_missing_required_flags"))
 
 
 if __name__ == "__main__":

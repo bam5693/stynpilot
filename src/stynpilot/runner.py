@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import selectors
 import signal
 import subprocess
@@ -23,7 +24,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .board import Denied
+from .board import LEASE_SECONDS, RATE_WINDOW, Denied
+
+# Claude Code features this runner relies on. Older or unknown CLIs are refused before
+# any task is claimed, so a version mismatch never burns task attempts.
+MIN_CLI_VERSION = (2, 1, 268)
+REQUIRED_FLAGS = ("--restricted", "--permission-mode", "--tools", "--strict-mcp-config",
+                  "--settings", "--output-format", "--no-session-persistence")
 
 
 class TaskBoard(Protocol):
@@ -32,6 +39,7 @@ class TaskBoard(Protocol):
                  percent: int, note: str = "") -> dict: ...
     def finish(self, client_id: str, task_id: str, lease_id: str,
                outcome: str, summary: str = "", *, verdict: str | None = None) -> dict: ...
+    def still_leased(self, client_id: str, task_id: str, lease_id: str) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -60,9 +68,10 @@ class ClaudeCodeRunner:
 
     def __init__(self, board: TaskBoard, client_id: str, workspaces: dict[str, str | Path],
                  worker_home: str | Path, claude_executable: str | Path, *,
-                 poll_interval: float = 1.0, stop_grace: float = 2.0,
+                 poll_interval: float = 1.0, report_interval: float = 30.0,
+                 cancel_check_interval: float = 2.0, stop_grace: float = 2.0,
                  max_runtime: float = 900.0, max_output_bytes: int = 64 * 1024,
-                 popen=subprocess.Popen, clock=time.monotonic):
+                 popen=subprocess.Popen, clock=time.monotonic, sleep=time.sleep):
         if os.geteuid() == 0:
             raise RunnerConfigurationError("Claude runner must never run as root")
         if not isinstance(client_id, str) or not client_id:
@@ -85,12 +94,23 @@ class ClaudeCodeRunner:
             raise RunnerConfigurationError("Claude Code executable must be an absolute path")
         self.worker_home, self.claude_executable = home, cli
         self.poll_interval, self.stop_grace = float(poll_interval), float(stop_grace)
+        # Progress renews the lease and counts against the identity's board rate limit,
+        # so it is sent far less often than output is polled.
+        self.report_interval = float(report_interval)
+        # Cancellation is probed separately and cheaply (board.still_leased is not
+        # rate-limited), so an owner's withdraw is *noticed* within this interval. Stopping can take
+        # longer: stop_grace, a busy database and scheduling add to it. This is a probe interval,
+        # not a hard deadline.
+        self.cancel_check_interval = float(cancel_check_interval)
         self.max_runtime, self.max_output_bytes = float(max_runtime), int(max_output_bytes)
         if not (0.01 <= self.poll_interval <= 30 and 0 <= self.stop_grace <= 30
                 and 1 <= self.max_runtime <= 24 * 60 * 60
-                and 1024 <= self.max_output_bytes <= 1024 * 1024):
+                and 1024 <= self.max_output_bytes <= 1024 * 1024
+                and self.poll_interval <= self.report_interval <= LEASE_SECONDS / 3
+                and self.poll_interval <= self.cancel_check_interval <= 10):
             raise RunnerConfigurationError("Runner bounds are outside supported limits")
-        self._popen, self._clock = popen, clock
+        self._popen, self._clock, self._sleep = popen, clock, sleep
+        self._cli_checked = False
 
     def _environment(self) -> dict[str, str]:
         """Use a small allowlist; in particular never inherit provider/API credentials."""
@@ -161,6 +181,9 @@ class ClaudeCodeRunner:
 
     def run_once(self) -> RunnerResult | None:
         """Claim and process one task; return None when the queue is empty."""
+        cli_problem = self._cli_problem()
+        if cli_problem:
+            return RunnerResult("blocked", note=cli_problem)
         if not self._has_subscription_login():
             return RunnerResult("blocked", note="claude_subscription_login_required")
         task = self.board.claim(self.client_id)
@@ -189,10 +212,11 @@ class ClaudeCodeRunner:
 
         output = bytearray()
         selector = selectors.DefaultSelector()
-        started = last_report = self._clock()
+        started = last_report = last_cancel_check = self._clock()
         exceeded = False
         cancelled = False
         timed_out = False
+
         try:
             assert process.stdin is not None and process.stdout is not None
             process.stdin.write(prompt.encode("utf-8"))
@@ -217,12 +241,22 @@ class ClaudeCodeRunner:
                         selector.unregister(key.fileobj)
                 if exceeded:
                     break
-                if now - last_report >= self.poll_interval:
+                if now - last_cancel_check >= self.cancel_check_interval:
+                    last_cancel_check = now
+                    if not self.board.still_leased(self.client_id, task_id, lease_id):
+                        cancelled = True
+                        self._stop(process)
+                        break
+                if now - last_report >= self.report_interval:
                     try:
                         self.board.progress(self.client_id, task_id, lease_id,
                                             min(95, int((now - started) * 95 / self.max_runtime)),
                                             "Read-only Claude Code session running")
                     except Denied as error:
+                        if error.code == "rate_limited":
+                            # Skip this report; the lease is still valid for minutes.
+                            last_report = now
+                            continue
                         if error.code != "lease_lost":
                             raise
                         cancelled = True
@@ -262,6 +296,8 @@ class ClaudeCodeRunner:
             if not self._finish_or_cancel(task_id, lease_id, "failed", "Read-only session exceeded output limit"):
                 return RunnerResult("cancelled", task_id, process.returncode, decoded[-1000:], "lease_lost")
             return RunnerResult("failed", task_id, process.returncode, note="output_limit")
+        # Follow-up instructions can't reach a one-shot session. The board itself appends a
+        # "not applied" note at finish for every unacknowledged one, however late it arrived.
         if process.returncode == 0:
             summary = "Read-only plan completed. No files or system state were changed."
             if decoded:
@@ -276,13 +312,52 @@ class ClaudeCodeRunner:
 
     def _finish_or_cancel(self, task_id: str, lease_id: str, outcome: str, summary: str) -> bool:
         """A lease revoked after child exit is a normal cancellation race, not a crash."""
+        # The final report must not be lost to the per-minute rate limit. Refused calls also
+        # count toward that limit, so wait out a whole window (the lease lasts much longer).
+        for attempt in range(3):
+            try:
+                self.board.finish(self.client_id, task_id, lease_id, outcome, summary)
+            except Denied as error:
+                if error.code == "lease_lost":
+                    return False
+                if error.code == "rate_limited" and attempt < 2:
+                    self._sleep(RATE_WINDOW + 1)
+                    continue
+                raise
+            return True
+        return False
+
+    def _cli_problem(self) -> str:
+        """Refuse an older or unexpected CLI once, before claiming any work."""
+        if self._cli_checked:
+            return ""
+        version = self._capture([str(self.claude_executable), "--version"])
+        if version is None:
+            return "claude_cli_unavailable"
+        found = re.search(rb"(\d+)\.(\d+)\.(\d+)", version)
+        if found is None or tuple(int(x) for x in found.groups()) < MIN_CLI_VERSION:
+            return "claude_cli_too_old"
+        usage = self._capture([str(self.claude_executable), "--help"])
+        if usage is None or any(flag.encode() not in usage for flag in REQUIRED_FLAGS):
+            return "claude_cli_missing_required_flags"
+        self._cli_checked = True
+        return ""
+
+    def _capture(self, argv: list[str]) -> bytes | None:
+        process = None
         try:
-            self.board.finish(self.client_id, task_id, lease_id, outcome, summary)
-        except Denied as error:
-            if error.code == "lease_lost":
-                return False
-            raise
-        return True
+            process = self._popen(argv, cwd=str(self.worker_home), env=self._environment(),
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, shell=False, start_new_session=True,
+                                  close_fds=True)
+            raw, _ = process.communicate(timeout=10)
+            if process.returncode != 0 or len(raw) > 256 * 1024:
+                return None
+            return raw
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            if process is not None and process.poll() is None:
+                self._stop(process)
+            return None
 
     def _has_subscription_login(self) -> bool:
         """Refuse API-key, Console, and unknown authentication before claiming work."""

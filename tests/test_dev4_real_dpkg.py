@@ -12,6 +12,12 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from stynpilot import upgrade_worker  # noqa: E402
 
+if os.environ.get("STYN_WORKER_SRC"):          # run the drill with an OLDER release's worker (the one that really performs the upgrade)
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("old_upgrade_worker", os.environ["STYN_WORKER_SRC"])
+    upgrade_worker = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(upgrade_worker)
+
 OLD, NEW = os.environ.get("STYN_DEV3_DEB"), os.environ.get("STYN_DEV4_DEB")     # "older" and "newer" package
 
 

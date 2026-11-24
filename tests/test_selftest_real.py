@@ -48,7 +48,8 @@ class SelfTest(unittest.TestCase):
 
     def runner_with(self, backend, **kw):
         jr = JobRunner(self.state, owner_uid=self.owner.pw_uid, home=self.home, backend=backend, version="9.9",
-                       selftest_root=self.sroot, python="/usr/bin/python3", **kw)
+                       selftest_root=self.sroot, python="/usr/bin/python3",
+                       **{"projects_dir": os.path.join(self.home, "StyNpilot-Projects"), **kw})
         return jr
 
     def test_a_confined_sandbox_passes_and_opens_the_gate_for_this_version_only(self):

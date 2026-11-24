@@ -29,6 +29,7 @@ from pathlib import Path
 
 from .. import redact, runner, safefs
 from . import apt
+from .helper import HelperError, LocalHelper, SystemdHelper
 
 MAX_OUT = 256 * 1024
 MAX_ENTRIES = 50000
@@ -76,18 +77,24 @@ def _kill_group(proc):
 class JobRunner:
     def __init__(self, state_dir, *, owner_uid, home, backend=None, run=apt.real_run, run_user=runner.RUN_USER, clock=time.time,
                  max_running=2, extra_deny=(), projects_dir=None, version="0", gate=True,
-                 selftest_root="/var/lib/stynpilot-run", python="/usr/bin/python3"):
+                 selftest_root="/var/lib/stynpilot-run", python="/usr/bin/python3", helper=None):
         self.dir = Path(state_dir)
         self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         # projects_dir: when set, a workspace must be a DIRECT child of it (production: ~/StyNpilot-Projects).
         # gate: general jobs refuse to start until the live confinement self-test passed for THIS version.
-        self.projects_dir = os.path.realpath(projects_dir) if projects_dir else None
+        # A symlinked base is REFUSED (not canonicalised first), so the folder the owner approved is the folder that is used.
+        self.projects_dir = os.path.abspath(projects_dir) if projects_dir else None
         self.version, self.gate, self.selftest_root, self.python = str(version), bool(gate), str(selftest_root), python
         (self.dir / "jobs").mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.owner_uid, self.home, self.run_user = owner_uid, os.path.realpath(home), run_user
+        self.owner_uid, self.home, self.run_user = owner_uid, os.path.abspath(home), run_user
+        owner = pwd.getpwuid(owner_uid)
+        self.owner_name = owner.pw_name
+        self.helper = helper or (SystemdHelper(owner.pw_name) if isinstance(backend or SystemdBackend(), SystemdBackend)
+                                 else LocalHelper(owner_uid, owner.pw_gid))
         self.backend, self.runcmd, self.clock, self.max_running = backend or SystemdBackend(), run, clock, max_running
         self.extra_deny = tuple(str(p) for p in extra_deny) + (str(self.dir),)
         self._lock = threading.Lock()
+        self._ws_lock = threading.RLock()                 # enrol/unenrol/job start never interleave
         self._live = {}                                   # job id -> (thread, process)
         self._db = sqlite3.connect(self.dir / "jobs.sqlite3", check_same_thread=False, isolation_level=None)
         self._db.row_factory = sqlite3.Row
@@ -111,72 +118,70 @@ class JobRunner:
         return pw.pw_uid, pw.pw_gid
 
     # -- workspaces ---------------------------------------------------------------------------------------
-    def _walk(self, root):
-        """(granted paths, count skipped). Plain files and folders on the same file system only."""
-        dev = os.lstat(root).st_dev
-        granted, skipped, stack = [(root, True)], 0, [root]
-        while stack:
-            folder = stack.pop()
-            for entry in os.scandir(folder):
-                try:
-                    info = entry.stat(follow_symlinks=False)
-                    mode = info.st_mode
-                    if info.st_dev != dev or not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
-                        raise ValueError
-                    if stat.S_ISREG(mode) and info.st_nlink > 1:
-                        raise ValueError                       # the inode may also live outside the workspace
-                    safefs.Policy.name_ok(entry.name)
-                except (ValueError, OSError, safefs.FileDenied):
-                    skipped += 1
-                    continue
-                is_dir = stat.S_ISDIR(mode)
-                granted.append((entry.path, is_dir))
-                if is_dir:
-                    stack.append(entry.path)
-                if len(granted) > MAX_ENTRIES:
-                    raise JobError("workspace_too_large")
-        return granted, skipped
+    def _ask(self, op, **fields):
+        request = {"op": op, "home": self.home, "projects": self.projects_dir, "run_user": self.run_user, "owner_user": self.owner_name}
+        request.update(fields)
+        try:
+            return self.helper.call(request)
+        except HelperError as error:
+            raise JobError(error.code) from None
 
-    def _acl(self, paths, spec, *, remove=False):
+    def _acl_scratch(self, folder, spec):
+        """ONLY for the self-test's own root-owned scratch folder (never anything in the owner's home)."""
         for default in (False, True):
-            subset = [p for p, d in paths if d or not default]
-            for i in range(0, len(subset), BATCH):
-                argv = ["setfacl"] + (["-d"] if default else []) + (["-x", spec] if remove else ["-m", spec]) + ["--"] + subset[i:i + BATCH]
-                if self.runcmd(argv, 120)[0] != 0:
-                    raise JobError("could_not_set_permissions_on_the_workspace")
+            argv = ["setfacl"] + (["-d"] if default else []) + ["-m", spec, "--", folder]
+            if self.runcmd(argv, 60)[0] != 0:
+                raise JobError("could_not_set_permissions_on_the_workspace")
+
+    def _workspace_ok(self, path):
+        """The workspace path as the helper (running as the owner) sees it: a REAL folder directly inside the projects folder."""
+        if self.projects_dir is None:
+            return runner.check_workspace(path, home=self.home, extra_deny=self.extra_deny)
+        try:
+            runner.check_workspace_text(path)
+        except runner.RunnerError as error:
+            raise JobError(str(error)) from None
+        if os.path.dirname(path) != self.projects_dir:
+            raise JobError("workspace_must_be_a_folder_directly_inside_the_projects_folder")
+        return self._ask("check", name=os.path.basename(path))["path"]
 
     def enroll(self, path):
         if not self.enabled():
             raise JobError("runner_not_set_up")
-        real = runner.check_workspace(path, home=self.home, extra_deny=self.extra_deny)
-        if self.projects_dir is not None and os.path.dirname(real) != self.projects_dir:
-            raise JobError("workspace_must_be_a_folder_directly_inside_the_projects_folder")
-        with self._lock:
-            if self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
-                raise JobError("already_enrolled")
-            for other in self._db.execute("select path from workspaces"):
-                o = other["path"]
-                if real.startswith(o + "/") or o.startswith(real + "/"):
-                    raise JobError("overlaps_an_enrolled_workspace")
-        uid, _ = self.ensure_user()
-        paths, skipped = self._walk(real)
-        spec = "u:%s:rwX,u:%s:rwX" % (self.run_user, pwd.getpwuid(self.owner_uid).pw_name)
-        self._acl(paths, spec)
-        with self._lock:
-            self._db.execute("insert into workspaces values(?,?,?)", (real, int(self.clock()), skipped))
-        return {"workspace": real, "entries": len(paths), "skipped": skipped}
+        real = self._workspace_ok(path)
+        if real != path:
+            raise JobError("workspace_path_is_or_contains_a_link")
+        self.ensure_user()
+        with self._ws_lock:
+            with self._lock:
+                if self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
+                    raise JobError("already_enrolled")
+                for other in self._db.execute("select path from workspaces"):
+                    o = other["path"]
+                    if real.startswith(o + "/") or o.startswith(real + "/"):
+                        raise JobError("overlaps_an_enrolled_workspace")
+            if self.projects_dir is None:
+                raise JobError("projects_folder_not_configured")
+            done = self._ask("enroll", name=os.path.basename(real))
+            with self._lock:
+                self._db.execute("insert into workspaces values(?,?,?)", (real, int(self.clock()), done["skipped"]))
+        return {"workspace": real, "entries": done["entries"], "skipped": done["skipped"]}
 
     def unenroll(self, path):
-        with self._lock:
-            if self._db.execute("select 1 from jobs j where j.workspace=? and j.state='running'", (path,)).fetchone():
-                raise JobError("a_job_is_running_in_this_workspace")
-            if not self._db.execute("select 1 from workspaces where path=?", (path,)).fetchone():
-                raise JobError("not_enrolled")
-        if os.path.isdir(path) and not os.path.islink(path):
-            paths, _ = self._walk(path)
-            self._acl(paths, "u:%s" % self.run_user, remove=True)
-        with self._lock:
-            self._db.execute("delete from workspaces where path=?", (path,))
+        with self._ws_lock:
+            with self._lock:
+                if self._db.execute("select 1 from jobs j where j.workspace=? and j.state='running'", (path,)).fetchone():
+                    raise JobError("a_job_is_running_in_this_workspace")
+                if not self._db.execute("select 1 from workspaces where path=?", (path,)).fetchone():
+                    raise JobError("not_enrolled")
+                # The row goes FIRST: from this instant no job can start here, then the access is taken away.
+                self._db.execute("delete from workspaces where path=?", (path,))
+            try:
+                self._ask("unenroll", name=os.path.basename(path))
+            except JobError as error:
+                if error.code not in ("workspace_name_invalid", "path_contains_a_link", "folder_must_be_a_real_folder_owned_by_the_owner",
+                                      "os_error_FileNotFoundError"):
+                    raise
         return {"workspace": path, "removed": True}
 
     def workspaces(self):
@@ -185,10 +190,7 @@ class JobRunner:
     # -- jobs ---------------------------------------------------------------------------------------------
     def run(self, workspace, recipe_id, args):
         self.require_ready()
-        with self._lock:
-            if not self._db.execute("select 1 from workspaces where path=?", (workspace,)).fetchone():
-                raise JobError("workspace_not_enrolled")
-        real = runner.check_workspace(workspace, home=self.home, extra_deny=self.extra_deny)     # still the same real folder
+        real = self._workspace_ok(workspace)                                                      # still the same real folder
         if real != workspace:
             raise JobError("workspace_changed")
         argv = runner.build_argv(recipe_id, args, real)
@@ -196,10 +198,12 @@ class JobRunner:
         limits = {"seconds": recipe.seconds, "memory_mb": recipe.memory_mb, "tasks": recipe.tasks, "writes": recipe.writes}
         return self._start(real, recipe_id, argv, limits, recipe.seconds)
 
-    def _start(self, real, label, argv, limits, seconds):
+    def _start(self, real, label, argv, limits, seconds, need_enrolled=True):
         self.ensure_user()
         job_id = secrets.token_hex(16)
-        with self._lock:
+        with self._ws_lock, self._lock:
+            if need_enrolled and not self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
+                raise JobError("workspace_not_enrolled")
             if len(self._live) >= self.max_running:
                 raise JobError("too_many_jobs_running")
             self._db.execute("insert into jobs(id,workspace,recipe,argv,state,created) values(?,?,?,?,?,?)",
@@ -236,15 +240,7 @@ class JobRunner:
                 raise JobError("missing_tool_" + tool.replace("-", "_") + "_install_the_acl_or_systemd_package")
         uid, gid = self.ensure_user()
         if self.projects_dir is not None:
-            if not os.path.lexists(self.projects_dir):
-                os.mkdir(self.projects_dir, 0o700)
-                home_info = os.stat(self.home)
-                os.chown(self.projects_dir, home_info.st_uid, home_info.st_gid)      # the installer is root: hand it to the owner
-            info = os.lstat(self.projects_dir)
-            if os.path.islink(self.projects_dir) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.stat(self.home).st_uid:
-                raise JobError("projects_folder_must_belong_to_the_owner")
-            if info.st_mode & 0o002:
-                raise JobError("projects_folder_is_world_writable")
+            self._ask("prepare")          # made BY the owner (so it is the owner's), refused if a link, foreign or world-writable
         _write_json(self._enabled_file, {"enabled": True, "at": int(self.clock()), "version": self.version})
         return {"runner_user": self.run_user, "projects_folder": self.projects_dir, "enabled": True}
 

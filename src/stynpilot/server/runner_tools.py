@@ -42,7 +42,7 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
     gate = ProposeGate(router=router, clients=clients)
     limiter = limiter or RateLimit(per_minute=120)
     now = clock or (lambda: datetime.now(timezone.utc))
-    projects = os.path.realpath(projects_dir)
+    projects = os.path.abspath(projects_dir)
     ctx = threading.local()
 
     def run(tool, device_id, work, *, write):

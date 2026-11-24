@@ -42,6 +42,15 @@ class RunnerError(Exception):
 
 
 # ---------------------------------------------------------------------------------------------------- workspaces
+def check_workspace_text(path):
+    """The purely lexical half of check_workspace (no file system access, so the root installer can run it with ProtectHome=yes)."""
+    if type(path) is not str or not path or len(path) > 200 or not _PATH_CHARS.fullmatch(path) or not os.path.isabs(path):
+        raise RunnerError("workspace_path_invalid")
+    if os.path.normpath(path) != path or any(part.startswith(".") for part in path.split("/") if part):
+        raise RunnerError("workspace_path_not_canonical_or_hidden")
+    return path
+
+
 def check_workspace(path, *, home, extra_deny=()):
     """The canonical real path of an acceptable workspace, or RunnerError. The path must ALREADY be canonical, so the
     folder the owner approves on the phone is byte-for-byte the folder commands will run in."""

@@ -56,19 +56,20 @@ class Real(unittest.TestCase):
         os.chmod(self.root, 0o755)
         self.owner = pwd.getpwnam(OWNER)
         self.home = os.path.join(self.root, "home")
-        os.makedirs(os.path.join(self.home, "work", "app"))
-        self.ws = os.path.join(self.home, "work", "app")
+        os.makedirs(os.path.join(self.home, "StyNpilot-Projects", "app"))
+        self.ws = os.path.join(self.home, "StyNpilot-Projects", "app")
         self.secret = os.path.join(self.home, "owner-secret.txt")
         Path(self.secret).write_text("top secret")
-        for p in (self.home, os.path.join(self.home, "work"), self.ws, self.secret):
+        for p in (self.home, os.path.join(self.home, "StyNpilot-Projects"), self.ws, self.secret):
             os.chown(p, self.owner.pw_uid, self.owner.pw_gid)
         os.chmod(self.secret, 0o600)
         os.chmod(self.home, 0o755)                         # parents must be traversable for the LOCAL backend only
-        os.chmod(os.path.join(self.home, "work"), 0o755)
+        os.chmod(os.path.join(self.home, "StyNpilot-Projects"), 0o755)
         os.chmod(self.ws, 0o755)
         self.state = os.path.join(self.root, "state")
         os.makedirs(self.state, mode=0o700)
-        self.jr = JobRunner(self.state, owner_uid=self.owner.pw_uid, home=self.home, backend=LocalBackend(), max_running=2, gate=False)
+        self.jr = JobRunner(self.state, owner_uid=self.owner.pw_uid, home=self.home, backend=LocalBackend(), max_running=2, gate=False,
+                            projects_dir=os.path.join(self.home, "StyNpilot-Projects"))
         self.jr.setup()
         self.addCleanup(self.stop_everything)
 
@@ -233,7 +234,7 @@ class Real(unittest.TestCase):
         self.jr.enroll(self.ws)
         self.jr._db.execute("insert into jobs(id,workspace,recipe,argv,state,created) values('%s',?,?,?,?,?)" % ("a" * 32),
                             (self.ws, "probe", "[]", "running", 1))
-        again = JobRunner(self.state, owner_uid=self.owner.pw_uid, home=self.home, backend=LocalBackend(), gate=False)
+        again = JobRunner(self.state, owner_uid=self.owner.pw_uid, home=self.home, backend=LocalBackend(), gate=False, projects_dir=os.path.join(self.home, "StyNpilot-Projects"))
         self.assertEqual(again.reconcile(), 1)
         self.assertEqual(again.status("a" * 32)["state"], "lost")
 

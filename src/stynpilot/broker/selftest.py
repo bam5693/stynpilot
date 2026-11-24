@@ -138,14 +138,14 @@ def run_selftest(jr, *, timeout=60):
     os.chown(scratch, owner.pw_uid, owner.pw_gid)
     ws = str(os.path.realpath(scratch))
     spec = "u:%s:rwX,u:%s:rwX" % (jr.run_user, owner.pw_name)
-    jr._acl([(ws, True)], spec)
+    jr._acl_scratch(ws, spec)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
     listener.listen(4)
     try:
         try:
-            home_names = sorted(os.listdir(jr.home))[:200]
-        except OSError:
+            home_names = jr._ask("home_names")["names"]            # listed by the owner-side helper: root cannot see the home folder
+        except Exception:
             home_names = []
         config = {"run_user": jr.run_user, "run_uid": uid, "run_gid": gid, "owner_uid": jr.owner_uid, "ws": ws,
                   "hidden": [p for p in runner.HIDDEN_PATHS + getattr(jr.backend, "extra_hidden", ()) if os.path.lexists(p)],
@@ -154,7 +154,7 @@ def run_selftest(jr, *, timeout=60):
         lines, job_status, started = [], None, time.time()
         try:
             job = jr._start(ws, "selftest", [jr.python, "-I", "-c", PROBE, json.dumps(config)],
-                            {"seconds": SECONDS, "memory_mb": MEMORY_MB, "tasks": TASKS, "writes": True}, SECONDS)
+                            {"seconds": SECONDS, "memory_mb": MEMORY_MB, "tasks": TASKS, "writes": True}, SECONDS, need_enrolled=False)
             job_status = jr.wait(job["job_id"], timeout)
             try:
                 lines = (jr.dir / "jobs" / job["job_id"] / "out.log").read_text(errors="replace").splitlines()

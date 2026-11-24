@@ -277,8 +277,9 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
                                          project_roots=safefs.load_project_roots(state / PROJECT_ROOTS_FILE, home),
                                          extra_deny=[config.state_dir, config.pairing_db, config.broker_socket]),
                     diagnostics=Diagnostics())
+        runner_tools = dict(broker=broker, projects_dir=os.path.join(home, "StyNpilot-Projects"))
         service.mcp = (start_mcp or run.start)(router=router, public_host=config.mcp_public_host,
-                                               port=config.mcp_port, propose=propose, diag=diag)
+                                               port=config.mcp_port, propose=propose, diag=diag, runner=runner_tools)
     except Exception:
         service.stop()
         raise

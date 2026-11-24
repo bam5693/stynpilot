@@ -171,7 +171,7 @@ class ScopeChallenge:
         return await self.app(scope, receive, tell)
 
 
-def build_app(*, router, public_host, port, scopes=None, propose=None, diag=None):
+def build_app(*, router, public_host, port, scopes=None, propose=None, diag=None, runner=None):
     """The ASGI app: MCP at /mcp plus its metadata document, both host-checked."""
     from starlette.responses import JSONResponse
     from starlette.routing import Route
@@ -183,7 +183,7 @@ def build_app(*, router, public_host, port, scopes=None, propose=None, diag=None
     resource = "https://%s/mcp" % public_host
     hosts = [public_host, "%s:%d" % (LISTEN_ADDRESS, port)]
     scopes = scopes or (PROPOSE_SCOPES if propose else READ_SCOPES)
-    server = create_server(router=router, resource_url=resource, allowed_hosts=hosts, propose=propose, diag=diag)
+    server = create_server(router=router, resource_url=resource, allowed_hosts=hosts, propose=propose, diag=diag, runner=runner)
     app = server.streamable_http_app()
     document = protected_resource_metadata(resource, router.tokens.issuer, scopes)
     allowed = {h.lower() for h in hosts}
@@ -209,7 +209,7 @@ class Running:
         self.thread.join(timeout=timeout)
 
 
-def start(*, router, public_host, port, address=LISTEN_ADDRESS, startup_timeout=15, propose=None, diag=None):
+def start(*, router, public_host, port, address=LISTEN_ADDRESS, startup_timeout=15, propose=None, diag=None, runner=None):
     """Start in a background thread. Only 127.0.0.1, an unprivileged port and a strict host name."""
     if propose is not None and getattr(propose.get("clients"), "revocations", None) is None:
         raise ValueError("Request tools need a durable revocation file (EnrolledClients(revocations=...))")
@@ -219,7 +219,7 @@ def start(*, router, public_host, port, address=LISTEN_ADDRESS, startup_timeout=
         raise PermissionError("Unprivileged port required")
     check_public_host(public_host)
     import uvicorn
-    app = build_app(router=router, public_host=public_host, port=port, propose=propose, diag=diag)
+    app = build_app(router=router, public_host=public_host, port=port, propose=propose, diag=diag, runner=runner)
     web = uvicorn.Server(uvicorn.Config(app, host=address, port=port, log_level="warning",
                                         proxy_headers=False, server_header=False))
     thread = threading.Thread(target=web.run, name="stynpilot-mcp", daemon=True)

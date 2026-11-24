@@ -38,8 +38,12 @@ REQUEST_TOOLS = ("commander_software_catalog", "commander_software_search", "com
                  "commander_software_install_status", "commander_request_software_rollback",
                  "commander_request_stynpilot_upgrade")
 # Tools that file or read requests need workspace.propose; search and the catalog list are read-only (GREEN).
+# The runner tools that change anything (request, edit files, run, cancel) need workspace.propose too.
+RUNNER_WRITE_TOOLS = frozenset({"commander_request_runner_setup", "commander_request_workspace_authorization",
+                                "commander_request_workspace_removal", "workspace_write", "workspace_edit", "workspace_move",
+                                "workspace_delete", "job_run", "job_cancel", "runner_selftest"})
 PROPOSE_ONLY_TOOLS = frozenset({"commander_request_software_install", "commander_software_install_status",
-                                "commander_request_software_rollback", "commander_request_stynpilot_upgrade"})
+                                "commander_request_software_rollback", "commander_request_stynpilot_upgrade"}) | RUNNER_WRITE_TOOLS
 FILES_A_REQUEST = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 

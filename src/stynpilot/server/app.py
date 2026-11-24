@@ -59,7 +59,7 @@ def _bearer():
     return "Bearer " + raw
 
 
-def create_server(*, router, resource_url, allowed_hosts=None, propose=None, diag=None):
+def create_server(*, router, resource_url, allowed_hosts=None, propose=None, diag=None, runner=None):
     """``propose``: optional dict(clients=EnrolledClients, store=RequestStore, resolve_apt=..., approval_url=...)
     that adds the YELLOW request tools. Without it the server is read-only."""
     if not isinstance(router, ReadRouter):
@@ -87,6 +87,8 @@ def create_server(*, router, resource_url, allowed_hosts=None, propose=None, dia
         instructions=("Read the paired computer's health and the status of StyNpilot-installed software"
                       + (", plus diagnostics, service logs and protected text-file reads" if diag else "")
                       + (", and ask the owner to approve catalog software installs or rollbacks" if propose else "")
+                      + (", and work inside project folders the owner authorized (edit files, run approved test/build commands in a "
+                         "locked-down sandbox)" if runner else "")
                       + ". This server cannot approve anything; the owner approves separately on his phone."),
         auth=AuthSettings(issuer_url=router.tokens.issuer, resource_server_url=exact,
                           required_scopes=[READ_SCOPE], validate_token_resource=False),
@@ -154,5 +156,10 @@ def create_server(*, router, resource_url, allowed_hosts=None, propose=None, dia
     if propose is not None:
         from .propose_tools import register
         register(server, router=router, bearer=_bearer, **propose)
+
+    if runner is not None:
+        from .runner_tools import register as register_runner
+        register_runner(server, router=router, bearer=_bearer, clients=propose["clients"], store=propose["store"],
+                        approval_url=propose.get("approval_url"), **runner)
 
     return server

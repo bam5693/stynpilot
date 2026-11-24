@@ -147,6 +147,10 @@ def build_argv(recipe_id, args, workspace):
         if type(a) is not str or not a or len(a) > MAX_ARG_LEN or any(ord(c) < 32 or ord(c) == 127 for c in a):
             raise RunnerError("argument_invalid")
     out, i, valued = list(recipe.argv), 0, dict(recipe.valued)
+    if out[0] == "/usr/bin/git":
+        # The folder belongs to the owner and git runs as the locked-down account: git refuses that ("dubious
+        # ownership") unless THIS folder, which the owner authorized, is named as safe on the command line.
+        out[1:1] = ["-c", "safe.directory=" + workspace]
     while i < len(args):
         a = args[i]
         if a in recipe.flags or any(p.fullmatch(a) for p in recipe.flag_patterns):

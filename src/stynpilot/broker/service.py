@@ -94,12 +94,15 @@ class BrokerService:
                 except LedgerError as refused:
                     return {"ok": False, "error": refused.code}
                 return {"ok": True, "request_id": entry["request_id"], "snapshot_id": entry["snapshot_id"]}
-            if op in ("install", "rollback", "upgrade", "deny"):
+            if op == "runner":
+                return {"ok": True, "result": self.executor.runner_call(message.get("call"), message.get("args"))}
+            if op in ("install", "rollback", "upgrade", "deny", "runner_admin"):
                 if not self._busy.acquire(blocking=False):
                     return {"ok": False, "error": "busy"}          # one change at a time
                 try:
                     method = {"install": self.executor.install, "rollback": self.executor.rollback,
-                              "upgrade": self.executor.upgrade, "deny": self.executor.deny}[op]
+                              "upgrade": self.executor.upgrade, "deny": self.executor.deny,
+                              "runner_admin": self.executor.runner_admin}[op]
                     result = method(message.get("payload"), message.get("proof"), message.get("challenge"))
                 finally:
                     self._busy.release()
@@ -233,6 +236,13 @@ class BrokerClient:
 
     def upgrade(self, payload, proof, challenge):
         return self._ask({"op": "upgrade", "payload": payload, "proof": proof, "challenge": challenge}, 600)["result"]
+
+    def runner_admin(self, payload, proof, challenge):
+        return self._ask({"op": "runner_admin", "payload": payload, "proof": proof, "challenge": challenge}, 300)["result"]
+
+    def runner(self, call, args=None):
+        """GREEN runner operations on the owner-only socket (no approval): status, self-test, run, jobs, output, cancel."""
+        return self._ask({"op": "runner", "call": call, "args": args or {}}, 120)["result"]
 
     def deny(self, payload, proof, challenge):
         return self._ask({"op": "deny", "payload": payload, "proof": proof, "challenge": challenge}, 60)["result"]

@@ -162,7 +162,7 @@ class ApprovalFlow:
                 return {"state": "denied", "request_id": rid, "recorded_by_installer": False,
                         "note": getattr(error, "code", "unavailable")}
             return {"state": "denied", "request_id": rid, "recorded_by_installer": bool(result.get("ok"))}
-        wanted = {"rollback": "rollback", "upgrade": "upgrade"}.get(payload.get("kind"), "install")
+        wanted = {"rollback": "rollback", "upgrade": "upgrade", "runner": "runner_admin"}.get(payload.get("kind"), "install")
         method = getattr(self.broker, wanted, None)
         if method is None:
             return self._uncertain(rid)

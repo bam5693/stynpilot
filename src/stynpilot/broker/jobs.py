@@ -77,6 +77,7 @@ class JobRunner:
                  max_running=2, extra_deny=(), projects_dir=None, version="0", gate=True,
                  selftest_root="/var/lib/stynpilot-run", python="/usr/bin/python3"):
         self.dir = Path(state_dir)
+        self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         # projects_dir: when set, a workspace must be a DIRECT child of it (production: ~/StyNpilot-Projects).
         # gate: general jobs refuse to start until the live confinement self-test passed for THIS version.
         self.projects_dir = os.path.realpath(projects_dir) if projects_dir else None
@@ -332,6 +333,16 @@ class JobRunner:
         window = clean[offset:offset + limit]
         return {"text": window, "offset": offset, "next_offset": offset + len(window), "total": len(clean),
                 "redactions": found, "note": safefs.UNTRUSTED}
+
+    def recent(self, limit=20, workspace=None):
+        limit = max(1, min(int(limit), 50))
+        if workspace is None:
+            rows = self._db.execute("select id,workspace,recipe,state,created,started,ended,exit_code,truncated from jobs "
+                                    "where recipe!='selftest' order by created desc limit ?", (limit,)).fetchall()
+        else:
+            rows = self._db.execute("select id,workspace,recipe,state,created,started,ended,exit_code,truncated from jobs "
+                                    "where recipe!='selftest' and workspace=? order by created desc limit ?", (workspace, limit)).fetchall()
+        return [dict(r) for r in rows]
 
     def reconcile(self):
         """After an installer restart: a 'running' job with no live worker is lost (its unit is stopped for safety)."""

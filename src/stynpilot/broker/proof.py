@@ -66,6 +66,23 @@ def proof_fingerprint(id_token):
 
 def render_summary(payload):
     """Plain-English text of an install or rollback payload, produced by the root installer itself."""
+    if payload.get("kind") == "runner":
+        expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
+        name = str(payload.get("name"))
+        if payload.get("action") == "setup":
+            return ["Set up the sandboxed command runner (one time).",
+                    "This creates a locked-down system account named stynpilot-run (no login, no sudo, no network, no groups) "
+                    "and a folder called StyNpilot-Projects in your home folder. It authorizes no project and runs nothing by itself.",
+                    "StyNpilot then runs a built-in self-test that tries to break out of the sandbox. Assistants cannot run any "
+                    "command until that test passes.", expires]
+        if payload.get("action") == "enroll":
+            return ["Authorize the project folder StyNpilot-Projects/%s for assistant work." % name,
+                    "Assistants may read and edit files in that folder, and run a short fixed list of approved commands there "
+                    "(tests, builds, git status/diff/log) inside the sandbox as the locked-down account: no network, no view of "
+                    "your other files, passwords or StyNpilot's own data. The folder is created if it does not exist.",
+                    "You can remove this authorization at any time.", expires]
+        return ["Remove the authorization for StyNpilot-Projects/%s." % name,
+                "Assistants will no longer be able to edit or run commands there. Your files are not deleted.", expires]
     if payload.get("kind") == "rollback":
         return ["Roll back %s (install %s)." % (payload.get("software"), str(payload.get("rollback_id"))[:12]),
                 "Packages that install added are removed (their settings files are kept); packages it "

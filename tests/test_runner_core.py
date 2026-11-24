@@ -83,7 +83,9 @@ class Recipes(unittest.TestCase):
         for rid, recipe in runner.RECIPES.items():
             argv = build_argv(rid, [], self.ws)
             self.assertTrue(os.path.isabs(argv[0]), rid)
-            self.assertEqual(argv, recipe.argv)
+            expected = recipe.argv if recipe.argv[0] != "/usr/bin/git" else (
+                recipe.argv[:1] + ("-c", "safe.directory=" + self.ws) + recipe.argv[1:])
+            self.assertEqual(argv, expected)
 
     def test_valid_arguments_are_passed_through_in_order(self):
         self.assertEqual(build_argv("make", ["-j4", "-k", "test"], self.ws)[-3:], ("-j4", "-k", "test"))
@@ -139,7 +141,7 @@ class Recipes(unittest.TestCase):
             except RunnerError:
                 continue
             recipe = runner.RECIPES[rid]
-            extra = argv[len(recipe.argv):]
+            extra = argv[len(recipe.argv) + (2 if recipe.argv[0] == '/usr/bin/git' else 0):]
             valued = dict(recipe.valued)
             skip = False
             for i, a in enumerate(extra):

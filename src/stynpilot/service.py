@@ -380,6 +380,13 @@ def build_installer(config, *, jwks, jwks_loader=None, run_command=apt.real_run,
     verifier = ProofVerifier(issuer=config.issuer, approval_client_id=config.approval_client_id, jwks=jwks,
                              jwks_loader=jwks_loader)
     executor_options.setdefault("owner_uid", config.owner_uid)
+    if "jobs" not in executor_options and require_root:
+        import pwd
+        from . import __version__
+        from .broker.jobs import JobRunner
+        home = pwd.getpwuid(config.owner_uid).pw_dir
+        executor_options["jobs"] = JobRunner(config.state_dir, owner_uid=config.owner_uid, home=home, run=run_command,
+                                             projects_dir=os.path.join(home, "StyNpilot-Projects"), version=__version__)
     executor = Executor(state_dir=config.state_dir, owner=config.owner, device=config.device, verifier=verifier,
                         run=run_command, require_root=require_root, **executor_options)
     return BrokerService(socket_path=config.socket_path, executor=executor, allowed_uid=config.owner_uid)

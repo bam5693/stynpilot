@@ -39,6 +39,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
+import re
 import secrets
 import shutil
 import sys
@@ -55,6 +57,8 @@ from ..plan import PlanError, validate_plan
 from ..requests import request_id as payload_hash
 from .. import backup, release
 from . import apt
+from .. import runner as runner_policy
+from .jobs import JobError
 from .proof import ProofDenied, decision_nonce, render_summary, summary_hash
 from .upgrade import UpgradeRefused, Upgrader
 
@@ -154,7 +158,7 @@ def _sha256(path):
 class Executor:
     def __init__(self, *, state_dir, owner, device, verifier, run=apt.real_run, require_root=True,
                  sources_root="/etc/apt", file_root="/", owner_uid=None, release_keys=None, fetch_release=None,
-                 launch_worker=None, upgrade_options=None):
+                 launch_worker=None, upgrade_options=None, jobs=None):
         self.dir = Path(state_dir)
         if require_root and not apt.is_root():
             raise ExecutionDenied("installer_must_run_as_root")
@@ -175,6 +179,9 @@ class Executor:
         self.owner_uid = owner_uid
         self.upgrader = Upgrader(self, keys=release_keys, fetch=fetch_release, launch=launch_worker,
                                  options=upgrade_options)
+        self.jobs = jobs
+        if jobs is not None:
+            jobs.reconcile()
         # A run still marked "running" means the installer died mid-change. We can't know what state
         # the machine is in, so record that durably and refuse new installs until the owner looks.
         # An UPGRADE run is different: its worker runs on its own and outlives this installer's restart, so it is
@@ -283,6 +290,10 @@ class Executor:
                     "nonce": decision_nonce(decision, rid, rid, challenge),
                     "summary": summary, "summary_sha256": summary_hash(summary), "expires_in": CHALLENGE_LIFETIME}
         summary = render_summary(payload)
+        if payload.get("kind") == "runner":
+            return {"request_id": rid, "decision": decision, "challenge": challenge,
+                    "nonce": decision_nonce(decision, rid, rid, challenge),
+                    "summary": summary, "summary_sha256": summary_hash(summary), "expires_in": CHALLENGE_LIFETIME}
         if payload.get("kind") != "rollback" and catalog.is_generic(payload.get("software")):
             try:
                 found = self.package_notes(payload)
@@ -304,6 +315,8 @@ class Executor:
             raise ExecutionDenied("an_upgrade_is_still_running")
         if payload.get("kind") == "upgrade":
             return self._check_upgrade_payload(payload)
+        if payload.get("kind") == "runner":
+            return self._check_runner_payload(payload)
         if payload.get("kind") == "rollback":
             return self._check_rollback_payload(payload)
         return self._check_install_payload(payload)
@@ -326,6 +339,128 @@ class Executor:
         rid = self._decide(payload, proof_token, challenge, "deny", payload.get("kind", "install"))
         self.runs.finish(rid, "denied", {"ok": True, "denied_by_owner": True})
         return {"ok": True, "denied_by_owner": True}
+
+    # -- sandboxed command runner ------------------------------------------------------------------
+    _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}\Z")
+    _RUNNER_KEYS = {"kind", "action", "name", "owner", "device", "expires_at"}
+
+    def _check_runner_payload(self, payload):
+        if self.jobs is None:
+            raise ExecutionDenied("runner_not_available")
+        action = payload.get("action")
+        if (set(payload) != self._RUNNER_KEYS or payload.get("kind") != "runner" or action not in ("setup", "enroll", "unenroll")
+                or payload.get("owner") != self.owner or payload.get("device") != self.device):
+            raise ExecutionDenied("runner_request_invalid")
+        name = payload.get("name")
+        if type(name) is not str or (name != "" if action == "setup" else not self._NAME.fullmatch(name)):
+            raise ExecutionDenied("runner_request_invalid")
+        try:
+            expires = datetime.strptime(payload["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            raise ExecutionDenied("runner_request_invalid") from None
+        if expires <= datetime.now(timezone.utc):
+            raise ExecutionDenied("plan_invalid_or_expired")
+        if self.needs_attention():
+            raise ExecutionDenied("owner_intervention_required")
+        if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
+            raise ExecutionDenied("already_decided_or_used")
+        if action != "setup" and not self.jobs.enabled():
+            raise ExecutionDenied("runner_not_set_up")
+        return payload
+
+    def runner_admin(self, payload, proof_token, challenge):
+        """Execute an owner-approved runner change (setup, authorize a workspace, remove one). Synchronous."""
+        self._check_payload(payload)
+        self._no_other_change()
+        rid = self._decide(payload, proof_token, challenge, "approve", "runner")
+        try:
+            result = self._runner_do(payload)
+        except (JobError, runner_policy.RunnerError) as stopped:
+            result = {"ok": False, "stopped": stopped.code, "changed_anything": None, "action": payload["action"]}
+        except Exception as error:
+            result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__, "changed_anything": None,
+                      "action": payload["action"]}
+        self._record_result(rid, "done" if result.get("ok") else "failed", result)
+        return result
+
+    def _workspace_path(self, name):
+        if type(name) is not str or not self._NAME.fullmatch(name) or self.jobs.projects_dir is None:
+            raise ExecutionDenied("workspace_name_invalid")
+        return os.path.join(self.jobs.projects_dir, name)
+
+    def _runner_do(self, payload):
+        action = payload["action"]
+        if action == "setup":
+            info = self.jobs.setup()
+            test = self.jobs.selftest()
+            return {"ok": True, "action": "setup", "runner_user": info["runner_user"], "enabled": True,
+                    "selftest": self._safe_selftest(test)}
+        path = self._workspace_path(payload["name"])
+        if action == "enroll":
+            if not os.path.lexists(path):
+                owner = pwd.getpwuid(self.owner_uid)
+                os.mkdir(path, 0o700)
+                os.chown(path, owner.pw_uid, owner.pw_gid)
+            done = self.jobs.enroll(path)
+            return {"ok": True, "action": "enroll", "workspace": payload["name"], "entries": done["entries"],
+                    "skipped": done["skipped"]}
+        self.jobs.unenroll(path)
+        return {"ok": True, "action": "unenroll", "workspace": payload["name"]}
+
+    @staticmethod
+    def _safe_selftest(state):
+        return {"ok": state.get("ok") is True, "ran": bool(state.get("ran")), "passed": list(state.get("passed", [])),
+                "failed": list(state.get("failed", [])), "unverified": list(state.get("unverified", [])),
+                "version": str(state.get("version", ""))[:40], "at": state.get("at")}
+
+    def runner_call(self, call, args):
+        """GREEN runner operations (owner-only socket, no approval): refused while an upgrade runs."""
+        if self.jobs is None:
+            raise ExecutionDenied("runner_not_available")
+        if type(call) is not str or type(args) is not dict:
+            raise ExecutionDenied("runner_call_invalid")
+        self._settle_upgrades()
+        if any(self.upgrader.is_job(r) for r in self.runs.running()):
+            raise ExecutionDenied("an_upgrade_is_still_running")
+        try:
+            return self._runner_green(call, args)
+        except (JobError, runner_policy.RunnerError) as stopped:
+            raise ExecutionDenied(stopped.code) from None
+
+    def _runner_green(self, call, args):
+        jobs, base = self.jobs, self.jobs.projects_dir
+        name_of = lambda path: os.path.basename(path)
+        if call == "status":
+            enabled = jobs.enabled()
+            test = jobs.selftest_state()
+            return {"enabled": enabled, "selftest": self._safe_selftest(test) if test.get("ran") else {"ran": False, "ok": False},
+                    "gate_open": enabled and test.get("ok") is True and test.get("version") == jobs.version,
+                    "workspaces": [name_of(w["path"]) for w in jobs.workspaces()],
+                    "recipes": {rid: r.title for rid, r in sorted(runner_policy.RECIPES.items())}}
+        if call == "selftest":
+            return self._safe_selftest(jobs.selftest())
+        if call == "workspaces":
+            return {"workspaces": [{"name": name_of(w["path"]), "enrolled_at": w["enrolled_at"]} for w in jobs.workspaces()]}
+        if call == "run":
+            recipe, extra = args.get("recipe"), args.get("args", [])
+            if type(recipe) is not str or type(extra) is not list or not all(type(a) is str for a in extra):
+                raise ExecutionDenied("runner_call_invalid")
+            started = jobs.run(self._workspace_path(args.get("workspace")), recipe, extra)
+            return {"job_id": started["job_id"], "argv": started["argv"], "limits": started["limits"]}
+        if call == "jobs":
+            ws = args.get("workspace")
+            rows = jobs.recent(args.get("limit", 20), None if ws is None else self._workspace_path(ws))
+            return {"jobs": [dict(r, workspace=name_of(r["workspace"])) for r in rows]}
+        if call in ("job_status", "job_output", "job_cancel"):
+            job_id = args.get("job_id")
+            if call == "job_cancel":
+                return jobs.cancel(job_id)
+            if call == "job_output":
+                return jobs.output(job_id, args.get("offset", 0), args.get("limit", 32768))
+            st = jobs.status(job_id)
+            st["workspace"] = name_of(st["workspace"])
+            return st
+        raise ExecutionDenied("runner_call_unknown")
 
     # -- self-upgrade ---------------------------------------------------------------------------
     def _check_upgrade_payload(self, payload):

@@ -8,6 +8,7 @@ The probe prints only ``PASS|FAIL|SKIP <check>`` lines: no paths, no file conten
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import pwd
@@ -20,8 +21,10 @@ from pathlib import Path
 from .. import runner
 
 REQUIRED = ("identity", "no_capabilities", "no_new_privs", "hidden_paths", "home_invisible", "network_isolated",
-            "writes_confined", "workspace_writable", "owner_edits_runner_files")
-OPTIONAL = ("limits",)               # must match when readable; "unverified" when the kernel does not show it
+            "writes_confined", "workspace_writable", "owner_edits_runner_files", "credentials_masked", "host_sockets_hidden")
+OPTIONAL = ("limits",)               # must match when readable; REQUIRED (fails if unseen) on a backend that enforces limits
+SOCKET_GLOBS = ("/run/*.sock", "/run/*/*.sock", "/run/dbus/system_bus_socket", "/run/systemd/private", "/run/systemd/*/private",
+                "/run/user/*/bus", "/run/user/*/*/bus", "/var/run/docker.sock", "/run/containerd/containerd.sock")
 TASKS, MEMORY_MB, SECONDS = 64, 256, 40
 
 PROBE = r'''
@@ -54,6 +57,18 @@ def reads(path):
     except OSError:
         return False
 say(not any(reads(p) for p in c["hidden"]), "hidden_paths")
+say(c["canaries"] and not any(reads(p) for p in c["canaries"]), "credentials_masked")
+def unix(path):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(2)
+    try:
+        s.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+say(not any(unix(p) for p in c["sockets"]), "host_sockets_hidden")
 ws_parts = set(c["ws"].split("/"))
 leaks = [n for n in c["home_names"] if n not in ws_parts and os.path.lexists(os.path.join(c["home"], n))]
 say(not leaks, "home_invisible")
@@ -84,8 +99,9 @@ def writes(path):
 say(not any(writes(os.path.join(d, ".stynpilot-selftest")) for d in c["no_write"]), "writes_confined")
 mine = os.path.join(c["ws"], "probe.txt")
 try:
-    with open(mine, "w") as handle:
-        handle.write("probe")
+    fd = os.open(mine, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)      # 0600 on purpose: the owner must still be able to edit it
+    os.write(fd, b"probe")
+    os.close(fd)
     ok = os.stat(mine).st_uid == c["run_uid"]
 except OSError:
     ok = False
@@ -94,7 +110,11 @@ try:
     cg = open("/proc/self/cgroup").read().strip().split("::", 1)[1]
     base = "/sys/fs/cgroup" + cg
     pids, mem = open(base + "/pids.max").read().strip(), open(base + "/memory.max").read().strip()
-    print(("PASS " if pids == str(c["tasks"]) and mem == str(c["memory_mb"] * 1024 * 1024) else "FAIL ") + "limits", flush=True)
+    import resource
+    fs_ok = resource.getrlimit(resource.RLIMIT_FSIZE)[0] == c["fsize"]
+    sv = os.statvfs("/tmp")
+    tmp_ok = sv.f_blocks * sv.f_frsize <= c["tmp_bytes"] if c["tmp_bytes"] else True
+    print(("PASS " if pids == str(c["tasks"]) and mem == str(c["memory_mb"] * 1024 * 1024) and fs_ok and tmp_ok else "FAIL ") + "limits", flush=True)
 except (OSError, IndexError):
     print("SKIP limits", flush=True)
 '''
@@ -108,7 +128,7 @@ def _owner_can_edit(path, uid, gid):
     return done.returncode == 0
 
 
-def _judge(lines, owner_ok):
+def _judge(lines, owner_ok, strict_limits=False):
     seen = {}
     for line in lines:
         word, _, name = line.strip().partition(" ")
@@ -116,8 +136,9 @@ def _judge(lines, owner_ok):
             seen[name] = word
     seen["owner_edits_runner_files"] = "PASS" if owner_ok else "FAIL"
     passed = sorted(n for n, w in seen.items() if w == "PASS")
-    failed = sorted([n for n in REQUIRED if seen.get(n) != "PASS"] + [n for n in OPTIONAL if seen.get(n) == "FAIL"])
-    unverified = sorted(n for n in OPTIONAL if seen.get(n) in (None, "SKIP"))
+    need = REQUIRED + (OPTIONAL if strict_limits else ())
+    failed = sorted([n for n in need if seen.get(n) != "PASS"] + [n for n in OPTIONAL if seen.get(n) == "FAIL"])
+    unverified = sorted(n for n in OPTIONAL if seen.get(n) in (None, "SKIP") and not strict_limits)
     return {"ok": not failed, "passed": passed, "failed": failed, "unverified": unverified}
 
 
@@ -139,6 +160,20 @@ def run_selftest(jr, *, timeout=60):
     ws = str(os.path.realpath(scratch))
     spec = "u:%s:rwX,u:%s:rwX" % (jr.run_user, owner.pw_name)
     jr._acl_scratch(ws, spec)
+    # Canaries: credential-looking files that are WORLD-READABLE (0666), the case an ACL "skip" does not protect against.
+    os.makedirs(os.path.join(ws, ".ssh"), mode=0o777)
+    os.makedirs(os.path.join(ws, ".stynpilot-trash"), mode=0o777)
+    for rel in (".env", ".ssh/id_ed25519", ".stynpilot-trash/old.txt"):
+        full = os.path.join(ws, rel)
+        with open(full, "w") as handle:
+            handle.write("canary")
+        os.chmod(full, 0o666)
+    for rel in (".ssh", ".stynpilot-trash"):
+        os.chmod(os.path.join(ws, rel), 0o777)
+    from .. import projects_helper
+    masked = jr._safe_masked(ws, [ws + "/" + n for n in projects_helper.scan_protected(ws)])
+    canaries = [ws + "/.env", ws + "/.ssh/id_ed25519", ws + "/.stynpilot-trash/old.txt"]
+    sockets = sorted({p for g in SOCKET_GLOBS for p in glob.glob(g)} | set(getattr(jr.backend, "extra_sockets", ())))
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
     listener.listen(4)
@@ -150,11 +185,12 @@ def run_selftest(jr, *, timeout=60):
         config = {"run_user": jr.run_user, "run_uid": uid, "run_gid": gid, "owner_uid": jr.owner_uid, "ws": ws,
                   "hidden": [p for p in runner.HIDDEN_PATHS + getattr(jr.backend, "extra_hidden", ()) if os.path.lexists(p)],
                   "home": jr.home, "home_names": home_names, "port": listener.getsockname()[1],
-                  "no_write": ["/etc", "/usr", "/var/lib", "/opt", "/srv", jr.home, str(jr.dir), "/root"], "tasks": TASKS, "memory_mb": MEMORY_MB}
+                  "no_write": ["/etc", "/usr", "/var/lib", "/opt", "/srv", jr.home, str(jr.dir), "/root"], "tasks": TASKS, "memory_mb": MEMORY_MB,
+                  "canaries": canaries, "sockets": sockets, "fsize": runner.FSIZE_MB * 1024 * 1024, "tmp_bytes": runner.TMP_MB * 1024 * 1024 + 4096}
         lines, job_status, started = [], None, time.time()
         try:
             job = jr._start(ws, "selftest", [jr.python, "-I", "-c", PROBE, json.dumps(config)],
-                            {"seconds": SECONDS, "memory_mb": MEMORY_MB, "tasks": TASKS, "writes": True}, SECONDS, need_enrolled=False)
+                            {"seconds": SECONDS, "memory_mb": MEMORY_MB, "tasks": TASKS, "writes": True}, SECONDS, need_enrolled=False, masked=masked)
             job_status = jr.wait(job["job_id"], timeout)
             try:
                 lines = (jr.dir / "jobs" / job["job_id"] / "out.log").read_text(errors="replace").splitlines()
@@ -169,7 +205,7 @@ def run_selftest(jr, *, timeout=60):
                 owner_ok = _owner_can_edit(probe_file, owner.pw_uid, owner.pw_gid)
             except (OSError, subprocess.SubprocessError):
                 owner_ok = False
-        verdict = _judge(lines, owner_ok)
+        verdict = _judge(lines, owner_ok, strict_limits=bool(getattr(jr.backend, "enforces_limits", False)))
         if not job_status or job_status.get("state") != "done":
             verdict["ok"], verdict["failed"] = False, sorted(set(verdict["failed"]) | {"probe_did_not_finish_cleanly"})
         verdict.update({"version": jr.version, "at": int(time.time()), "ran": True, "seconds": round(time.time() - started, 1)})

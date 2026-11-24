@@ -251,9 +251,8 @@ def op_unenroll(request):
     return {"path": path}
 
 
-def op_protected(request):
-    """Credential-named files and folders (and the trash) that the sandbox must not see at all, found NOW (not at enrolment)."""
-    path = _workspace(request)
+def scan_protected(path):
+    """Relative paths of credential-named files and folders (and the trash) below ``path``, found NOW, without following links."""
     found, seen = [], [0]
 
     def scan(dirfd, rel, depth):
@@ -293,7 +292,13 @@ def op_protected(request):
         scan(fd, "", 0)
     finally:
         os.close(fd)
-    return {"path": path, "protected": found}
+    return found
+
+
+def op_protected(request):
+    """What the sandbox must not see at all, found NOW (at job start), not remembered from enrolment."""
+    path = _workspace(request)
+    return {"path": path, "protected": scan_protected(path)}
 
 
 OPS = {"prepare": op_prepare, "check": op_check, "home_names": op_home_names, "disk": op_disk, "enroll": op_enroll,

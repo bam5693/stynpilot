@@ -45,8 +45,10 @@ class JobError(Exception):
 
 
 class SystemdBackend:
-    def start(self, job_id, argv, workspace, limits, run_user):
-        cmd = runner.unit_command(job_id, argv, workspace, run_user=run_user, **limits)
+    enforces_limits = True          # the self-test must SEE the limits from inside, or it fails
+
+    def start(self, job_id, argv, workspace, limits, run_user, masked=()):
+        cmd = runner.unit_command(job_id, argv, workspace, run_user=run_user, masked=masked, **limits)
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=_ENV,
                                 start_new_session=True)
 
@@ -57,7 +59,9 @@ class SystemdBackend:
 
 class LocalBackend:
     """Root sandbox only: same argv, same fixed environment, real uid/gid drop, no systemd."""
-    def start(self, job_id, argv, workspace, limits, run_user):
+    enforces_limits = False
+
+    def start(self, job_id, argv, workspace, limits, run_user, masked=()):
         pw = pwd.getpwnam(run_user)
         cmd = ["setpriv", "--reuid=%d" % pw.pw_uid, "--regid=%d" % pw.pw_gid, "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--inh-caps=-all", "--"] + list(argv)
         return subprocess.Popen(cmd, cwd=workspace, env=dict(runner.ENV), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -76,7 +80,7 @@ def _kill_group(proc):
 
 class JobRunner:
     def __init__(self, state_dir, *, owner_uid, home, backend=None, run=apt.real_run, run_user=runner.RUN_USER, clock=time.time,
-                 max_running=2, extra_deny=(), projects_dir=None, version="0", gate=True,
+                 max_running=2, extra_deny=(), projects_dir=None, disk_start_free=4 << 30, disk_kill_free=2 << 30, disk_poll=2.0, version="0", gate=True,
                  selftest_root="/var/lib/stynpilot-run", python="/usr/bin/python3", helper=None):
         self.dir = Path(state_dir)
         self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -94,6 +98,7 @@ class JobRunner:
         self.backend, self.runcmd, self.clock, self.max_running = backend or SystemdBackend(), run, clock, max_running
         self.extra_deny = tuple(str(p) for p in extra_deny) + (str(self.dir),)
         self._lock = threading.Lock()
+        self.disk_start_free, self.disk_kill_free, self.disk_poll = int(disk_start_free), int(disk_kill_free), float(disk_poll)
         self._ws_lock = threading.RLock()                 # enrol/unenrol/job start never interleave
         self._live = {}                                   # job id -> (thread, process)
         self._db = sqlite3.connect(self.dir / "jobs.sqlite3", check_same_thread=False, isolation_level=None)
@@ -196,10 +201,33 @@ class JobRunner:
         argv = runner.build_argv(recipe_id, args, real)
         recipe = runner.RECIPES[recipe_id]
         limits = {"seconds": recipe.seconds, "memory_mb": recipe.memory_mb, "tasks": recipe.tasks, "writes": recipe.writes}
-        return self._start(real, recipe_id, argv, limits, recipe.seconds)
+        return self._start(real, recipe_id, argv, limits, recipe.seconds)   # masked: computed inside, at start, every time
 
-    def _start(self, real, label, argv, limits, seconds, need_enrolled=True):
+    def _masked(self, real):
+        """Credential-named files/folders and the trash, found NOW and hidden from the sandbox (not merely skipped by the ACL)."""
+        names = self._ask("protected", name=os.path.basename(real))["protected"]
+        out = [real + "/" + n for n in names]
+        return self._safe_masked(real, out)
+
+    @staticmethod
+    def _safe_masked(real, paths):
+        for m in paths:
+            if not runner._PATH_CHARS.fullmatch(m) or ".." in m.split("/") or not m.startswith(real + "/"):
+                raise JobError("a_protected_file_has_a_name_that_cannot_be_hidden_safely")   # fail closed: no job
+        return paths
+
+    def _free_bytes(self, real, local):
+        if local:
+            info = os.statvfs(real)
+            return info.f_bavail * info.f_frsize
+        return int(self._ask("disk", path=self.projects_dir)["free"])
+
+    def _start(self, real, label, argv, limits, seconds, need_enrolled=True, masked=None):
         self.ensure_user()
+        if masked is None:
+            masked = self._masked(real) if need_enrolled else []
+        if self._free_bytes(real, local=not need_enrolled) < self.disk_start_free:
+            raise JobError("not_enough_free_disk_space_to_start_a_job")
         job_id = secrets.token_hex(16)
         with self._ws_lock, self._lock:
             if need_enrolled and not self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
@@ -209,11 +237,11 @@ class JobRunner:
             self._db.execute("insert into jobs(id,workspace,recipe,argv,state,created) values(?,?,?,?,?,?)",
                              (job_id, real, label, json.dumps(argv), "running", int(self.clock())))
             try:
-                proc = self.backend.start(job_id, argv, real, limits, self.run_user)
+                proc = self.backend.start(job_id, argv, real, limits, self.run_user, masked=masked)
             except OSError:
                 self._db.execute("update jobs set state='failed', ended=? where id=?", (int(self.clock()), job_id))
                 raise JobError("could_not_start_the_job") from None
-            thread = threading.Thread(target=self._pump, args=(job_id, proc, seconds), daemon=True, name="stynpilot-job")
+            thread = threading.Thread(target=self._pump, args=(job_id, proc, seconds, not need_enrolled), daemon=True, name="stynpilot-job")
             self._live[job_id] = (thread, proc)
             self._db.execute("update jobs set started=? where id=?", (int(self.clock()), job_id))
         thread.start()
@@ -240,9 +268,17 @@ class JobRunner:
                 raise JobError("missing_tool_" + tool.replace("-", "_") + "_install_the_acl_or_systemd_package")
         uid, gid = self.ensure_user()
         if self.projects_dir is not None:
-            self._ask("prepare")          # made BY the owner (so it is the owner's), refused if a link, foreign or world-writable
+            created = self._ask("prepare")["created"]      # made BY the owner (so it is the owner's); refused if a link/foreign/world-writable
         _write_json(self._enabled_file, {"enabled": True, "at": int(self.clock()), "version": self.version})
-        return {"runner_user": self.run_user, "projects_folder": self.projects_dir, "enabled": True}
+        info = {"runner_user": self.run_user, "projects_folder": self.projects_dir, "enabled": True}
+        if self.projects_dir is not None and created and isinstance(self.backend, SystemdBackend):
+            # systemd binds the owner service's writable folder only if it exists when the service STARTS. An upgrade from an older
+            # build cannot create the folder first (its worker predates this), so the owner service is restarted once, a little
+            # later (never during this approval's own reply).
+            code, _ = self.runcmd(["systemd-run", "--quiet", "--collect", "--on-active=20", "--unit", "stynpilot-owner-restart",
+                                   "systemctl", "--user", "--machine=%s@.host" % self.owner_name, "restart", "stynpilot-owner.service"], 30)
+            info["owner_service_restart_scheduled"] = code == 0
+        return info
 
     def selftest_state(self):
         try:
@@ -265,7 +301,7 @@ class JobRunner:
         from .selftest import run_selftest
         return run_selftest(self)
 
-    def _pump(self, job_id, proc, seconds):
+    def _pump(self, job_id, proc, seconds, local=False):
         folder = self.dir / "jobs" / job_id
         folder.mkdir(mode=0o700)
         out = os.open(folder / "out.log", os.O_CREAT | os.O_WRONLY | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -273,6 +309,21 @@ class JobRunner:
         timed_out = threading.Event()
         timer = threading.Timer(seconds + 10, lambda: (timed_out.set(), self.backend.cancel(job_id, proc)))
         timer.start()
+        disk_full = threading.Event()
+        stop_watch = threading.Event()
+
+        def watch():
+            # A runaway job must not fill the host disk: the kill threshold leaves headroom for the polling interval.
+            while not stop_watch.wait(self.disk_poll):
+                try:
+                    low = self._free_bytes(self._watch_path(job_id), local) < self.disk_kill_free
+                except (JobError, OSError, ValueError):
+                    low = True                                    # cannot tell -> fail closed
+                if low:
+                    disk_full.set()
+                    self.backend.cancel(job_id, proc)
+                    return
+        threading.Thread(target=watch, daemon=True, name="stynpilot-job-disk").start()
         try:
             while True:
                 chunk = proc.stdout.read(8192)
@@ -285,18 +336,38 @@ class JobRunner:
                 if len(chunk) > max(room, 0):
                     truncated = 1                               # keep draining so the process never blocks on a full pipe
             code = proc.wait()
+            self._repair(job_id, local)
         finally:
             timer.cancel()
+            stop_watch.set()
             os.close(out)
             proc.stdout.close()
         with self._lock:
             row = self._db.execute("select state from jobs where id=?", (job_id,)).fetchone()
             state = row["state"]
             if state == "running":
-                state = "done" if code == 0 else ("timeout" if timed_out.is_set() else "failed")
+                state = "done" if code == 0 else ("disk_limit" if disk_full.is_set() else ("timeout" if timed_out.is_set() else "failed"))
             self._db.execute("update jobs set state=?, exit_code=?, ended=?, truncated=? where id=?",
                              (state, code, int(self.clock()), truncated, job_id))
             self._live.pop(job_id, None)
+
+    def _repair(self, job_id, local):
+        """Files the run user created with mode 0600 get an ACL mask of 0 (so the owner's named entry stops working). Re-open the mask,
+        AS THE RUN USER (it owns those files), inside the same sandbox, without following links."""
+        row = self._db.execute("select workspace from jobs where id=?", (job_id,)).fetchone()
+        if row is None or not os.path.isabs(row["workspace"]):
+            return
+        try:
+            proc = self.backend.start(secrets.token_hex(16), ["/usr/bin/setfacl", "-R", "-P", "-m", "m::rwx", "--", "."], row["workspace"],
+                                      {"seconds": 60, "memory_mb": 128, "tasks": 16, "writes": True}, self.run_user, masked=())
+            proc.stdout.read()
+            proc.wait()
+        except (OSError, JobError, runner.RunnerError):
+            pass
+
+    def _watch_path(self, job_id):
+        row = self._db.execute("select workspace from jobs where id=?", (job_id,)).fetchone()
+        return row["workspace"] if row else "/"
 
     def cancel(self, job_id):
         with self._lock:

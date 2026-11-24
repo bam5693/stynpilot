@@ -176,15 +176,15 @@ class SandboxUnit(unittest.TestCase):
     def test_every_hardening_property_is_present(self):
         props = self.props(self.cmd())
         for want in ("User=stynpilot-run", "Group=stynpilot-run", "SupplementaryGroups=", "ProtectSystem=strict", "ProtectHome=tmpfs",
-                     "BindPaths=/home/o/projects/app", "PrivateTmp=yes", "PrivateDevices=yes", "ProtectProc=invisible",
+                     "BindPaths=/home/o/projects/app", "PrivateDevices=yes", "ProtectProc=invisible",
                      "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "RestrictNamespaces=yes",
                      "RestrictSUIDSGID=yes", "PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX", "UMask=0077", "LimitCORE=0",
-                     "RuntimeMaxSec=60", "MemoryMax=512M", "MemorySwapMax=0", "TasksMax=64", "KillMode=control-group",
+                     "TemporaryFileSystem=/tmp:mode=1777,nosuid,nodev,size=256M", "LimitFSIZE=512M", "RuntimeMaxSec=60", "MemoryMax=512M", "MemorySwapMax=0", "TasksMax=64", "KillMode=control-group",
                      "WorkingDirectory=/home/o/projects/app", "SystemCallFilter=@system-service"):
             self.assertIn(want, props)
         hidden = next(p for p in props if p.startswith("InaccessiblePaths="))
         for path in ("/etc/stynpilot", "/var/lib/stynpilot", "/run/stynpilot", "/run/user", "/root", "/etc/shadow"):
-            self.assertIn(path, hidden.split("=", 1)[1].split(" "))
+            self.assertIn("-" + path, hidden.split("=", 1)[1].split(" "))   # "-": a missing path is not an error
 
     def test_it_never_runs_as_root_or_the_owner_and_the_environment_is_fixed(self):
         cmd = self.cmd()

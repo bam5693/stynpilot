@@ -183,7 +183,12 @@ HIDDEN_PATHS = ("/etc/stynpilot", "/var/lib/stynpilot", "/var/lib/stynpilot-inst
                 "/var/lib/tailscale", "/run/user", "/run/dbus", "/run/systemd/private")
 
 
-def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=True, network=False, run_user=RUN_USER):
+FSIZE_MB = 512          # largest single file a job may write (RLIMIT_FSIZE)
+TMP_MB = 256            # size of the private /tmp (a memory-backed file system, so it can never fill the disk)
+RUN_MB = 8
+
+
+def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=True, network=False, run_user=RUN_USER, masked=()):
     """The ``systemd-run`` argv list that runs ``argv`` in ``workspace`` as ``run_user`` with the sandbox below. A LIST, so
     nothing is ever parsed by a shell; every value that varies is validated here, and property values never contain
     separators that systemd would interpret."""
@@ -196,19 +201,23 @@ def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=T
             raise RunnerError("limit_invalid")
     if not argv or any(type(a) is not str or "\x00" in a for a in argv) or not os.path.isabs(argv[0]):
         raise RunnerError("argv_invalid")
+    for m in masked:
+        if type(m) is not str or not _PATH_CHARS.fullmatch(m) or not m.startswith(workspace + "/") or ".." in m.split("/"):
+            raise RunnerError("protected_path_unsafe")
     props = [
         "User=" + run_user, "Group=" + run_user, "SupplementaryGroups=",
         "WorkingDirectory=" + workspace,
         # who it can see and touch
         "ProtectSystem=strict", "ProtectHome=tmpfs", "BindPaths=" + workspace if writes else "BindReadOnlyPaths=" + workspace,
-        "PrivateTmp=yes", "PrivateDevices=yes", "ProtectProc=invisible", "ProcSubset=pid", "ProtectKernelTunables=yes",
+        "TemporaryFileSystem=/tmp:mode=1777,nosuid,nodev,size=%dM" % TMP_MB, "TemporaryFileSystem=/run:mode=0755,nosuid,nodev,size=%dM" % RUN_MB,
+        "PrivateDevices=yes", "ProtectProc=invisible", "ProcSubset=pid", "ProtectKernelTunables=yes",
         "ProtectKernelModules=yes", "ProtectKernelLogs=yes", "ProtectControlGroups=yes", "ProtectClock=yes",
-        "ProtectHostname=yes", "InaccessiblePaths=" + " ".join(HIDDEN_PATHS),
+        "ProtectHostname=yes", "InaccessiblePaths=" + " ".join("-" + p for p in HIDDEN_PATHS + tuple(masked)),
         # what it can do
         "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "RestrictSUIDSGID=yes",
         "RestrictNamespaces=yes", "LockPersonality=yes", "RestrictRealtime=yes",
         "SystemCallArchitectures=native", "SystemCallFilter=@system-service", "SystemCallFilter=~@privileged @resources",
-        "UMask=0077", "LimitCORE=0", "LimitNOFILE=1024", "KeyringMode=private",
+        "UMask=0077", "LimitCORE=0", "LimitNOFILE=1024", "LimitFSIZE=%dM" % FSIZE_MB, "KeyringMode=private",
         # network: none by default (a separate YELLOW grant would be needed)
         "PrivateNetwork=yes" if not network else "PrivateNetwork=no",
         "RestrictAddressFamilies=AF_UNIX" if not network else "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",

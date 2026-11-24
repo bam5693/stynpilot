@@ -36,6 +36,10 @@ PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print
 printf '{"pairing_db":"%s/pairing.sqlite3","state_dir":"%s/state","mcp_port":%s,"mcp_public_host":"mcp.example.test"}\n' "$H" "$H" "$PORT" > "$H/.config/stynpilot/owner.json"
 for db in "$H/pairing.sqlite3" "$H/state/requests.sqlite3" "$H/state/token-revocations.sqlite3"; do python3 -c 'import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);c.execute("create table t(x)");c.commit()' "$db"; done
 echo '[]' > "$H/state/revoked-clients.json"; echo '{}' > "$H/state/provisioned.json"
+# the layout a failed self-upgrade really leaves (made like the owner service does): read-roots.json + pre-upgrade safety copies
+echo '{"roots": []}' > "$H/state/read-roots.json"; mkdir -p "$H/state/backups"
+python3 -c 'import tarfile,io,sys; t=tarfile.open(sys.argv[1],"w"); i=tarfile.TarInfo("manifest.json"); d=b"{}"; i.size=len(d); t.addfile(i,io.BytesIO(d)); t.close()' "$H/state/backups/pre-upgrade-0123456789abcdef.tar"
+chmod 600 "$H/state/read-roots.json" "$H/state/backups/"*; chmod 700 "$H/state/backups"
 chown -R $USERNAME "$H"; chmod 700 "$H"
 printf 'nobody ALL=(ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/zz-drill6; chmod 440 /etc/sudoers.d/zz-drill6
 

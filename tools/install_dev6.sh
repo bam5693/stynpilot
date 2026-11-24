@@ -20,6 +20,9 @@ OLD_COMMIT="1a149d6d21b9f68af8a75f265f14f1fe42c51842"
 OLD_SHA256="6dcaceaa189230a30de972d382cd23c74220292d5d1d3c91d09874b0cd26c5bc"
 REPO="${STYNPILOT_REPO:-https://github.com/bam5693/stynpilot.git}"
 COMMIT="${1:-}"; EXPECT="${2:-}"
+# The backup tool ships NEXT TO this script (not from the package commit, which is unchanged) and is pinned by hash.
+PF_SHA256="a082d66e52a23328510c52ae8afb5cf9681d10d952a1443f75e8f7a01725c1fd"
+PF="$(cd "$(dirname "$0")" && pwd)/preflight_backup.sh"
 OWNERCFG="$HOME/.config/stynpilot/owner.json"
 INSTALLER_UNIT="stynpilot-installer.service"; OWNER_UNIT="stynpilot-owner.service"
 HEALTH_WAIT=90
@@ -186,7 +189,8 @@ main() {
   say "3. build dev6 from commit $COMMIT and check the checksum"
   build "$COMMIT" "$EXPECT" "$NEW_DEB" || die "could not build a package that matches the SHA-256 you were given. Do not use it."
   SRC="$WORK/src-$COMMIT"
-  cmp -s "$0" "$SRC/tools/install_dev6.sh" || note "(this copy of the script differs from the one in the commit; the package check above is what matters)"
+  [ -f "$PF" ] && [ ! -L "$PF" ] && [ "$(sha256sum "$PF" | cut -d' ' -f1)" = "$PF_SHA256" ] \
+    || die "preflight_backup.sh next to this script is missing or is not the pinned version; do not use it"
   say "4. make sure the dev4 rollback package is present and correct"
   if [ -e "$OLD_DEB" ] && [ "$(sha256sum "$OLD_DEB" | cut -d' ' -f1)" = "$OLD_SHA256" ]; then note "found $OLD_DEB"
   else build "$OLD_COMMIT" "$OLD_SHA256" "$OLD_DEB" || die "could not prepare the dev4 rollback package"; note "rebuilt dev4 from its pinned commit"; fi
@@ -200,8 +204,8 @@ main() {
     || die "package dependencies differ from the installed ones; refusing"
 
   say "6. back up your settings and records"
-  sh "$SRC/tools/preflight_backup.sh" "$HOME/stynpilot-pre-dev6-$TS" || die "backup failed"
-  sh "$SRC/tools/preflight_backup.sh" --verify "$HOME/stynpilot-pre-dev6-$TS" || die "backup did not verify"
+  sh "$PF" "$HOME/stynpilot-pre-dev6-$TS" || die "backup failed"
+  sh "$PF" --verify "$HOME/stynpilot-pre-dev6-$TS" || die "backup did not verify"
   [ "$(config_digest)" = "$BASE_CONFIG" ] || die "a settings file changed during the backup"
 
   # ---- 3. the change: from here on every failure rolls back ----------------------------------------------------

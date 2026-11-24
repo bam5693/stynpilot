@@ -75,6 +75,7 @@ verify() {
     [ -f "$D/owner/$f" ] || fail "missing $f"
     python3 -I -c 'import sqlite3,sys; c=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro", uri=True); r=c.execute("pragma integrity_check").fetchone()[0]; sys.exit(0 if r=="ok" else 1)' "$(cd "$D/owner" && pwd -P)/$f" || fail "SQLite integrity check failed: $f"
   done
+  for t in "$D"/owner/state/backups/*.tar; do [ -f "$t" ] || continue; tar -tf "$t" >/dev/null 2>&1 || fail "pre-upgrade copy is not a readable archive: ${t##*/}"; done
   $SUDO sh -c "$ROOT_VERIFY" sh "$R" || fail "root-side verification failed"
   say "verified: $D and $R"
 }
@@ -104,16 +105,51 @@ EOP
 [ -f "$PAIRING" ] && [ ! -L "$PAIRING" ] || fail "pairing database not found at the configured path (or is a link)"
 [ -d "$STATE" ] && [ ! -L "$STATE" ] || fail "owner state folder not found at the configured path (or is a link)"
 
-# Audited FLAT state layout: exactly the four files StyNpilot creates (+ SQLite side files). Anything else: refuse.
+# Audited state layout. REQUIRED plain files StyNpilot creates: requests.sqlite3, revoked-clients.json,
+# token-revocations.sqlite3, provisioned.json (+ SQLite -journal/-wal/-shm side files). KNOWN OPTIONAL, created later by
+# StyNpilot itself and found on the real machine after dev4:
+#   read-roots.json   the owner's list of readable project folders (dev4), a plain file;
+#   backups/          the owner service's own pre-upgrade safety copies (service._owner_backup_before_upgrade, written
+#                     when an upgrade is approved, kept newest five): ONLY plain files named pre-upgrade-<16 hex>.tar.
+# Anything else (other names, other subfolders, links, wrong owner, odd file types) -> refuse, change nothing, and name
+# the offending entries (names only, never contents) so the review is quick. Nothing here loosens credential rules.
 for n in requests.sqlite3 revoked-clients.json token-revocations.sqlite3 provisioned.json; do
   [ -f "$STATE/$n" ] && [ ! -L "$STATE/$n" ] || fail "expected state file missing or not a plain file: $n"
 done
-odd=$(find "$STATE" -mindepth 1 \( ! -type f -o -type l \) -print -o -type f ! \( -name requests.sqlite3 -o -name requests.sqlite3-journal -o -name requests.sqlite3-wal -o -name requests.sqlite3-shm -o -name token-revocations.sqlite3 -o -name token-revocations.sqlite3-journal -o -name token-revocations.sqlite3-wal -o -name token-revocations.sqlite3-shm -o -name revoked-clients.json -o -name provisioned.json \) -print | head -3)
-[ -z "$odd" ] || fail "owner state folder has an unexpected layout (subfolder, link or unknown file); not backing up. Ask for review."
+ME=$(id -u); odd=""; HAVE_ROOTS=0; HAVE_BACKUPS=0
+oddname() { odd="$odd $(printf '%s' "$1" | tr -c 'A-Za-z0-9._/-' '?' | head -c 80)"; }
+for p in "$STATE"/* "$STATE"/.[!.]* "$STATE"/..?*; do
+  [ -e "$p" ] || [ -L "$p" ] || continue
+  b=${p##*/}
+  case "$b" in
+    requests.sqlite3|requests.sqlite3-journal|requests.sqlite3-wal|requests.sqlite3-shm|token-revocations.sqlite3|token-revocations.sqlite3-journal|token-revocations.sqlite3-wal|token-revocations.sqlite3-shm|revoked-clients.json|provisioned.json)
+      [ -f "$p" ] && [ ! -L "$p" ] || oddname "$b" ;;
+    read-roots.json)
+      if [ -f "$p" ] && [ ! -L "$p" ] && [ "$(stat -c %u "$p")" = "$ME" ] && [ "$(stat -c %s "$p")" -le 65536 ]; then HAVE_ROOTS=1; else oddname "$b"; fi ;;
+    backups)
+      if [ -d "$p" ] && [ ! -L "$p" ] && [ "$(stat -c %u "$p")" = "$ME" ]; then
+        HAVE_BACKUPS=1; cnt=0
+        for q in "$p"/* "$p"/.[!.]* "$p"/..?*; do
+          [ -e "$q" ] || [ -L "$q" ] || continue
+          cnt=$((cnt+1)); qb=${q##*/}
+          case "$qb" in
+            pre-upgrade-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].tar)
+              [ -f "$q" ] && [ ! -L "$q" ] && [ "$(stat -c %u "$q")" = "$ME" ] || oddname "backups/$qb" ;;
+            *) oddname "backups/$qb" ;;
+          esac
+        done
+        [ "$cnt" -le 50 ] || oddname "backups/(more than 50 entries)"
+      else oddname "$b"; fi ;;
+    *) oddname "$b" ;;
+  esac
+done
+[ -z "$odd" ] || fail "owner state folder has an unexpected layout (subfolder, link or unknown file); not backing up. Ask for review. Unexpected entries (names only):$odd"
 
 say "1. owner side -> $DEST (0700)"
 install -d -m 700 "$DEST" "$DEST/owner" "$DEST/owner/state"
-sums() { (sha256sum "$OWNERCFG" "$STATE/revoked-clients.json" "$STATE/provisioned.json") | sha256sum; }
+sums() { (sha256sum "$OWNERCFG" "$STATE/revoked-clients.json" "$STATE/provisioned.json"
+          [ "$HAVE_ROOTS" = 1 ] && sha256sum "$STATE/read-roots.json"
+          [ "$HAVE_BACKUPS" = 1 ] && for t in "$STATE"/backups/*.tar; do [ -f "$t" ] && sha256sum "$t"; done; true) | sha256sum; }
 before=$(sums)
 cp -p -- "$OWNERCFG" "$DEST/owner/owner.json"
 copy_sqlite() {
@@ -128,7 +164,13 @@ PY
 copy_sqlite "$PAIRING" "$DEST/owner/pairing.sqlite3" || fail "could not copy the pairing database"
 for n in requests.sqlite3 token-revocations.sqlite3; do copy_sqlite "$STATE/$n" "$DEST/owner/state/$n" || fail "could not copy $n"; done
 for n in revoked-clients.json provisioned.json; do cp -p -- "$STATE/$n" "$DEST/owner/state/$n"; done
-chmod 600 -- "$DEST"/owner/owner.json "$DEST"/owner/pairing.sqlite3 "$DEST"/owner/state/*
+if [ "$HAVE_ROOTS" = 1 ]; then cp -p -- "$STATE/read-roots.json" "$DEST/owner/state/read-roots.json"; fi
+if [ "$HAVE_BACKUPS" = 1 ]; then
+  install -d -m 700 "$DEST/owner/state/backups"
+  for t in "$STATE"/backups/*.tar; do [ -f "$t" ] && cp -p -- "$t" "$DEST/owner/state/backups/"; done
+  chmod 600 -- "$DEST"/owner/state/backups/* 2>/dev/null || true
+fi
+chmod 600 -- "$DEST"/owner/owner.json "$DEST"/owner/pairing.sqlite3 "$DEST"/owner/state/*.json "$DEST"/owner/state/*.sqlite3
 { echo "date_utc $(date -u +%FT%TZ)"; echo "package $(dpkg-query -W -f '${Version}' stynpilot 2>/dev/null || echo none)"
   echo "installer_service $(systemctl is-active stynpilot-installer 2>/dev/null || true)"
   echo "owner_service $(systemctl --user is-active stynpilot-owner 2>/dev/null || true)"; } > "$DEST/owner/INFO.txt"

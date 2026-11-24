@@ -29,3 +29,34 @@ state paths inaccessible). Tests: `tests/test_runner_core.py` (hostile folders, 
 ## Next steps
 S3b root-door job kinds (create runner user, enroll workspace, run, status, cancel, selftest) with approval and a job
 table; S3c MCP tools (workspace request, file edits inside workspaces, job run/status/output/cancel); S3d one-off command.
+
+## dev8: the combined S3 release (S3b-2 + live self-test + S3c)
+
+What an assistant can do after the owner's two phone approvals (setup once; authorize a project):
+request setup and workspace authorization; verify the live sandbox (`runner_status`, `runner_selftest`); create, read, edit, move and
+trash files in `~/StyNpilot-Projects/<name>`; run fixed recipes; watch, page the output of, and cancel jobs.
+
+**Approvals (YELLOW, phone):** `runner` request kind with actions `setup`, `enroll`, `unenroll`. Same one-time proof as installs and
+upgrades. `setup` creates the `stynpilot-run` account, the `~/StyNpilot-Projects` folder (owner-owned, 0700) and runs the self-test.
+**GREEN, no approval:** status, self-test, run/jobs/output/cancel (installer socket, owner uid only), file tools (owner service).
+
+**Gate:** `run` is refused (`sandbox_self_test_required`) until the live self-test passed for this exact StyNpilot version. An upgrade
+closes the gate; `runner_selftest` (GREEN) reopens it. The probe runs inside the real sandbox and checks: identity (not root/owner, no
+groups), no capabilities and NoNewPrivs, hidden paths unreadable, owner home invisible, network isolated (a listener on the host
+loopback is unreachable, so is 1.1.1.1), writes outside the workspace refused, workspace writable, and the OWNER can edit files the
+sandbox account creates. Limits (pids/memory in the cgroup) are checked when the kernel shows them, otherwise reported `unverified`.
+
+**Deliberate decisions to review**
+1. Workspaces are only direct children of `~/StyNpilot-Projects`. This keeps the owner unit's write access to one named folder
+   (`ReadWritePaths=-%h/StyNpilot-Projects`) instead of the whole home.
+2. `ProtectHome=yes` was removed from the installer unit (it must see/ACL files in the home). Code restricts every use to the folder above.
+3. git recipes pass `-c safe.directory=<authorized folder>`: found by a real test (git refuses owner-owned repos run by another account).
+4. Free-form commands never run. Recipes only. No network in jobs. No root.
+
+**Known limits (tracked)**
+- A tool that creates a file with mode 0600 inside the sandbox leaves an ACL mask that can lock the owner out of that file. Not repaired yet.
+- Workspace size is not capped beyond per-write 1 MiB / enrol 50,000 entries.
+- Selftest `limits` may show `unverified` on kernels that hide the cgroup files.
+- If the projects folder is first created by `setup` (fresh install, not an upgrade) the owner service sees it writable only after its next
+  restart; `runner_status.file_editing_ready` says so.
+- The systemd unit properties themselves cannot be exercised in the build sandbox (no systemd); the self-test is how they are proven on the Ryzen.

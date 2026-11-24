@@ -30,7 +30,7 @@ from pathlib import Path
 from .. import redact, runner, safefs
 from . import apt
 from ..projects_helper import block_devices
-from .helper import MEASURE_TIMEOUT, HelperError, LocalHelper, SystemdHelper
+from .helper import MEASURE_TIMEOUT, SLACK, STOP_WAIT, HelperError, LocalHelper, SystemdHelper
 
 MAX_OUT = 256 * 1024
 MAX_ENTRIES = 50000
@@ -88,7 +88,7 @@ def _kill_group(proc):
 
 class JobRunner:
     def __init__(self, state_dir, *, owner_uid, home, backend=None, run=apt.real_run, run_user=runner.RUN_USER, clock=time.time,
-                 max_running=2, extra_deny=(), projects_dir=None, disk_start_free=4 << 30, disk_kill_free=2 << 30, disk_growth=4 << 30,
+                 max_running=2, extra_deny=(), projects_dir=None, disk_start_free=6 << 30, disk_kill_free=4 << 30, disk_growth=4 << 30,
                  inode_start=0.05, inode_kill=0.02, inode_growth=0.15, disk_poll=1.0, measure_timeout=MEASURE_TIMEOUT, version="0", gate=True,
                  selftest_root="/var/lib/stynpilot-run", python="/usr/bin/python3", helper=None):
         self.dir = Path(state_dir)
@@ -114,6 +114,8 @@ class JobRunner:
         self._lock = threading.Lock()
         self.disk_start_free, self.disk_kill_free, self.disk_growth, self.disk_poll = int(disk_start_free), int(disk_kill_free), int(disk_growth), float(disk_poll)
         self.inode_start, self.inode_kill, self.inode_growth, self.measure_timeout = inode_start, inode_kill, inode_growth, float(measure_timeout)
+        if getattr(self.backend, "enforces_limits", False) and self.disk_kill_free < self.worst_overshoot():
+            raise ValueError("disk_reserve_smaller_than_what_two_writers_can_add_before_they_are_stopped")   # production never starts so configured
         self._ws_lock = threading.RLock()                 # enrol/unenrol/job start never interleave
         self._live = {}                                   # job id -> (thread, process)
         self._db = sqlite3.connect(self.dir / "jobs.sqlite3", check_same_thread=False, isolation_level=None)
@@ -250,6 +252,14 @@ class JobRunner:
         got = self._ask("disk", _timeout=self.measure_timeout, path=self.projects_dir)
         return {k: got[k] for k in ("free", "ifree", "itotal", "devices")}
 
+    def worst_overshoot(self):
+        """Most bytes two concurrent writers can add between the disk filling past the kill line and both jobs being dead:
+        poll interval + measurement (deadline + slack + cleanup) + termination (kill + stop), at the per-job write cap, plus the
+        dirty (buffered) pages each job's memory limit can hold before the kernel throttles it (20% of the limit)."""
+        seconds = self.disk_poll + self.measure_timeout + SLACK + STOP_WAIT + 3 + 5
+        per_writer = runner.IO_WRITE_MBPS * (1 << 20) * seconds + int(0.2 * max(r.memory_mb for r in runner.RECIPES.values()) * (1 << 20))
+        return len(self.pool) * int(per_writer)
+
     def _low(self, m, base):
         """True when the host disk is too full, or this job has used too much of it. ``base`` is the measurement at job start."""
         if m["free"] < self.disk_kill_free or base["free"] - m["free"] > self.disk_growth:
@@ -373,11 +383,16 @@ class JobRunner:
             while not stop_watch.wait(self.disk_poll):
                 try:
                     low = self._low(self._measure(self._real_of(job_id), local), info["base"])
-                except (JobError, OSError, ValueError, KeyError, TypeError):
+                except BaseException:                             # ANY failure (incl. a timeout of the helper's own cleanup)
                     low = True                                    # cannot tell in time -> fail closed
                 if low:
                     disk_full.set()
-                    self.backend.cancel(job_id, proc)
+                    try:
+                        self.backend.cancel(job_id, proc)
+                    except BaseException:
+                        pass
+                    finally:
+                        _kill_group(proc)                         # the local client process always dies, whatever happened above
                     return
         threading.Thread(target=watch, daemon=True, name="stynpilot-job-disk").start()
         try:

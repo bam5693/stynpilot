@@ -155,6 +155,60 @@ class Watchdog(Base):
         self.assertEqual(kill[:2], ["systemctl", "kill"])
         self.assertTrue(kill[-1].startswith("stynpilot-projects-helper-"))
 
+    def test_a_cleanup_that_itself_times_out_still_surfaces_only_as_a_helper_error(self):
+        from stynpilot.broker.helper import SystemdHelper
+
+        def fake_run(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw["timeout"])          # systemd-run hangs, and so does systemctl kill
+        with mock.patch("subprocess.run", fake_run):
+            with self.assertRaises(HelperError) as e:
+                SystemdHelper("nobody").call({"op": "disk", "path": "/x"}, timeout=4)
+        self.assertEqual(e.exception.code, "projects_helper_timed_out")
+
+        def failing_cleanup(cmd, **kw):
+            if cmd[0] == "systemd-run":
+                raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+            raise OSError("no systemctl")
+        with mock.patch("subprocess.run", failing_cleanup):
+            with self.assertRaises(HelperError):
+                SystemdHelper("nobody").call({"op": "disk", "path": "/x"}, timeout=4)
+
+    def test_the_watchdog_kills_the_job_even_when_the_helper_and_its_cleanup_both_blow_up(self):
+        class Exploding(LocalHelper):
+            boom = False
+
+            def call(self, request, timeout=120):
+                if Exploding.boom and request["op"] == "disk":
+                    raise subprocess.TimeoutExpired("systemctl", 5)     # the exact error that used to escape the thread
+                return super().call(request, timeout)
+
+        class BadCancel(LocalBackend):
+            def cancel(self, job_id, proc):
+                raise subprocess.TimeoutExpired("systemctl", 3)         # and the backend's own cancel fails too
+        jr = self.make(BadCancel(), helper=Exploding(self.owner.pw_uid, self.owner.pw_gid))
+        ws = self.ws()
+        jr.enroll(str(ws))
+        job = self.start(jr, ws, "import time; time.sleep(60)")
+        began = time.time()
+        Exploding.boom = True
+        self.assertEqual(jr.wait(job["job_id"], 20)["state"], "disk_limit")
+        self.assertLess(time.time() - began, 8)
+
+    def test_the_reserve_covers_two_writers_termination_latency_and_buffered_writes(self):
+        jr = self.jr
+        need = jr.worst_overshoot()
+        rate = runner.IO_WRITE_MBPS * (1 << 20)
+        self.assertGreater(need, 2 * rate * (jr.disk_poll + jr.measure_timeout))        # two writers, poll + measurement
+        self.assertGreater(need, 2 * rate * 16)                                          # + helper cleanup and termination latency
+        self.assertGreater(need, 2 * 400 * (1 << 20))                                    # + buffered (dirty) pages per memory limit
+        with self.assertRaises(ValueError):
+            JobRunner(self.root / "bad", owner_uid=self.owner.pw_uid, home=str(self.home), backend=SystemdBackend(), gate=False,
+                      disk_kill_free=1 << 30, helper=LocalHelper(self.owner.pw_uid, self.owner.pw_gid))
+        import inspect
+        shipped = inspect.signature(JobRunner.__init__).parameters["disk_kill_free"].default
+        self.assertGreaterEqual(shipped, need)                                            # the shipped kill line is above it
+        self.assertGreater(inspect.signature(JobRunner.__init__).parameters["disk_start_free"].default, shipped)
+
     def test_termination_under_systemd_is_bounded(self):
         calls = []
 
@@ -211,7 +265,7 @@ class Watchdog(Base):
     def test_a_disk_with_no_resolvable_device_refuses_jobs_where_limits_are_enforced(self):
         class Strict(LocalBackend):
             enforces_limits = True
-        jr = self.make(Strict())
+        jr = self.make(Strict(), disk_kill_free=4 << 30)
         ws = self.ws()
         jr.enroll(str(ws))
         with mock.patch.object(JobRunner, "_measure", lambda self_, real, local: {"free": 1 << 40, "ifree": 1, "itotal": 0, "devices": []}):

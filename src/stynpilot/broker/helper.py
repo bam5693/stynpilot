@@ -16,6 +16,8 @@ from pathlib import Path
 HELPER = str(Path(__file__).resolve().parent.parent / "projects_helper.py")
 DEFAULT_TIMEOUT = 120          # walks over big workspaces; the measurement the disk watchdog uses asks for much less
 MEASURE_TIMEOUT = 4
+SLACK = 1               # seconds the client waits past the unit's own deadline before it stops the unit itself
+STOP_WAIT = 2           # seconds the cleanup (systemctl kill) may take; it can fail or time out without ever escaping the helper
 _ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
 
 
@@ -52,9 +54,13 @@ class SystemdHelper:
             cmd += ["-p", "ReadWritePaths=" + str(writable)]
         cmd += ["--", self.python, "-I", HELPER, json.dumps(request)]
         try:
-            done = subprocess.run(cmd, capture_output=True, timeout=timeout + 3, env=_ENV, check=False)
+            done = subprocess.run(cmd, capture_output=True, timeout=timeout + SLACK, env=_ENV, check=False)
         except subprocess.TimeoutExpired:
-            subprocess.run(["systemctl", "kill", "--signal=SIGKILL", unit + ".service"], capture_output=True, timeout=5, check=False, env=_ENV)
+            try:
+                subprocess.run(["systemctl", "kill", "--signal=SIGKILL", unit + ".service"], capture_output=True, timeout=STOP_WAIT,
+                               check=False, env=_ENV)
+            except (subprocess.SubprocessError, OSError):
+                pass            # the cleanup itself hung or failed: the unit still ends at RuntimeMaxSec; the caller must see only HelperError
             raise HelperError("projects_helper_timed_out") from None
         except OSError:
             raise HelperError("projects_helper_failed") from None

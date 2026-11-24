@@ -30,6 +30,24 @@ state paths inaccessible). Tests: `tests/test_runner_core.py` (hostile folders, 
 S3b root-door job kinds (create runner user, enroll workspace, run, status, cancel, selftest) with approval and a job
 table; S3c MCP tools (workspace request, file edits inside workspaces, job run/status/output/cancel); S3d one-off command.
 
+## dev11: fix from ChatGPT's independent review of dev10 (3c6080f)
+
+One blocker, nothing added. dev10 was never installed: dev11 replaces it as the dev7 upgrade target.
+
+- *Blocker:* when the owner-helper call timed out, the cleanup (`systemctl kill`) had its own timeout, and its `TimeoutExpired` could escape the helper, kill the
+  disk-watchdog thread and leave the job running. Now the cleanup's failure or timeout is swallowed (the unit still ends at `RuntimeMaxSec`), the helper only ever raises
+  `HelperError`, and the watchdog treats ANY exception as "cannot tell, stop the job". Stopping the job is itself exception-proof: backend failure still ends with SIGKILL of the
+  job's process group. Regression tests: cleanup times out / fails; helper raises the raw error AND the backend cancel raises, job still ends `disk_limit` in bounded time.
+- *Reserve:* `JobRunner.worst_overshoot()` = two writers x (64 MB/s x (poll 1 s + measure 4 s + slack 1 s + cleanup 2 s + kill 3 s + stop 5 s)) + 20% of the 2 GiB memory limit
+  of dirty (buffered) pages each = about 2.8 GiB. The kill line is now 4 GiB free (was 2) and a job needs 6 GiB free to start (was 4); the production runner refuses to start
+  with a smaller kill line. Tested.
+- *For the first live test:* use only a NEW disposable workspace with no credentials or important files.
+
+**Tracked before broader use:** (1) a pre-existing file moved into a workspace during a run keeps its permission bits (out-of-band movement); (2) no per-workspace byte
+quota (per-job growth cap of 4 GiB is the bound); (3) systemd unit properties are proven only by the live self-test.
+
+Non-root tests: 591 passed + 88 skipped (679 total); as root the 41 baseline failures are unchanged and 22 new real-isolation tests pass.
+
 ## dev10: fixes from ChatGPT's independent review of dev9 (54caf0b)
 
 Same architecture and capabilities; nothing new added. dev9 and dev8 were never installed: dev10 replaces them as the dev7 upgrade target.

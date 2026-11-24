@@ -30,6 +30,33 @@ state paths inaccessible). Tests: `tests/test_runner_core.py` (hostile folders, 
 S3b root-door job kinds (create runner user, enroll workspace, run, status, cancel, selftest) with approval and a job
 table; S3c MCP tools (workspace request, file edits inside workspaces, job run/status/output/cancel); S3d one-off command.
 
+## dev9: fixes from ChatGPT's independent review of dev8 (a020d9f)
+
+Same architecture, same capabilities; nothing new added. dev8 was never installed: dev9 replaces it as the dev7 upgrade target.
+
+**Blocker 1, home-folder safety.** `ProtectHome=yes` is back on the installer: root never looks into the home. A helper
+(`projects_helper.py`) runs AS THE OWNER (transient unit: read-only system, writes only to the projects folder, no capabilities, no
+network) and does every path operation: folders are opened with `O_NOFOLLOW` from the previous descriptor, files are re-verified on the
+descriptor (regular, one link, same device and inode) and ACLs are set on `/proc/self/fd/N`, never on a name. A link swapped in
+mid-walk is skipped. A symlinked projects folder or home is refused, not canonicalised. Enrol, unenrol and job start share one lock;
+unenrol removes the row first, then the access.
+
+**Blocker 2, credentials.** Credential-named files and folders (and `.stynpilot-trash`) are found at EVERY job start and hidden with
+`InaccessiblePaths=-<path>`, whatever their mode (0600/0644/0666) and whether they existed at enrolment. A protected name that cannot be
+expressed safely stops the job (fail closed). The self-test plants world-readable canaries and requires the probe to be refused.
+
+**Blocker 3, disk.** `LimitFSIZE=512M` per file, a 256 MiB memory-backed `/tmp`, an 8 MiB `/run`, a start refusal below 4 GiB free, and a
+root-side watchdog (every 2 s, owner-side measurement; cannot measure means stop) that kills a job under 2 GiB free (state `disk_limit`).
+
+**Should-fix.** Host UNIX sockets: `/run` is a private tmpfs and the probe tries to connect to every host socket it can find.
+`InaccessiblePaths` entries carry `-`. After each job the run user re-opens the ACL mask (`m::rwx`) so the owner keeps access to its
+0600 files. The self-test now REQUIRES the cgroup limits, `RLIMIT_FSIZE` and the `/tmp` size to be seen when the backend is systemd.
+Setup schedules one owner-service restart when it creates the projects folder (dev7's upgrade worker cannot create it first).
+
+**Honest limits.** Not exercisable without systemd: the unit properties (proven only by the live self-test on the Ryzen). The disk
+bound is: per-file cap + tmpfs caps + a 2 s watchdog with a 2 GiB margin; a writer faster than ~1 GB/s on a nearly full disk could still
+race it, and there is no per-workspace byte quota. `IOWriteBandwidthMax` is not set (needs the block device).
+
 ## dev8: the combined S3 release (S3b-2 + live self-test + S3c)
 
 What an assistant can do after the owner's two phone approvals (setup once; authorize a project):

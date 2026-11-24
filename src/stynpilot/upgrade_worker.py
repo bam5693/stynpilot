@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 import signal
 import socket
 import subprocess
@@ -122,6 +123,22 @@ class Worker:
 
     def dpkg(self, args, timeout=300):
         return self.run(["dpkg", *self.job.get("dpkg_extra", []), *args], timeout)
+
+    def ensure_projects_folder(self):
+        """The owner service may write only to ~/StyNpilot-Projects (its unit lists that one folder), and systemd binds it only
+        if it exists when the service starts. So make sure it exists BEFORE the restart. Best effort: never stops an upgrade."""
+        uid = self.job.get("owner_uid")
+        if type(uid) is not int or not self.job.get("restart_owner"):
+            return
+        try:
+            info = pwd.getpwuid(uid)
+            path = os.path.join(info.pw_dir, "StyNpilot-Projects")
+            if not os.path.lexists(path):
+                os.mkdir(path, 0o700)
+                os.chown(path, info.pw_uid, info.pw_gid)
+                self.note("created the StyNpilot-Projects folder for the owner")
+        except (OSError, KeyError):
+            self.note("could not create the StyNpilot-Projects folder")
 
     def installed_version(self):
         code, out = self.run(["dpkg-query", *self.job.get("query_extra", []), "-W", "-f", "${Version}", "stynpilot"], 30)
@@ -278,6 +295,7 @@ class Worker:
             self.note("dpkg refused the new package")
             return self.roll_back("install_failed")
         self.state("restarting")
+        self.ensure_projects_folder()
         if not self.restart_services():
             return self.roll_back("restart_failed")
         self.state("checking_health")

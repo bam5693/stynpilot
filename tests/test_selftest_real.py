@@ -141,3 +141,15 @@ class SelfTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Preflight(unittest.TestCase):
+    def test_setup_names_a_missing_tool_instead_of_half_working(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            jr = JobRunner(os.path.join(tmp, "s"), owner_uid=1000, home=tmp, backend=jobs.SystemdBackend())
+            with mock.patch("shutil.which", side_effect=lambda t, path=None: None if t == "systemd-run" else "/usr/bin/" + t):
+                with self.assertRaises(JobError) as e:
+                    jr.setup()
+            self.assertTrue(e.exception.code.startswith("missing_tool_systemd_run"))
+            self.assertFalse(jr.enabled())

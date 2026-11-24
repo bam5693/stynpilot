@@ -146,7 +146,16 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
                  description=("Is the sandboxed runner set up, did its live confinement self-test pass for this version (gate_open), which "
                               "workspaces are authorized, and which recipes exist. Read-only."))
     def runner_status(device_id: str) -> dict:
-        return run("runner_status", device_id, lambda owner: broker.runner("status"), write=False)
+        def work(owner):
+            state = broker.runner("status")
+            ready = os.path.isdir(projects) and os.access(projects, os.W_OK)
+            state["file_editing_ready"] = ready
+            if state.get("enabled") and not ready:
+                state["file_editing_note"] = ("The owner service cannot write to the projects folder yet. It picks the folder up when "
+                                              "it restarts (the next StyNpilot upgrade does that, or the owner runs: "
+                                              "systemctl --user restart stynpilot-owner).")
+            return state
+        return run("runner_status", device_id, work, write=False)
 
     @server.tool(name="workspace_list", title="List authorized project folders", annotations=READ_ONLY,
                  description="Names of the project folders the owner has authorized (StyNpilot-Projects/<name>).")

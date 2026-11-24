@@ -13,6 +13,8 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=-%h/.local/state/stynpilot
+# The ONLY other place this service may write: the project folders the owner authorizes for assistants (S3).
+ReadWritePaths=-%h/StyNpilot-Projects
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]

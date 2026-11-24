@@ -94,3 +94,27 @@ class WorkerUsesTheOwnerIdentity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProjectsFolder(unittest.TestCase):
+    """dev8: the worker creates ~/StyNpilot-Projects (owner-owned) before the owner service restarts, never fatally."""
+
+    def worker(self, **job):
+        import tempfile
+        from stynpilot.upgrade_worker import Worker
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return Worker({"job_dir": tmp.name, **job})
+
+    def test_skipped_without_an_owner_or_when_the_owner_service_is_not_restarted(self):
+        w = self.worker(restart_owner=False, owner_uid=os.getuid())
+        w.ensure_projects_folder()
+        self.assertEqual(w.notes, [])
+        w = self.worker(restart_owner=True)
+        w.ensure_projects_folder()
+        self.assertEqual(w.notes, [])
+
+    def test_an_unknown_owner_is_noted_and_never_fatal(self):
+        w = self.worker(restart_owner=True, owner_uid=4294967000)
+        w.ensure_projects_folder()
+        self.assertEqual(w.notes, ["could not create the StyNpilot-Projects folder"])

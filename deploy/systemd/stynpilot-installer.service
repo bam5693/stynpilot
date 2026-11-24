@@ -16,7 +16,8 @@ RuntimeDirectoryMode=0755
 StateDirectory=stynpilot-installer
 StateDirectoryMode=0700
 PrivateTmp=yes
-ProtectHome=yes
+# S3: ProtectHome=yes was REMOVED on purpose. The installer must see and set ACLs inside the owner's home to authorize project
+# folders and to start sandboxed jobs there. Code limits every such action to folders directly inside ~/StyNpilot-Projects.
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

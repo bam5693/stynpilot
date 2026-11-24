@@ -18,6 +18,7 @@ import json
 import os
 import pwd
 import secrets
+import shutil
 import signal
 import sqlite3
 import stat
@@ -229,6 +230,10 @@ class JobRunner:
 
     def setup(self):
         """YELLOW at the door, once: the locked-down run user, the fixed projects folder, and the enabled marker."""
+        need = ["setfacl"] + (["systemd-run", "systemctl"] if isinstance(self.backend, SystemdBackend) else [])
+        for tool in need:
+            if shutil.which(tool, path=_ENV["PATH"]) is None:
+                raise JobError("missing_tool_" + tool.replace("-", "_") + "_install_the_acl_or_systemd_package")
         uid, gid = self.ensure_user()
         if self.projects_dir is not None:
             if not os.path.lexists(self.projects_dir):

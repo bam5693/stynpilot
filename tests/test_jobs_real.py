@@ -19,12 +19,11 @@ OWNER = "nobody"
 PROBE = r"""
 import os, sys
 print("uid", os.getuid(), "euid", os.geteuid(), "groups", sorted(os.getgroups()))
-for p in sys.argv[1:]:
-    p = p.replace("@", "/")
+for i, p in enumerate(sys.argv[1:]):
     try:
-        open(p, "rb").read(1); print("READ", p)
+        open(p, "rb").read(1); print("READ #%d" % i)
     except OSError as e:
-        print("DENIED", p, e.errno)
+        print("DENIED #%d" % i)
 """
 TEST_RECIPES = {
     "probe": runner.Recipe("probe", "probe", ("/usr/bin/python3", "-c", PROBE), positional="word", max_extra=6, seconds=30),
@@ -136,9 +135,9 @@ class Real(unittest.TestCase):
         paths = [p for p in (data, env, self.secret, os.path.join(self.ws, "link-to-secret"),
                                                os.path.join(self.ws, "hardlink-to-secret"))]
         status, text = self.probe(*paths)
-        self.assertIn("READ " + data, text)
-        for forbidden in (env, self.secret, os.path.join(self.ws, "link-to-secret"), os.path.join(self.ws, "hardlink-to-secret")):
-            self.assertIn("DENIED " + forbidden, text)
+        self.assertIn("READ #0", text)
+        for i in range(1, 5):                                         # .env, owner secret, symlink, hard link
+            self.assertIn("DENIED #%d" % i, text)
         acl = subprocess.run(["getfacl", "-p", self.secret], capture_output=True, text=True).stdout
         self.assertNotIn(runner.RUN_USER, acl)                       # the outside file's ACL was never touched
 

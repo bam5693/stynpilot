@@ -57,7 +57,7 @@ class LocalBackend:
     """Root sandbox only: same argv, same fixed environment, real uid/gid drop, no systemd."""
     def start(self, job_id, argv, workspace, limits, run_user):
         pw = pwd.getpwnam(run_user)
-        cmd = ["setpriv", "--reuid=%d" % pw.pw_uid, "--regid=%d" % pw.pw_gid, "--clear-groups", "--no-new-privs", "--"] + list(argv)
+        cmd = ["setpriv", "--reuid=%d" % pw.pw_uid, "--regid=%d" % pw.pw_gid, "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--inh-caps=-all", "--"] + list(argv)
         return subprocess.Popen(cmd, cwd=workspace, env=dict(runner.ENV), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
 
@@ -74,8 +74,13 @@ def _kill_group(proc):
 
 class JobRunner:
     def __init__(self, state_dir, *, owner_uid, home, backend=None, run=apt.real_run, run_user=runner.RUN_USER, clock=time.time,
-                 max_running=2, extra_deny=()):
+                 max_running=2, extra_deny=(), projects_dir=None, version="0", gate=True,
+                 selftest_root="/var/lib/stynpilot-run", python="/usr/bin/python3"):
         self.dir = Path(state_dir)
+        # projects_dir: when set, a workspace must be a DIRECT child of it (production: ~/StyNpilot-Projects).
+        # gate: general jobs refuse to start until the live confinement self-test passed for THIS version.
+        self.projects_dir = os.path.realpath(projects_dir) if projects_dir else None
+        self.version, self.gate, self.selftest_root, self.python = str(version), bool(gate), str(selftest_root), python
         (self.dir / "jobs").mkdir(parents=True, exist_ok=True, mode=0o700)
         self.owner_uid, self.home, self.run_user = owner_uid, os.path.realpath(home), run_user
         self.backend, self.runcmd, self.clock, self.max_running = backend or SystemdBackend(), run, clock, max_running
@@ -139,7 +144,11 @@ class JobRunner:
                     raise JobError("could_not_set_permissions_on_the_workspace")
 
     def enroll(self, path):
+        if not self.enabled():
+            raise JobError("runner_not_set_up")
         real = runner.check_workspace(path, home=self.home, extra_deny=self.extra_deny)
+        if self.projects_dir is not None and os.path.dirname(real) != self.projects_dir:
+            raise JobError("workspace_must_be_a_folder_directly_inside_the_projects_folder")
         with self._lock:
             if self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
                 raise JobError("already_enrolled")
@@ -173,6 +182,7 @@ class JobRunner:
 
     # -- jobs ---------------------------------------------------------------------------------------------
     def run(self, workspace, recipe_id, args):
+        self.require_ready()
         with self._lock:
             if not self._db.execute("select 1 from workspaces where path=?", (workspace,)).fetchone():
                 raise JobError("workspace_not_enrolled")
@@ -182,24 +192,76 @@ class JobRunner:
         argv = runner.build_argv(recipe_id, args, real)
         recipe = runner.RECIPES[recipe_id]
         limits = {"seconds": recipe.seconds, "memory_mb": recipe.memory_mb, "tasks": recipe.tasks, "writes": recipe.writes}
+        return self._start(real, recipe_id, argv, limits, recipe.seconds)
+
+    def _start(self, real, label, argv, limits, seconds):
         self.ensure_user()
         job_id = secrets.token_hex(16)
         with self._lock:
             if len(self._live) >= self.max_running:
                 raise JobError("too_many_jobs_running")
             self._db.execute("insert into jobs(id,workspace,recipe,argv,state,created) values(?,?,?,?,?,?)",
-                             (job_id, real, recipe_id, json.dumps(argv), "running", int(self.clock())))
+                             (job_id, real, label, json.dumps(argv), "running", int(self.clock())))
             try:
                 proc = self.backend.start(job_id, argv, real, limits, self.run_user)
             except OSError:
                 self._db.execute("update jobs set state='failed', ended=? where id=?", (int(self.clock()), job_id))
                 raise JobError("could_not_start_the_job") from None
-            thread = threading.Thread(target=self._pump, args=(job_id, proc, recipe.seconds), daemon=True, name="stynpilot-job")
+            thread = threading.Thread(target=self._pump, args=(job_id, proc, seconds), daemon=True, name="stynpilot-job")
             self._live[job_id] = (thread, proc)
             self._db.execute("update jobs set started=? where id=?", (int(self.clock()), job_id))
         thread.start()
         self._prune()
         return {"job_id": job_id, "argv": list(argv), "limits": limits}
+
+    # -- setup and the self-test gate ---------------------------------------------------------------------
+    @property
+    def _enabled_file(self):
+        return self.dir / "runner-enabled.json"
+
+    @property
+    def _selftest_file(self):
+        return self.dir / "runner-selftest.json"
+
+    def enabled(self):
+        return self._enabled_file.is_file()
+
+    def setup(self):
+        """YELLOW at the door, once: the locked-down run user, the fixed projects folder, and the enabled marker."""
+        uid, gid = self.ensure_user()
+        if self.projects_dir is not None:
+            if not os.path.lexists(self.projects_dir):
+                os.mkdir(self.projects_dir, 0o700)
+                home_info = os.stat(self.home)
+                os.chown(self.projects_dir, home_info.st_uid, home_info.st_gid)      # the installer is root: hand it to the owner
+            info = os.lstat(self.projects_dir)
+            if os.path.islink(self.projects_dir) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.stat(self.home).st_uid:
+                raise JobError("projects_folder_must_belong_to_the_owner")
+            if info.st_mode & 0o002:
+                raise JobError("projects_folder_is_world_writable")
+        _write_json(self._enabled_file, {"enabled": True, "at": int(self.clock()), "version": self.version})
+        return {"runner_user": self.run_user, "projects_folder": self.projects_dir, "enabled": True}
+
+    def selftest_state(self):
+        try:
+            data = json.loads(self._selftest_file.read_text())
+        except (OSError, ValueError):
+            return {"ok": False, "ran": False}
+        if type(data) is not dict:
+            return {"ok": False, "ran": False}
+        return data
+
+    def require_ready(self):
+        if not self.enabled():
+            raise JobError("runner_not_set_up")
+        if self.gate:
+            state = self.selftest_state()
+            if state.get("ok") is not True or state.get("version") != self.version:
+                raise JobError("sandbox_self_test_required")
+
+    def selftest(self):
+        from .selftest import run_selftest
+        return run_selftest(self)
 
     def _pump(self, job_id, proc, seconds):
         folder = self.dir / "jobs" / job_id
@@ -292,6 +354,14 @@ class JobRunner:
             except OSError:
                 pass
             self._db.execute("delete from jobs where id=?", (row["id"],))
+
+
+def _write_json(path, data):
+    tmp = Path(str(path) + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(data, sort_keys=True))
+    os.replace(tmp, path)
 
 
 def _is_id(value):

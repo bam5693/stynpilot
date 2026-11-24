@@ -68,7 +68,8 @@ class Real(unittest.TestCase):
         os.chmod(self.ws, 0o755)
         self.state = os.path.join(self.root, "state")
         os.makedirs(self.state, mode=0o700)
-        self.jr = JobRunner(self.state, owner_uid=self.owner.pw_uid, home=self.home, backend=LocalBackend(), max_running=2)
+        self.jr = JobRunner(self.state, owner_uid=self.owner.pw_uid, home=self.home, backend=LocalBackend(), max_running=2, gate=False)
+        self.jr.setup()
         self.addCleanup(self.stop_everything)
 
     def stop_everything(self):
@@ -232,7 +233,7 @@ class Real(unittest.TestCase):
         self.jr.enroll(self.ws)
         self.jr._db.execute("insert into jobs(id,workspace,recipe,argv,state,created) values('%s',?,?,?,?,?)" % ("a" * 32),
                             (self.ws, "probe", "[]", "running", 1))
-        again = JobRunner(self.state, owner_uid=self.owner.pw_uid, home=self.home, backend=LocalBackend())
+        again = JobRunner(self.state, owner_uid=self.owner.pw_uid, home=self.home, backend=LocalBackend(), gate=False)
         self.assertEqual(again.reconcile(), 1)
         self.assertEqual(again.status("a" * 32)["state"], "lost")
 

@@ -10,6 +10,7 @@ from stynpilot import runner
 from stynpilot.broker.jobs import _kill_group
 
 SCRIPT = r'''set -e
+[ -n "$NS_UNHIDE" ] && umount "$NS_UNHIDE"        # test harness only: undo the "installer cannot see the home" tmpfs in THIS namespace
 stash=$(mktemp -d)
 mount --bind "$NS_WS" "$stash"
 mount -t tmpfs -o mode=0755 none "$NS_HOME"
@@ -32,7 +33,7 @@ class NamespaceBackend:
 
     enforces_limits = False
 
-    def start(self, job_id, argv, workspace, limits, run_user, masked=()):
+    def start(self, job_id, argv, workspace, limits, run_user, masked=(), io_devices=()):
         pw = pwd.getpwnam(run_user)
         drop = ["setpriv", "--reuid=%d" % pw.pw_uid, "--regid=%d" % pw.pw_gid, "--clear-groups", "--no-new-privs",
                 "--bounding-set=-all", "--inh-caps=-all", "--"]

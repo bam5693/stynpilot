@@ -397,11 +397,7 @@ class Executor:
                     "selftest": self._safe_selftest(test)}
         path = self._workspace_path(payload["name"])
         if action == "enroll":
-            if not os.path.lexists(path):
-                owner = pwd.getpwuid(self.owner_uid)
-                os.mkdir(path, 0o700)
-                os.chown(path, owner.pw_uid, owner.pw_gid)
-            done = self.jobs.enroll(path)
+            done = self.jobs.enroll(path)           # the owner-side helper creates the folder if needed; root never touches the home
             return {"ok": True, "action": "enroll", "workspace": payload["name"], "entries": done["entries"],
                     "skipped": done["skipped"]}
         self.jobs.unenroll(path)

@@ -186,9 +186,10 @@ HIDDEN_PATHS = ("/etc/stynpilot", "/var/lib/stynpilot", "/var/lib/stynpilot-inst
 FSIZE_MB = 512          # largest single file a job may write (RLIMIT_FSIZE)
 TMP_MB = 256            # size of the private /tmp (a memory-backed file system, so it can never fill the disk)
 RUN_MB = 8
+IO_WRITE_MBPS = 64      # bytes per second ceiling per disk: bounds how far the disk can fill between two watchdog checks
 
 
-def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=True, network=False, run_user=RUN_USER, masked=()):
+def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=True, network=False, run_user=RUN_USER, masked=(), io_devices=()):
     """The ``systemd-run`` argv list that runs ``argv`` in ``workspace`` as ``run_user`` with the sandbox below. A LIST, so
     nothing is ever parsed by a shell; every value that varies is validated here, and property values never contain
     separators that systemd would interpret."""
@@ -204,6 +205,9 @@ def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=T
     for m in masked:
         if type(m) is not str or not _PATH_CHARS.fullmatch(m) or not m.startswith(workspace + "/") or ".." in m.split("/"):
             raise RunnerError("protected_path_unsafe")
+    for dev in io_devices:
+        if type(dev) is not str or not re.fullmatch(r"[0-9]{1,4}:[0-9]{1,7}", dev):
+            raise RunnerError("io_device_invalid")
     props = [
         "User=" + run_user, "Group=" + run_user, "SupplementaryGroups=",
         "WorkingDirectory=" + workspace,
@@ -224,7 +228,7 @@ def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=T
         # how much it can use
         "RuntimeMaxSec=%d" % seconds, "MemoryMax=%dM" % memory_mb, "MemorySwapMax=0", "TasksMax=%d" % tasks, "CPUQuota=200%",
         "KillMode=control-group", "TimeoutStopSec=5",
-    ]
+    ] + ["IOWriteBandwidthMax=/dev/block/%s %dM" % (dev, IO_WRITE_MBPS) for dev in io_devices]
     cmd = ["systemd-run", "--quiet", "--collect", "--wait", "--pipe", "--unit", "stynpilot-job-" + job_id]
     for p in props:
         cmd += ["-p", p]

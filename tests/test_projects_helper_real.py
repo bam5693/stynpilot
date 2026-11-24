@@ -167,7 +167,7 @@ class Helper(unittest.TestCase):
                 os.symlink(self.outside, full)
             return real_open(path, flags, *a, **kw)
         request = {"op": "enroll", "name": "app", "projects": str(self.projects), "home": str(self.home),
-                   "run_user": runner.RUN_USER, "owner_user": "nobody"}
+                   "run_users": [runner.RUN_USER, runner.RUN_USER + "-2"], "owner_user": "nobody"}
         os.setegid(self.owner.pw_gid)
         os.seteuid(self.owner.pw_uid)
         try:

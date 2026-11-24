@@ -29,12 +29,14 @@ from pathlib import Path
 
 from .. import redact, runner, safefs
 from . import apt
-from .helper import HelperError, LocalHelper, SystemdHelper
+from ..projects_helper import block_devices
+from .helper import MEASURE_TIMEOUT, HelperError, LocalHelper, SystemdHelper
 
 MAX_OUT = 256 * 1024
 MAX_ENTRIES = 50000
 MAX_JOBS_KEPT = 200
 BATCH = 100
+LIB = str(Path(__file__).resolve().parents[2])      # where the stynpilot package lives (the sandbox imports acl_repair from here)
 _ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
 
 
@@ -47,13 +49,19 @@ class JobError(Exception):
 class SystemdBackend:
     enforces_limits = True          # the self-test must SEE the limits from inside, or it fails
 
-    def start(self, job_id, argv, workspace, limits, run_user, masked=()):
-        cmd = runner.unit_command(job_id, argv, workspace, run_user=run_user, masked=masked, **limits)
+    def start(self, job_id, argv, workspace, limits, run_user, masked=(), io_devices=()):
+        cmd = runner.unit_command(job_id, argv, workspace, run_user=run_user, masked=masked, io_devices=io_devices, **limits)
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=_ENV,
                                 start_new_session=True)
 
     def cancel(self, job_id, proc):
-        subprocess.run(["systemctl", "stop", "stynpilot-job-" + job_id], capture_output=True, timeout=30, check=False, env=_ENV)
+        """Bounded termination: SIGKILL the whole unit first (a few seconds at most), then stop it, then the local client process."""
+        unit = "stynpilot-job-" + job_id + ".service"
+        for argv, wait in ((["systemctl", "kill", "--signal=SIGKILL", "--kill-whom=all", unit], 3), (["systemctl", "stop", unit], 5)):
+            try:
+                subprocess.run(argv, capture_output=True, timeout=wait, check=False, env=_ENV)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
         _kill_group(proc)
 
 
@@ -61,7 +69,7 @@ class LocalBackend:
     """Root sandbox only: same argv, same fixed environment, real uid/gid drop, no systemd."""
     enforces_limits = False
 
-    def start(self, job_id, argv, workspace, limits, run_user, masked=()):
+    def start(self, job_id, argv, workspace, limits, run_user, masked=(), io_devices=()):
         pw = pwd.getpwnam(run_user)
         cmd = ["setpriv", "--reuid=%d" % pw.pw_uid, "--regid=%d" % pw.pw_gid, "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--inh-caps=-all", "--"] + list(argv)
         return subprocess.Popen(cmd, cwd=workspace, env=dict(runner.ENV), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -80,7 +88,8 @@ def _kill_group(proc):
 
 class JobRunner:
     def __init__(self, state_dir, *, owner_uid, home, backend=None, run=apt.real_run, run_user=runner.RUN_USER, clock=time.time,
-                 max_running=2, extra_deny=(), projects_dir=None, disk_start_free=4 << 30, disk_kill_free=2 << 30, disk_poll=2.0, version="0", gate=True,
+                 max_running=2, extra_deny=(), projects_dir=None, disk_start_free=4 << 30, disk_kill_free=2 << 30, disk_growth=4 << 30,
+                 inode_start=0.05, inode_kill=0.02, inode_growth=0.15, disk_poll=1.0, measure_timeout=MEASURE_TIMEOUT, version="0", gate=True,
                  selftest_root="/var/lib/stynpilot-run", python="/usr/bin/python3", helper=None):
         self.dir = Path(state_dir)
         self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -91,14 +100,20 @@ class JobRunner:
         self.version, self.gate, self.selftest_root, self.python = str(version), bool(gate), str(selftest_root), python
         (self.dir / "jobs").mkdir(parents=True, exist_ok=True, mode=0o700)
         self.owner_uid, self.home, self.run_user = owner_uid, os.path.abspath(home), run_user
+        # Two sandbox accounts: jobs that run at the same time never share a uid, so one cannot read another's files, processes
+        # (/proc/<pid>/root) or memory. The pool size is also the cap on concurrent jobs.
+        self.pool = [run_user, run_user + "-2"]
+        self.max_running = min(int(max_running), len(self.pool))
+        self._user_of, self._info = {}, {}
         owner = pwd.getpwuid(owner_uid)
         self.owner_name = owner.pw_name
         self.helper = helper or (SystemdHelper(owner.pw_name) if isinstance(backend or SystemdBackend(), SystemdBackend)
                                  else LocalHelper(owner_uid, owner.pw_gid))
-        self.backend, self.runcmd, self.clock, self.max_running = backend or SystemdBackend(), run, clock, max_running
+        self.backend, self.runcmd, self.clock = backend or SystemdBackend(), run, clock
         self.extra_deny = tuple(str(p) for p in extra_deny) + (str(self.dir),)
         self._lock = threading.Lock()
-        self.disk_start_free, self.disk_kill_free, self.disk_poll = int(disk_start_free), int(disk_kill_free), float(disk_poll)
+        self.disk_start_free, self.disk_kill_free, self.disk_growth, self.disk_poll = int(disk_start_free), int(disk_kill_free), int(disk_growth), float(disk_poll)
+        self.inode_start, self.inode_kill, self.inode_growth, self.measure_timeout = inode_start, inode_kill, inode_growth, float(measure_timeout)
         self._ws_lock = threading.RLock()                 # enrol/unenrol/job start never interleave
         self._live = {}                                   # job id -> (thread, process)
         self._db = sqlite3.connect(self.dir / "jobs.sqlite3", check_same_thread=False, isolation_level=None)
@@ -110,32 +125,42 @@ class JobRunner:
 
     # -- the runner user ----------------------------------------------------------------------------------
     def ensure_user(self):
-        try:
-            pw = pwd.getpwnam(self.run_user)
-        except KeyError:
-            code, out = self.runcmd(["useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", "--user-group",
-                                     self.run_user], 60)
-            if code != 0:
-                raise JobError("could_not_create_the_runner_user") from None
-            pw = pwd.getpwnam(self.run_user)
-        if pw.pw_uid in (0, self.owner_uid) or pw.pw_shell not in ("/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "/usr/bin/nologin"):
-            raise JobError("runner_user_is_not_locked_down")
+        """Create (once) and verify every sandbox account; returns the primary account's (uid, gid)."""
+        primary = None
+        for name in self.pool:
+            try:
+                pw = pwd.getpwnam(name)
+            except KeyError:
+                code, out = self.runcmd(["useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", "--user-group", name], 60)
+                if code != 0:
+                    raise JobError("could_not_create_the_runner_user") from None
+                pw = pwd.getpwnam(name)
+            if pw.pw_uid in (0, self.owner_uid) or pw.pw_shell not in ("/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "/usr/bin/nologin"):
+                raise JobError("runner_user_is_not_locked_down")
+            primary = primary or (pw.pw_uid, pw.pw_gid)
+        return primary
+
+    def ids(self, name):
+        pw = pwd.getpwnam(name)
         return pw.pw_uid, pw.pw_gid
 
     # -- workspaces ---------------------------------------------------------------------------------------
-    def _ask(self, op, **fields):
-        request = {"op": op, "home": self.home, "projects": self.projects_dir, "run_user": self.run_user, "owner_user": self.owner_name}
+    def _ask(self, op, _timeout=None, **fields):
+        request = {"op": op, "home": self.home, "projects": self.projects_dir, "run_users": list(self.pool), "owner_user": self.owner_name}
         request.update(fields)
         try:
-            return self.helper.call(request)
+            return self.helper.call(request) if _timeout is None else self.helper.call(request, timeout=_timeout)
         except HelperError as error:
             raise JobError(error.code) from None
 
-    def _acl_scratch(self, folder, spec):
-        """ONLY for the self-test's own root-owned scratch folder (never anything in the owner's home)."""
-        for default in (False, True):
-            argv = ["setfacl"] + (["-d"] if default else []) + ["-m", spec, "--", folder]
-            if self.runcmd(argv, 60)[0] != 0:
+    def _acl_scratch(self, folder, *, owner_only=False):
+        """ONLY for the self-test's own root-owned scratch folders (never anything in the owner's home). Same model as a real
+        workspace: named entries now, no default entry for the sandbox accounts, nothing for "other"."""
+        users = [] if owner_only else list(self.pool)
+        access = ",".join("u:%s:rwX" % u for u in users + [self.owner_name])
+        steps = [["-m", access], ["-d", "-m", "u:%s:rwX,g::---,o::---" % self.owner_name]]
+        for step in steps:
+            if self.runcmd(["setfacl"] + step + ["--", folder], 60)[0] != 0:
                 raise JobError("could_not_set_permissions_on_the_workspace")
 
     def _workspace_ok(self, path):
@@ -151,26 +176,33 @@ class JobRunner:
         return self._ask("check", name=os.path.basename(path))["path"]
 
     def enroll(self, path):
+        """The workspace folder is created (if missing), checked and given its access by the OWNER-side helper in one step; this
+        root-side code never looks at the home folder."""
         if not self.enabled():
             raise JobError("runner_not_set_up")
-        real = self._workspace_ok(path)
-        if real != path:
-            raise JobError("workspace_path_is_or_contains_a_link")
+        if self.projects_dir is None:
+            raise JobError("projects_folder_not_configured")
+        try:
+            runner.check_workspace_text(path)
+        except runner.RunnerError as error:
+            raise JobError(str(error)) from None
+        if os.path.dirname(path) != self.projects_dir:
+            raise JobError("workspace_must_be_a_folder_directly_inside_the_projects_folder")
         self.ensure_user()
         with self._ws_lock:
             with self._lock:
-                if self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
+                if self._db.execute("select 1 from workspaces where path=?", (path,)).fetchone():
                     raise JobError("already_enrolled")
                 for other in self._db.execute("select path from workspaces"):
                     o = other["path"]
-                    if real.startswith(o + "/") or o.startswith(real + "/"):
+                    if path.startswith(o + "/") or o.startswith(path + "/"):
                         raise JobError("overlaps_an_enrolled_workspace")
-            if self.projects_dir is None:
-                raise JobError("projects_folder_not_configured")
-            done = self._ask("enroll", name=os.path.basename(real))
+            done = self._ask("enroll", name=os.path.basename(path))
+            if done["path"] != path:
+                raise JobError("workspace_path_is_or_contains_a_link")
             with self._lock:
-                self._db.execute("insert into workspaces values(?,?,?)", (real, int(self.clock()), done["skipped"]))
-        return {"workspace": real, "entries": done["entries"], "skipped": done["skipped"]}
+                self._db.execute("insert into workspaces values(?,?,?)", (path, int(self.clock()), done["skipped"]))
+        return {"workspace": path, "entries": done["entries"], "skipped": done["skipped"]}
 
     def unenroll(self, path):
         with self._ws_lock:
@@ -201,13 +233,7 @@ class JobRunner:
         argv = runner.build_argv(recipe_id, args, real)
         recipe = runner.RECIPES[recipe_id]
         limits = {"seconds": recipe.seconds, "memory_mb": recipe.memory_mb, "tasks": recipe.tasks, "writes": recipe.writes}
-        return self._start(real, recipe_id, argv, limits, recipe.seconds)   # masked: computed inside, at start, every time
-
-    def _masked(self, real):
-        """Credential-named files/folders and the trash, found NOW and hidden from the sandbox (not merely skipped by the ACL)."""
-        names = self._ask("protected", name=os.path.basename(real))["protected"]
-        out = [real + "/" + n for n in names]
-        return self._safe_masked(real, out)
+        return self._start(real, recipe_id, argv, limits, recipe.seconds)
 
     @staticmethod
     def _safe_masked(real, paths):
@@ -216,37 +242,64 @@ class JobRunner:
                 raise JobError("a_protected_file_has_a_name_that_cannot_be_hidden_safely")   # fail closed: no job
         return paths
 
-    def _free_bytes(self, real, local):
+    def _measure(self, real, local):
+        """Free bytes/inodes and the disks under the workspace, with a HARD deadline (a slow measurement counts as a failed one)."""
         if local:
             info = os.statvfs(real)
-            return info.f_bavail * info.f_frsize
-        return int(self._ask("disk", path=self.projects_dir)["free"])
+            return {"free": info.f_bavail * info.f_frsize, "ifree": info.f_favail, "itotal": info.f_files, "devices": block_devices(real)}
+        got = self._ask("disk", _timeout=self.measure_timeout, path=self.projects_dir)
+        return {k: got[k] for k in ("free", "ifree", "itotal", "devices")}
 
-    def _start(self, real, label, argv, limits, seconds, need_enrolled=True, masked=None):
+    def _low(self, m, base):
+        """True when the host disk is too full, or this job has used too much of it. ``base`` is the measurement at job start."""
+        if m["free"] < self.disk_kill_free or base["free"] - m["free"] > self.disk_growth:
+            return True
+        if m["itotal"] > 0 and (m["ifree"] < self.inode_kill * m["itotal"] or base["ifree"] - m["ifree"] > self.inode_growth * m["itotal"]):
+            return True
+        return False
+
+    def _start(self, real, label, argv, limits, seconds, need_enrolled=True, masked=None, run_user=None):
         self.ensure_user()
-        if masked is None:
-            masked = self._masked(real) if need_enrolled else []
-        if self._free_bytes(real, local=not need_enrolled) < self.disk_start_free:
-            raise JobError("not_enough_free_disk_space_to_start_a_job")
-        job_id = secrets.token_hex(16)
-        with self._ws_lock, self._lock:
-            if need_enrolled and not self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
-                raise JobError("workspace_not_enrolled")
-            if len(self._live) >= self.max_running:
-                raise JobError("too_many_jobs_running")
-            self._db.execute("insert into jobs(id,workspace,recipe,argv,state,created) values(?,?,?,?,?,?)",
-                             (job_id, real, label, json.dumps(argv), "running", int(self.clock())))
-            try:
-                proc = self.backend.start(job_id, argv, real, limits, self.run_user, masked=masked)
-            except OSError:
-                self._db.execute("update jobs set state='failed', ended=? where id=?", (int(self.clock()), job_id))
-                raise JobError("could_not_start_the_job") from None
-            thread = threading.Thread(target=self._pump, args=(job_id, proc, seconds, not need_enrolled), daemon=True, name="stynpilot-job")
-            self._live[job_id] = (thread, proc)
-            self._db.execute("update jobs set started=? where id=?", (int(self.clock()), job_id))
+        with self._ws_lock:
+            if need_enrolled:
+                with self._lock:
+                    if not self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
+                        raise JobError("workspace_not_enrolled")
+                # Look at everything that exists NOW: ordinary files get sandbox access, protected names lose it and are hidden.
+                # Anything the helper cannot see completely is a refusal (never a partial scan).
+                done = self._ask("grant", name=os.path.basename(real))
+                masked = self._safe_masked(real, [real + "/" + p for p in done["protected"]])
+            masked = list(masked or [])
+            base = self._measure(real, local=not need_enrolled)
+            if base["free"] < self.disk_start_free or (base["itotal"] > 0 and base["ifree"] < self.inode_start * base["itotal"]):
+                raise JobError("not_enough_free_disk_space_to_start_a_job")
+            if getattr(self.backend, "enforces_limits", False) and not base["devices"]:
+                raise JobError("storage_write_rate_limit_unavailable_for_this_disk")        # fail closed: no unbounded writer
+            job_id = secrets.token_hex(16)
+            with self._lock:
+                if len(self._live) >= self.max_running:
+                    raise JobError("too_many_jobs_running")
+                busy = set(self._user_of.values())
+                user = run_user if run_user is not None else next((u for u in self.pool if u not in busy), None)
+                if user is None or user in busy:
+                    raise JobError("too_many_jobs_running")
+                self._db.execute("insert into jobs(id,workspace,recipe,argv,state,created) values(?,?,?,?,?,?)",
+                                 (job_id, real, label, json.dumps(argv), "running", int(self.clock())))
+                self._user_of[job_id] = user
+                self._info[job_id] = {"base": base, "masked": masked}
+                try:
+                    proc = self.backend.start(job_id, argv, real, limits, user, masked=masked, io_devices=base["devices"])
+                except OSError:
+                    self._db.execute("update jobs set state='failed', ended=? where id=?", (int(self.clock()), job_id))
+                    self._user_of.pop(job_id, None)
+                    self._info.pop(job_id, None)
+                    raise JobError("could_not_start_the_job") from None
+                thread = threading.Thread(target=self._pump, args=(job_id, proc, seconds, not need_enrolled), daemon=True, name="stynpilot-job")
+                self._live[job_id] = (thread, proc)
+                self._db.execute("update jobs set started=? where id=?", (int(self.clock()), job_id))
         thread.start()
         self._prune()
-        return {"job_id": job_id, "argv": list(argv), "limits": limits}
+        return {"job_id": job_id, "argv": list(argv), "limits": limits, "run_user": user}
 
     # -- setup and the self-test gate ---------------------------------------------------------------------
     @property
@@ -313,12 +366,15 @@ class JobRunner:
         stop_watch = threading.Event()
 
         def watch():
-            # A runaway job must not fill the host disk: the kill threshold leaves headroom for the polling interval.
+            # A runaway job must not exhaust the host disk (bytes or inodes). Every measurement has a hard deadline, so a slow or
+            # failing one counts as "low"; termination is bounded too. Between checks the write-rate cap (IOWriteBandwidthMax)
+            # limits how far the disk can fill, and the reserve below the kill line is larger than that growth.
+            info = self._info.get(job_id)
             while not stop_watch.wait(self.disk_poll):
                 try:
-                    low = self._free_bytes(self._watch_path(job_id), local) < self.disk_kill_free
-                except (JobError, OSError, ValueError):
-                    low = True                                    # cannot tell -> fail closed
+                    low = self._low(self._measure(self._real_of(job_id), local), info["base"])
+                except (JobError, OSError, ValueError, KeyError, TypeError):
+                    low = True                                    # cannot tell in time -> fail closed
                 if low:
                     disk_full.set()
                     self.backend.cancel(job_id, proc)
@@ -326,7 +382,7 @@ class JobRunner:
         threading.Thread(target=watch, daemon=True, name="stynpilot-job-disk").start()
         try:
             while True:
-                chunk = proc.stdout.read(8192)
+                chunk = proc.stdout.read1(8192)          # returns what is there now (live output), not after 8 KiB
                 if not chunk:
                     break
                 room = MAX_OUT - written
@@ -350,24 +406,34 @@ class JobRunner:
             self._db.execute("update jobs set state=?, exit_code=?, ended=?, truncated=? where id=?",
                              (state, code, int(self.clock()), truncated, job_id))
             self._live.pop(job_id, None)
+            self._user_of.pop(job_id, None)
+            self._info.pop(job_id, None)
 
     def _repair(self, job_id, local):
-        """Files the run user created with mode 0600 get an ACL mask of 0 (so the owner's named entry stops working). Re-open the mask,
-        AS THE RUN USER (it owns those files), inside the same sandbox, without following links."""
+        """Files the sandbox account created with mode 0600 get an ACL mask of 0, which switches the owner's access off. Only the
+        account that owns them can change that, so it repairs its OWN files, inside the same sandbox (protected paths still hidden),
+        with stynpilot.acl_repair: no links, nothing it does not own, no protected names, and no ACL entries other than the owner's
+        and the sandbox accounts' (it starts from ``setfacl -b``), so nothing is unmasked or widened."""
         row = self._db.execute("select workspace from jobs where id=?", (job_id,)).fetchone()
-        if row is None or not os.path.isabs(row["workspace"]):
+        user, info = self._user_of.get(job_id), self._info.get(job_id)
+        if row is None or user is None or info is None or not os.path.isabs(row["workspace"]):
             return
+        code = ("import sys; sys.path.insert(0, %r); from stynpilot import acl_repair; acl_repair.main()" % LIB)
+        argv = [self.python, "-I", "-c", code, json.dumps({"owner": self.owner_name, "users": list(self.pool)})]
         try:
-            proc = self.backend.start(secrets.token_hex(16), ["/usr/bin/setfacl", "-R", "-P", "-m", "m::rwx", "--", "."], row["workspace"],
-                                      {"seconds": 60, "memory_mb": 128, "tasks": 16, "writes": True}, self.run_user, masked=())
+            proc = self.backend.start(secrets.token_hex(16), argv, row["workspace"],
+                                      {"seconds": 60, "memory_mb": 128, "tasks": 16, "writes": True}, user, masked=info["masked"],
+                                      io_devices=info["base"]["devices"])
             proc.stdout.read()
             proc.wait()
         except (OSError, JobError, runner.RunnerError):
             pass
 
-    def _watch_path(self, job_id):
+    def _real_of(self, job_id):
         row = self._db.execute("select workspace from jobs where id=?", (job_id,)).fetchone()
-        return row["workspace"] if row else "/"
+        if row is None:
+            raise JobError("unknown_job")
+        return row["workspace"]
 
     def cancel(self, job_id):
         with self._lock:

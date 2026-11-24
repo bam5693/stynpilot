@@ -30,6 +30,33 @@ state paths inaccessible). Tests: `tests/test_runner_core.py` (hostile folders, 
 S3b root-door job kinds (create runner user, enroll workspace, run, status, cancel, selftest) with approval and a job
 table; S3c MCP tools (workspace request, file edits inside workspaces, job run/status/output/cancel); S3d one-off command.
 
+## dev10: fixes from ChatGPT's independent review of dev9 (54caf0b)
+
+Same architecture and capabilities; nothing new added. dev9 and dev8 were never installed: dev10 replaces them as the dev7 upgrade target.
+
+**Findings and fixes**
+1. *Disk watchdog.* Every helper call now has a hard deadline (`RuntimeMaxSec` plus a subprocess timeout, then `systemctl kill`); the watchdog's
+   measurement uses a 4 s bound and fails closed (job cancelled) on any error. Cancel is bounded too. Inodes are watched (start refused below 5% free,
+   killed below 2% or after 15% consumed), per-job growth is capped at 4 GiB, and writes are throttled with `IOWriteBandwidthMax` on the real block
+   device (fail closed if it cannot be resolved). `LimitFSIZE=512M`, `/tmp` 256M, `/run` 8M. There is no per-workspace byte quota; the per-job growth budget is the aggregate bound.
+2. *Credentials.* Runtime boundary instead of name filtering: new files in a workspace get no sandbox entry by default (default ACL gives other = none), the
+   job runs with only its own account, and the owner helper grants access per job start. Scans fail closed: anything unreadable, over 64 levels deep or over 50,000 entries refuses the job
+   (`scan_incomplete`, `workspace_too_deep`), never a silent skip. Protected names are masked and never descended into.
+3. *Enrollment.* `Executor._runner_do` has no `lexists`/`mkdir`/`chown`; the owner helper creates and verifies the folder (0700). Tested with the home hidden from root.
+4. *Concurrency.* Two accounts (`stynpilot-run`, `stynpilot-run-2`); each live job gets its own. The live self-test runs a decoy job in another workspace and proves the
+   probe cannot read its files, see its processes, or reach it. A third job is refused (`too_many_jobs_running`).
+5. *Permission repair.* Runs as the job's own account (`acl_repair`), only on entries the owner owns, skips protected names, links and hard-linked files, and leaves files carrying
+   unrelated named ACL entries exactly as they are (the sweep reads ACLs first and fails closed if it cannot).
+
+**Honest limits**
+- A world-readable file moved into a workspace during a run keeps its permission bits. No AI tool does this.
+- There is no filename-independent kernel boundary against the owner's own out-of-band actions.
+- Inode creation rate is bounded by the watchdog and thresholds, not prevented.
+- Systemd unit properties can only be proven by the live self-test on the Ryzen.
+
+**Test count 634 -> 591.** dev8: 587 passed + 47 skipped = 634 total. dev9: 591 passed + 66 skipped = 657 total. dev10: 591 passed + 85 skipped = 676 total (non-root).
+The earlier figures compared a total with a passed count. The new tests are root-only isolation tests and show as skips without root; as root they all run (19 new, all pass).
+
 ## dev9: fixes from ChatGPT's independent review of dev8 (a020d9f)
 
 Same architecture, same capabilities; nothing new added. dev8 was never installed: dev9 replaces it as the dev7 upgrade target.

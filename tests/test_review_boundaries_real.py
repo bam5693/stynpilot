@@ -189,14 +189,13 @@ class Boundary(unittest.TestCase):
     def test_if_free_space_cannot_be_measured_the_job_is_stopped(self):
         jr = self.make(LocalBackend())
         jr.enroll(str(self.app))
+        real_measure = jr._measure
+        jr._measure = lambda real, local: real_measure(real, local)
+        job = jr._start(str(self.app), "t", ["/usr/bin/python3", "-c", "import time; time.sleep(30)"], {"seconds": 60, "memory_mb": 64, "tasks": 8, "writes": True}, 60)
 
         def broken(real, local):
-            if local is False and getattr(broken, "armed", False):
-                raise JobError("projects_helper_failed")
-            return 1 << 60
-        jr._free_bytes = broken
-        job = jr._start(str(self.app), "t", ["/usr/bin/python3", "-c", "import time; time.sleep(30)"], {"seconds": 60, "memory_mb": 64, "tasks": 8, "writes": True}, 60)
-        broken.armed = True
+            raise JobError("projects_helper_failed")
+        jr._measure = broken
         self.assertEqual(jr.wait(job["job_id"], 15)["state"], "disk_limit")
 
     # -- should-fix ------------------------------------------------------------------------------------------------

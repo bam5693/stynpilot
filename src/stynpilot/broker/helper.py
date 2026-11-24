@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import subprocess
 import sys
 from pathlib import Path
 
 HELPER = str(Path(__file__).resolve().parent.parent / "projects_helper.py")
+DEFAULT_TIMEOUT = 120          # walks over big workspaces; the measurement the disk watchdog uses asks for much less
+MEASURE_TIMEOUT = 4
 _ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
 
 
@@ -36,17 +39,24 @@ class SystemdHelper:
     def __init__(self, owner_user, python="/usr/bin/python3"):
         self.owner_user, self.python = owner_user, python
 
-    def call(self, request):
+    def call(self, request, timeout=DEFAULT_TIMEOUT):
+        """One owner-side operation with a HARD deadline: systemd itself ends the unit at ``timeout`` (RuntimeMaxSec), and if the
+        client is still hanging a little later the unit is stopped by name and the call fails. A slow measurement is a failed one."""
         writable = request.get("home") if request.get("op") == "prepare" else request.get("projects")
-        cmd = ["systemd-run", "--pipe", "--wait", "--collect", "--quiet", "-p", "User=" + self.owner_user, "-p", "ProtectSystem=strict",
+        unit = "stynpilot-projects-helper-" + secrets.token_hex(8)
+        cmd = ["systemd-run", "--pipe", "--wait", "--collect", "--quiet", "--unit", unit, "-p", "RuntimeMaxSec=%d" % max(1, int(timeout)),
+               "-p", "User=" + self.owner_user, "-p", "ProtectSystem=strict",
                "-p", "PrivateNetwork=yes", "-p", "PrivateTmp=yes", "-p", "NoNewPrivileges=yes", "-p", "CapabilityBoundingSet=",
                "-p", "ProtectKernelModules=yes", "-p", "RestrictAddressFamilies=AF_UNIX", "-p", "TimeoutStopSec=5"]
         if writable:
             cmd += ["-p", "ReadWritePaths=" + str(writable)]
         cmd += ["--", self.python, "-I", HELPER, json.dumps(request)]
         try:
-            done = subprocess.run(cmd, capture_output=True, timeout=300, env=_ENV, check=False)
-        except (OSError, subprocess.TimeoutExpired):
+            done = subprocess.run(cmd, capture_output=True, timeout=timeout + 3, env=_ENV, check=False)
+        except subprocess.TimeoutExpired:
+            subprocess.run(["systemctl", "kill", "--signal=SIGKILL", unit + ".service"], capture_output=True, timeout=5, check=False, env=_ENV)
+            raise HelperError("projects_helper_timed_out") from None
+        except OSError:
             raise HelperError("projects_helper_failed") from None
         return _parse(done)
 
@@ -56,12 +66,14 @@ class LocalHelper:
     def __init__(self, owner_uid, owner_gid=None, python=None):
         self.owner_uid, self.owner_gid, self.python = owner_uid, owner_gid, python or sys.executable
 
-    def call(self, request):
+    def call(self, request, timeout=DEFAULT_TIMEOUT):
         gid = self.owner_gid if self.owner_gid is not None else self.owner_uid
         cmd = ["setpriv", "--reuid=%d" % self.owner_uid, "--regid=%d" % gid, "--clear-groups", "--no-new-privs", "--bounding-set=-all",
                "--inh-caps=-all", "--", self.python, "-I", HELPER, json.dumps(request)]
         try:
-            done = subprocess.run(cmd, capture_output=True, timeout=300, env=dict(_ENV), check=False, cwd="/")
-        except (OSError, subprocess.TimeoutExpired):
+            done = subprocess.run(cmd, capture_output=True, timeout=timeout, env=dict(_ENV), check=False, cwd="/")
+        except subprocess.TimeoutExpired:
+            raise HelperError("projects_helper_timed_out") from None
+        except OSError:
             raise HelperError("projects_helper_failed") from None
         return _parse(done)

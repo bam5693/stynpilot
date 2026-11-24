@@ -531,7 +531,7 @@ class WorkerTests(unittest.TestCase):
         self.system = FakeSystem("0.1.0~dev3", {str(self.new): "0.1.0~dev4", str(self.old): "0.1.0~dev3"})
         self.clock = [0.0]
 
-    def run_job(self, answers=True, **changes):
+    def run_job(self, answers=True, endpoint_fn=None, **changes):
         job = {"job_dir": str(self.dir), "from_version": "0.1.0~dev3", "to_version": "0.1.0~dev4",
                "new_deb": str(self.new), "new_sha256": hashlib.sha256(self.new.read_bytes()).hexdigest(),
                "old_deb": str(self.old), "old_sha256": hashlib.sha256(self.old.read_bytes()).hexdigest(),
@@ -544,8 +544,9 @@ class WorkerTests(unittest.TestCase):
         def tick():
             self.clock[0] += 1.0
             return self.clock[0]
+        extra = {"endpoint": endpoint_fn} if endpoint_fn else {}
         worker = Worker(job, run=self.system, answers=answers if callable(answers) else (lambda p: answers),
-                        sleep=lambda s: None, monotonic=tick)
+                        sleep=lambda s: None, monotonic=tick, **extra)
         return worker.execute()
 
     def installs(self):

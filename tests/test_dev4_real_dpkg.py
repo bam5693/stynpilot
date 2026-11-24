@@ -12,7 +12,16 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from stynpilot import upgrade_worker  # noqa: E402
 
-OLD, NEW = os.environ.get("STYN_DEV3_DEB"), os.environ.get("STYN_DEV4_DEB")
+OLD, NEW = os.environ.get("STYN_DEV3_DEB"), os.environ.get("STYN_DEV4_DEB")     # "older" and "newer" package
+
+
+def deb_version(path):
+    if not path or not os.path.exists(path):
+        return None
+    return subprocess.run(["dpkg-deb", "-f", path, "Version"], capture_output=True, text=True).stdout.strip()
+
+
+OLD_V, NEW_V = deb_version(OLD), deb_version(NEW)
 
 
 def sha(path):
@@ -59,7 +68,7 @@ class RealDpkgDrill(unittest.TestCase):
             f.write("owner-config\n")
         self.conf = conf
         job = {"job_dir": self.job_dir, "new_deb": NEW, "new_sha256": sha(NEW), "old_deb": OLD, "old_sha256": sha(OLD),
-               "from_version": "0.1.0~dev3", "to_version": "0.1.0~dev4", "restart_installer": False,
+               "from_version": OLD_V, "to_version": NEW_V, "restart_installer": False,
                "restart_owner": False, "config_hashes": {conf: sha(conf)}, "dpkg_extra": self.extra,
                "query_extra": self.query, "health_wait": 1, "settle_seconds": 0}
         job.update(more)
@@ -72,7 +81,7 @@ class RealDpkgDrill(unittest.TestCase):
         before = tree_hashes(self.root)
         result = self.worker(self.job()).execute()
         self.assertTrue(result["ok"], result)
-        self.assertEqual(self.version(), "0.1.0~dev4")
+        self.assertEqual(self.version(), NEW_V)
         self.assertNotEqual(before, tree_hashes(self.root))
         with open(self.conf) as f:
             self.assertEqual(f.read(), "owner-config\n")
@@ -82,13 +91,13 @@ class RealDpkgDrill(unittest.TestCase):
         job = self.job()
 
         def faulty(path):       # the configuration looks changed only while the NEW version is installed
-            return "0" * 64 if path == self.conf and self.version() == "0.1.0~dev4" else sha(path)
+            return "0" * 64 if path == self.conf and self.version() == NEW_V else sha(path)
         result = upgrade_worker.Worker(job, sleep=lambda s: None, hash_file=faulty).execute()
         self.assertFalse(result["ok"])
         self.assertEqual(result["stopped"], "health_check_failed")
         self.assertTrue(result["rolled_back"], result)
         self.assertFalse(result.get("needs_owner_intervention"))
-        self.assertEqual(self.version(), "0.1.0~dev3")
+        self.assertEqual(self.version(), OLD_V)
         self.assertEqual(before, tree_hashes(self.root))
 
     def test_tampered_package_changes_nothing(self):
@@ -96,7 +105,7 @@ class RealDpkgDrill(unittest.TestCase):
         result = self.worker(job).execute()
         self.assertFalse(result["ok"])
         self.assertFalse(result["changed_anything"])
-        self.assertEqual(self.version(), "0.1.0~dev3")
+        self.assertEqual(self.version(), OLD_V)
 
 
 if __name__ == "__main__":

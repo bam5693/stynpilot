@@ -30,7 +30,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .. import release
+from .. import release, upgrade_worker
 from ..release import ReleaseError
 
 PAYLOAD_FIELDS = {"kind", "software", "owner", "device", "manifest", "signature", "expires_at"}
@@ -79,6 +79,7 @@ class Upgrader:
         self.socket_path = o.get("socket_path", "/run/stynpilot/installer.sock")
         self.worker_source = Path(o.get("worker_source", Path(__file__).resolve().parent.parent / "upgrade_worker.py"))
         self.python = o.get("python", "/usr/bin/python3")
+        self.endpoint_check = o.get("endpoint_check", upgrade_worker.endpoint_answers)
         self.jobs = executor.dir / "upgrades"
         self.jobs.mkdir(exist_ok=True, mode=0o700)
         (executor.dir / "kept").mkdir(exist_ok=True, mode=0o700)
@@ -266,6 +267,18 @@ class Upgrader:
             pass
         return files
 
+    def _endpoint_target(self):
+        """Where the owner's local MCP endpoint listens (from the owner's settings file), or None."""
+        try:
+            home = Path(pwd.getpwuid(self.ex.owner_uid).pw_dir)
+            data = json.loads((home / ".config/stynpilot/owner.json").read_text())
+            port, host = data["mcp_port"], data["mcp_public_host"]
+            if type(port) is int and 0 < port < 65536 and type(host) is str and host:
+                return {"port": port, "host": host}
+        except (KeyError, TypeError, ValueError, OSError):
+            pass
+        return None
+
     def _is_active(self, scope, unit):
         argv = ["systemctl"] + (["--user", "--machine=%s@.host" % self._owner_user()] if scope == "user" else [])
         return self._run(argv + ["is-active", unit], 30)[1].strip() == "active"
@@ -298,6 +311,8 @@ class Upgrader:
                 doctor = ["runuser", "-u", user, "--", "env", "HOME=" + pwd.getpwnam(user).pw_dir,
                           "XDG_RUNTIME_DIR=/run/user/%d" % uid, "/usr/bin/stynpilot", "doctor"]
             baseline = self._run(doctor, 120)[0] if doctor else 0
+            endpoint = self._endpoint_target() if self.restart else None
+            baseline_endpoint_ok = bool(endpoint and self.endpoint_check(endpoint))
             data = {"request_id": rid, "from_version": installed, "to_version": manifest["version"],
                     "new_deb": str(new_deb), "new_sha256": hashlib.sha256(new_deb.read_bytes()).hexdigest(),
                     "old_deb": str(old_deb), "old_sha256": hashlib.sha256(old_deb.read_bytes()).hexdigest(),
@@ -305,6 +320,7 @@ class Upgrader:
                     "owner_unit": "stynpilot-owner.service", "owner_user": user, "socket_path": self.socket_path,
                     "restart_installer": bool(restart_installer), "restart_owner": bool(restart_owner),
                     "config_hashes": hashes, "doctor_command": doctor, "baseline_doctor_code": baseline,
+                    "endpoint": endpoint, "baseline_endpoint_ok": baseline_endpoint_ok,
                     "dpkg_extra": self.dpkg_extra, "query_extra": self.query_extra,
                     "health_wait": self.health_wait, "settle_seconds": self.settle_seconds,
                     "started_at": int(time.time())}

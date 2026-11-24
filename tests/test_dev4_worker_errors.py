@@ -2,7 +2,9 @@
 package may have been changed, and 'rolled back' is claimed only when reinstall AND health checks both succeeded."""
 import unittest
 
-from test_dev4_upgrade import FakeSystem, WorkerTests as _Base
+import test_dev4_upgrade as _up
+
+FakeSystem, _Base = _up.FakeSystem, _up.WorkerTests
 
 NEW, OLD = "0.1.0~dev4", "0.1.0~dev3"
 
@@ -82,6 +84,8 @@ class WorkerErrorTests(unittest.TestCase):
         result = self.run_job(health_wait=5)
         self.assertEqual((result["ok"], result["rolled_back"], result["needs_owner_intervention"]), (False, False, True))
 
+
+del _Base, _up
 
 if __name__ == "__main__":
     unittest.main()

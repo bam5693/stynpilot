@@ -57,6 +57,21 @@ def write_json(path, data):
     os.replace(tmp, path)
 
 
+def endpoint_answers(target, timeout=10):
+    """The local MCP endpoint really works: a request without a token is answered 401 with a Bearer challenge.
+    (An active service that serves nothing, or serves the wrong thing, fails this.)"""
+    try:
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", int(target["port"]), timeout=timeout)
+        conn.request("POST", "/mcp", body="{}", headers={"Host": target["host"], "Content-Type": "application/json"})
+        reply = conn.getresponse()
+        reply.read(4096)
+        conn.close()
+        return reply.status == 401 and "bearer" in (reply.getheader("WWW-Authenticate") or "").lower()
+    except Exception:
+        return False
+
+
 def socket_answers(path, timeout=5):
     """The installer's own door answers a harmless status question. Proves the NEW installer is up."""
     try:
@@ -71,9 +86,10 @@ def socket_answers(path, timeout=5):
 
 
 class Worker:
-    def __init__(self, job, *, run=sh, answers=socket_answers, sleep=time.sleep, monotonic=time.monotonic,
+    def __init__(self, job, *, run=sh, answers=socket_answers, endpoint=endpoint_answers, sleep=time.sleep, monotonic=time.monotonic,
                  hash_file=sha256_file):
         self.job, self.run, self.answers, self.sleep, self.monotonic, self.hash_file = job, run, answers, sleep, monotonic, hash_file
+        self.endpoint = endpoint
         self.dir = job["job_dir"]
         self.notes = []
         self.touched = False             # True from the moment we ask dpkg to change the installed package
@@ -137,6 +153,8 @@ class Worker:
                 why = "installer_not_answering"
             elif self.job["restart_owner"] and not self.is_active("user", self.job["owner_unit"]):
                 why = "owner_service_not_running"
+            elif self.job.get("endpoint") and self.job.get("baseline_endpoint_ok") and not self.endpoint(self.job["endpoint"]):
+                why = "mcp_endpoint_not_answering"        # only gated when it answered BEFORE the upgrade
             if why is None:
                 break
             if self.monotonic() >= deadline:

@@ -53,6 +53,10 @@ RETAIN_BUILDS = 3
 _LOCK_LINE = re.compile(r"([A-Za-z0-9_.\-]{1,80})==([A-Za-z0-9_.!+\-]{1,40}) [0-9a-f]{64}")
 _VERSION_SCRIPT = ("import re;m=re.search(r'^__version__ = \"([^\"]+)\"', open('src/src/stynpilot/__init__.py').read(), re.M);"
                    "print(m.group(1) if m else '')")
+# The tests need the vendored packages (e.g. mcp, which Ubuntu does not ship) exactly as the package carries them: unpack the wheels the
+# lock file named (already hash-checked by the build) beside the source and put them on the path. No network, no install.
+TEST_SCRIPT = ("mkdir -p vendor && for w in cache/*.whl; do /usr/bin/python3 -m zipfile -e \"$w\" vendor || exit 97; done && "
+               "cd src && PYTHONPATH=src:../vendor exec /usr/bin/python3 -m pytest -q -p no:cacheprovider tests")
 _ASSET_HOSTS = (".githubusercontent.com",)
 _TESTS_LINE = re.compile(r"(?:(\d+) failed, )?(?:(\d+) passed)(?:, (\d+) skipped)?(?:, (\d+) (?:error|errors))?")
 
@@ -324,7 +328,7 @@ class Authority:
         result = self._phase_run(commit, name, argv, work, seconds, network, memory_mb, tasks, env)
         # What the owner (and the assistants) need to find a failure on a real machine: which step, its exit code, the end of its output.
         # The builder's output is untrusted DATA: printable ASCII only, short, and no secrets exist in the sandbox to leak.
-        tail = re.sub(r"[^ -~\n]", "?", result[1][-400:])
+        tail = re.sub(r"[^ -~\n]", "?", result[1][-1500:])
         self.last_phase = {"phase": name, "code": result[0], "tail": tail}
         return result
 
@@ -418,7 +422,7 @@ class Authority:
             if code != 0:
                 raise AuthorityError("build_failed")
         # Run the tests directly (no pipe: the exit status must be pytest's own).
-        code, out = ph("tests", ["/usr/bin/sh", "-c", "cd src && PYTHONPATH=src exec /usr/bin/python3 -m pytest -q -p no:cacheprovider tests"],
+        code, out = ph("tests", ["/usr/bin/sh", "-c", TEST_SCRIPT],
                        seconds=TEST_TIMEOUT)
         counts = self._count_tests(out)
         if counts is None:

@@ -463,6 +463,20 @@ class AuthorityTests(unittest.TestCase):
         self.assertIn("fatal: boom", got["detail"]["tail"])
         self.assertNotRegex(got["detail"]["tail"], r"[\x00-\x09\x0b-\x1f]")
 
+    def test_the_test_run_gets_the_vendored_packages_and_still_has_no_network(self):
+        seen = []
+
+        def sandbox(job, argv, workspace, *, seconds, memory_mb, tasks, network):
+            seen.append((argv, network))
+            return ["env", "WORKSPACE=" + workspace] + argv
+        auth = self.make(self.tmp / "vt", self.machine, sandbox=sandbox, work_root=self.tmp / "vtroot")
+        auth.prepare(COMMIT, VERSION, "x")
+        argv, network = [a for a in seen if "pytest" in a[0][-1]][0]
+        self.assertFalse(network)
+        self.assertIn("zipfile -e", argv[-1])
+        self.assertIn("PYTHONPATH=src:../vendor", argv[-1])
+        self.assertNotIn("pip", argv[-1])
+
     def test_readiness_recognises_the_production_sandbox_builder(self):
         sandboxed = Authority(self.tmp / "rd", run=self.machine, http=self.http, sandbox=lambda *a, **k: [])
         self.assertTrue(sandboxed.ready()["builder"])

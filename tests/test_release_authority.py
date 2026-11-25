@@ -23,6 +23,7 @@ except ImportError:          # pragma: no cover
     tu = None
 
 COMMIT = "c" * 40
+RID = "9" * 64
 VERSION = "0.1.0~dev4"
 
 
@@ -34,12 +35,12 @@ class FakeMachine:
                  pip_code=0):
         self.deb, self.tests, self.tests_code, self.second = deb_bytes, tests, tests_code, second_build
         self.commit, self.version, self.pip_code = commit, version, pip_code
-        self.calls, self.fetched, self.stopped, self.mounts = [], None, [], []
+        self.calls, self.fetched, self.stopped, self.mounts, self.unit_state = [], None, [], [], "inactive"
 
     def __call__(self, argv, timeout, cwd=None, env=None):
         if argv[0] in ("systemctl", "mount", "umount"):
             (self.stopped if argv[0] == "systemctl" else self.mounts).append(argv)
-            return 0, ""
+            return 0, (self.unit_state if "is-active" in argv else "")
         assert argv[0] == "env", argv                  # always run through the unprivileged-account prefix
         args, work = list(argv[1:]), cwd
         if args and args[0].startswith("WORKSPACE="):
@@ -107,7 +108,7 @@ class FakeGitHub:
             data = json.loads(body)
             self.next_id += 1
             rel = {"id": self.next_id, "tag_name": data["tag_name"], "target_commitish": data["target_commitish"],
-                   "draft": data["draft"], "prerelease": data["prerelease"], "assets": []}
+                   "draft": data["draft"], "prerelease": data["prerelease"], "body": data["body"], "name": data["name"], "assets": []}
             self.releases[self.next_id] = rel
             return j(rel, 201)
         m = re.fullmatch(re.escape(base) + r"/releases/(\d+)", url)
@@ -327,9 +328,9 @@ class AuthorityTests(unittest.TestCase):
 
     def publish_all(self):
         manifest, sig, data = self.staged()
-        rid = self.auth.draft(manifest, COMMIT)
-        self.auth.upload_and_verify(rid, manifest, sig, data)
-        self.auth.make_public(rid, manifest, sig, data, COMMIT)
+        rid = self.auth.draft(manifest, COMMIT, RID)
+        self.auth.upload_and_verify(rid, manifest, sig, data, COMMIT, RID)
+        self.auth.make_public(rid, manifest, sig, data, COMMIT, RID)
         return manifest, sig, data, rid
 
     def test_publication_is_a_verified_draft_made_public_at_the_exact_commit(self):
@@ -347,10 +348,10 @@ class AuthorityTests(unittest.TestCase):
                        {self.auth.key_entry()["key_id"]: self.auth._private().public_key()})
         # repeating the last step on the already-public identical release succeeds and changes nothing
         before = len(self.http.calls)
-        self.auth.make_public(rid, manifest, sig, data, COMMIT)
+        self.auth.make_public(rid, manifest, sig, data, COMMIT, RID)
         self.assertFalse([c for c in self.http.calls[before:] if c[0] in ("POST", "PATCH", "DELETE")])
         with self.assertRaises(AuthorityError) as e:
-            self.auth.draft(manifest, COMMIT)                                   # a public release is never reopened
+            self.auth.draft(manifest, COMMIT, RID)                                   # a public release is never reopened
         self.assertEqual(e.exception.code, "release_is_already_public")
 
     def test_an_existing_tag_for_a_different_commit_is_refused_even_when_annotated(self):
@@ -360,7 +361,7 @@ class AuthorityTests(unittest.TestCase):
             if annotated:
                 self.http.annotated.add(manifest["tag"])
             with self.assertRaises(AuthorityError) as e:
-                self.auth.draft(manifest, COMMIT)
+                self.auth.draft(manifest, COMMIT, RID)
             self.assertEqual(e.exception.code, "tag_exists_for_a_different_commit")
             self.assertEqual(self.auth.tag_commit(manifest["tag"]), "e" * 40)
         self.assertEqual(self.http.assets(), {})
@@ -369,36 +370,88 @@ class AuthorityTests(unittest.TestCase):
 
     def test_a_public_tag_that_ends_up_somewhere_else_is_never_reported_as_published(self):
         manifest, sig, data = self.staged()
-        rid = self.auth.draft(manifest, COMMIT)
-        self.auth.upload_and_verify(rid, manifest, sig, data)
+        rid = self.auth.draft(manifest, COMMIT, RID)
+        self.auth.upload_and_verify(rid, manifest, sig, data, COMMIT, RID)
         self.http.tag_override = "f" * 40
         with self.assertRaises(AuthorityError) as e:
-            self.auth.make_public(rid, manifest, sig, data, COMMIT)
+            self.auth.make_public(rid, manifest, sig, data, COMMIT, RID)
         self.assertEqual(e.exception.code, "published_tag_does_not_point_at_the_approved_commit")
 
     def test_an_asset_with_the_right_name_but_wrong_content_is_replaced_on_the_draft_and_checked_by_content(self):
         manifest, sig, data = self.staged()
-        rid = self.auth.draft(manifest, COMMIT)
-        self.auth.upload_and_verify(rid, manifest, sig, data)
+        rid = self.auth.draft(manifest, COMMIT, RID)
+        self.auth.upload_and_verify(rid, manifest, sig, data, COMMIT, RID)
         aid = next(a["id"] for a in self.http.releases[rid]["assets"] if a["name"] == "release-manifest.json")
         self.http.blobs[aid] = b"x" * len(self.http.blobs[aid])                 # same name, same size, different bytes
         with self.assertRaises(AuthorityError) as e:
             self.auth.verify_assets(rid, manifest, sig, data)
         self.assertTrue(e.exception.code.startswith("asset_content_differs"))
-        self.auth.upload_and_verify(rid, manifest, sig, data)                   # repairs it
+        self.auth.upload_and_verify(rid, manifest, sig, data, COMMIT, RID)                   # repairs it
         self.assertEqual(self.http.assets()["release-manifest.json"], release.canonical(manifest))
         self.assertEqual(len(self.http.releases[rid]["assets"]), 3)
 
     def test_an_extra_or_missing_asset_stops_publication(self):
         manifest, sig, data = self.staged()
-        rid = self.auth.draft(manifest, COMMIT)
-        self.auth.upload_and_verify(rid, manifest, sig, data)
+        rid = self.auth.draft(manifest, COMMIT, RID)
+        self.auth.upload_and_verify(rid, manifest, sig, data, COMMIT, RID)
         self.http.releases[rid]["assets"].append({"id": 999, "name": "extra.sh", "size": 1})
         self.http.blobs[999] = b"x"
         with self.assertRaises(AuthorityError) as e:
-            self.auth.make_public(rid, manifest, sig, data, COMMIT)
+            self.auth.make_public(rid, manifest, sig, data, COMMIT, RID)
         self.assertEqual(e.exception.code, "release_assets_are_not_exactly_the_approved_three")
         self.assertTrue(self.http.releases[rid]["draft"])                      # still a draft: nothing became public
+
+    # -- dev16 re-review: bounded output, verified sandbox stop, pinned artifact, owned drafts, recovery gates -----------------
+    def test_runaway_output_is_bounded_while_it_is_read_and_time_is_enforced(self):
+        from stynpilot.broker.release_authority import default_run
+        code, out = default_run(["sh", "-c", "yes | head -c 60000000"], 60)
+        self.assertEqual(code, 0)
+        self.assertLessEqual(len(out), 20000)
+        import time as _t
+        start = _t.monotonic()
+        code, _ = default_run(["sh", "-c", "sleep 30 & sleep 30; wait"], 1)
+        self.assertEqual(code, 124)
+        self.assertLess(_t.monotonic() - start, 10)
+
+    def test_a_sandbox_unit_that_will_not_stop_fails_the_build(self):
+        self.machine.unit_state = "active"
+        auth = self.make(self.tmp / "stuck", self.machine, sandbox=lambda job, argv, ws, **k: ["env", "WORKSPACE=" + ws] + argv,
+                         work_root=self.tmp / "stuckroot")
+        got = auth.prepare(COMMIT, VERSION, "x")
+        self.assertEqual((got["state"], got["why"]), ("failed", "sandbox_did_not_stop"))
+
+    def test_an_unrelated_draft_with_the_same_tag_is_never_adopted_or_touched(self):
+        manifest, sig, data = self.staged()
+        self.http.next_id += 1
+        mine = {"id": self.http.next_id, "tag_name": manifest["tag"], "target_commitish": COMMIT, "draft": True, "prerelease": True,
+                "body": "someone else's draft", "name": manifest["tag"], "assets": []}
+        self.http.releases[mine["id"]] = mine
+        with self.assertRaises(AuthorityError) as e:
+            self.auth.draft(manifest, COMMIT, RID)
+        self.assertEqual(e.exception.code, "existing_release_not_owned_by_this_transaction")
+        # another transaction's marker, or the right marker on the wrong target, is not ours either
+        mine["body"] = self.auth._marker("8" * 64)
+        with self.assertRaises(AuthorityError):
+            self.auth.draft(manifest, COMMIT, RID)
+        mine["body"], mine["target_commitish"] = self.auth._marker(RID), "e" * 40
+        with self.assertRaises(AuthorityError):
+            self.auth.draft(manifest, COMMIT, RID)
+        mine["target_commitish"] = COMMIT
+        for call in (lambda: self.auth.upload_and_verify(mine["id"], manifest, sig, data, COMMIT, "8" * 64),
+                     lambda: self.auth.make_public(mine["id"], manifest, sig, data, COMMIT, "8" * 64)):
+            with self.assertRaises(AuthorityError):
+                call()
+        self.assertEqual(self.http.assets(), {})
+        self.assertFalse([c for c in self.http.calls if c[0] in ("PATCH", "DELETE")])
+        self.assertEqual(self.auth.draft(manifest, COMMIT, RID), mine["id"])        # its own draft IS found again (crash recovery)
+
+    def test_the_bytes_are_checked_against_the_approved_hash_right_before_upload(self):
+        manifest, sig, data = self.staged()
+        rid = self.auth.draft(manifest, COMMIT, RID)
+        with self.assertRaises(AuthorityError) as e:
+            self.auth.upload_and_verify(rid, manifest, sig, data[:-1] + b"X", COMMIT, RID)
+        self.assertEqual(e.exception.code, "package_bytes_differ_from_the_approved_package")
+        self.assertEqual(self.http.assets(), {})
 
     def test_the_http_helpers_refuse_other_hosts_and_never_follow_redirects(self):
         from stynpilot.broker.release_authority import default_fetch
@@ -563,17 +616,135 @@ class OneApprovalTests(tu.UpgradeTests):
         with self.assertRaises(ExecutionDenied):
             self.executor.release(payload, proof, challenge)
         self.http.fail_upload = False
-        deb = next((self.tmp / "broker/release/builds" / COMMIT).glob("*.deb"))
-        os.chmod(deb, 0o600)
-        deb.write_bytes(b"swapped after the approval")
+        pinned = self.executor._tx_copy_path(self.rid)
+        os.chmod(pinned, 0o600)
+        pinned.write_bytes(b"swapped after the approval")
         with self.assertRaises(ExecutionDenied) as caught:
             self.executor.release_resume(self.rid)
-        self.assertIn("verified_package_was_altered", caught.exception.code)
+        self.assertIn("approved_package_changed", caught.exception.code)
         self.assertEqual(self.launched, [])
         self.assertEqual(self.http.assets(), {})
         for bad in ("short", "g" * 64, None, "../x", "0" * 64):
             with self.assertRaises(ExecutionDenied):
                 self.executor.release_resume(bad)
+
+    def interrupted(self):
+        payload, challenge, proof = self.go()
+        self.http.fail_upload = True
+        with self.assertRaises(ExecutionDenied):
+            self.executor.release(payload, proof, challenge)
+        self.http.fail_upload = False
+        return payload, challenge, proof
+
+    def test_the_approved_package_is_pinned_for_the_whole_transaction(self):
+        payload, challenge, proof = self.interrupted()
+        # a rebuild of the same commit, or pruning the build folder, cannot change or break a pending release
+        self.denied("a_release_is_in_progress", self.executor.release_prepare, COMMIT, VERSION)
+        import shutil as _sh
+        _sh.rmtree(self.tmp / "broker/release/builds" / COMMIT)
+        result = self.executor.release_resume(self.rid)
+        self.assertTrue(result["pending"])
+        self.assertEqual(self.http.assets()["stynpilot-v0.1.0-dev4.deb"], self.deb.read_bytes())
+
+    def test_a_pinned_package_that_changes_is_caught_right_before_upload(self):
+        payload, challenge, proof = self.interrupted()
+        pinned = self.executor._tx_copy_path(self.rid)
+        os.chmod(pinned, 0o600)
+        pinned.write_bytes(pinned.read_bytes()[:-1] + b"X")                     # same size, different bytes
+        with self.assertRaises(ExecutionDenied) as caught:
+            self.executor.release_resume(self.rid)
+        self.assertIn("approved_package_changed", caught.exception.code)
+        self.assertEqual(self.http.assets(), {})
+
+    def test_resume_respects_attention_other_upgrades_revoked_keys_and_the_installed_version(self):
+        payload, challenge, proof = self.interrupted()
+        # unresolved machine attention
+        self.executor._attention("e" * 64, None, "something_broke", None)
+        self.assertIn("owner_intervention_required", self.expect_denied(self.executor.release_resume, self.rid))
+        for f in (self.tmp / "broker" / "attention").glob("*"):
+            f.unlink()
+        self.assertFalse(self.executor.needs_attention())
+        # another change is running
+        self.executor.runs.consume(challenge=self.executor.runs.issue("f" * 64, "approve"), request_id="f" * 64, decision="approve",
+                                   proof="x", kind="install")
+        self.assertIn("another_change_is_still_running", self.expect_denied(self.executor.release_resume, self.rid))
+        self.executor.runs.finish("f" * 64, "done", {"ok": True})
+        # the signing key was revoked
+        keys = self.executor.upgrader._keys
+        self.executor.upgrader._keys = {"1" * 16: release.new_private_key().public_key()}
+        self.assertIn("release_key_not_trusted_by_this_machine", self.expect_denied(self.executor.release_resume, self.rid))
+        self.executor.upgrader._keys = keys
+        # the machine already runs this version or newer
+        real = self.executor.upgrader.installed_version
+        self.executor.upgrader.installed_version = lambda: "0.1.0~dev9"
+        self.assertIn("not_newer_than_installed", self.expect_denied(self.executor.release_resume, self.rid))
+        self.executor.upgrader.installed_version = real
+        self.assertEqual(self.http.assets(), {})
+        self.assertEqual(self.launched, [])
+        self.assertTrue(self.executor.release_resume(self.rid)["pending"])      # all clear: it finishes
+
+    def expect_denied(self, fn, *args):
+        with self.assertRaises(ExecutionDenied) as caught:
+            fn(*args)
+        return caught.exception.code
+
+    def test_a_crash_between_spending_the_approval_and_recording_it_is_recoverable(self):
+        payload, challenge, proof = self.go()
+        real = self.executor._tx_save
+
+        def crash(tx):
+            if tx["state"] == "reserved":
+                raise RuntimeError("power cut")
+            return real(tx)
+        self.executor._tx_save = crash
+        with self.assertRaises(RuntimeError):
+            self.executor.release(payload, proof, challenge)
+        self.executor._tx_save = real
+        self.assertEqual(self.executor.runs.status(self.rid)["state"], "running")          # the approval IS spent
+        self.assertEqual(self.executor._tx_load(self.rid)["state"], "authorized")
+        self.assertEqual(self.executor.status(self.rid)["release"]["resumable"], True)
+        self.build(authority=self.auth, sleep=lambda s: None)                              # and the installer restarts
+        self.assertFalse(self.executor.needs_attention())
+        self.assertTrue(self.executor.release_resume(self.rid)["pending"])
+        self.assertEqual(len(self.launched), 1)
+
+    def test_a_crash_after_the_draft_is_made_but_before_it_is_recorded_reuses_that_draft(self):
+        payload, challenge, proof = self.go()
+        real = self.executor._tx_save
+
+        def crash(tx):
+            if tx["state"] == "drafted":
+                raise OSError("disk went away")
+            return real(tx)
+        self.executor._tx_save = crash
+        with self.assertRaises(ExecutionDenied) as caught:
+            self.executor.release(payload, proof, challenge)
+        self.assertIn("stopped_after_signed_resumable_yes", caught.exception.code)
+        self.executor._tx_save = real
+        self.assertTrue(self.executor.release_resume(self.rid)["pending"])
+        self.assertEqual(len(self.http.releases), 1)                                       # no second draft, nothing adopted blindly
+
+    def test_a_crash_between_upgrade_preparation_and_worker_launch_resumes_without_blame(self):
+        payload, challenge, proof = self.go()
+        calls = []
+        real = self.executor.upgrader.launch
+
+        def die(rid, job):
+            calls.append(1)
+            raise RuntimeError("killed before the worker started")
+        self.executor.upgrader.launch = die
+        with self.assertRaises(ExecutionDenied) as caught:
+            self.executor.release(payload, proof, challenge)
+        self.assertIn("stopped_after_published_resumable_yes", caught.exception.code)
+        job = self.executor.upgrader.job_dir(self.rid)
+        self.assertTrue((job / "job.json").exists() and not (job / "unit").exists())
+        self.executor.upgrader.launch = real
+        self.build(authority=self.auth, sleep=lambda s: None)                              # restart: the half-started job is not "vanished"
+        self.assertFalse(self.executor.needs_attention())
+        self.assertEqual(self.executor.runs.status(self.rid)["state"], "running")
+        self.assertTrue(self.executor.release_resume(self.rid)["pending"])
+        self.assertEqual(len(self.launched), 1)
+        self.assertEqual(len(self.http.releases), 1)
 
     def test_an_old_spent_release_cannot_be_resumed_and_is_closed_honestly(self):
         import time as _time

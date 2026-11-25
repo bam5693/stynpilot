@@ -26,6 +26,16 @@ approval (passkey); the Ryzen signs, publishes to GitHub and upgrades itself wit
    re-derived and must still match the verified build; no new authority; within 24 hours, then it is closed as abandoned and a new approval is
    needed). A restart of the installer leaves a pending release alone (it is not damage); status shows `release: {state, approval_spent, resumable}`.
 
+6. Re-review hardening: subprocess output is bounded WHILE it is read (last 20 kB kept; a timeout kills the whole process group); a sandbox
+   unit is stopped and verified inactive after every step or the build fails (`sandbox_did_not_stop`). At reservation the approved package is
+   copied into the transaction's own private file and re-checked against the approved SHA-256 and size every time it is used, including
+   immediately before upload; rebuilds and pruning cannot affect a pending release, and a new build is refused while one is pending. A GitHub
+   draft is only used if it carries THIS transaction's marker, tag and exact target commit; an unrelated release or draft with the same tag is
+   never adopted, changed or published. Every release step (first run or resume) is gated on: no unresolved machine attention, no other
+   change running, signing key still trusted and the approved one, still newer than the installed version, `from_min` satisfied. A crash
+   after the approval is spent but before the note is written, after a draft is made but before it is recorded, or between upgrade
+   preparation and worker launch all resume cleanly (and are not reported as "attention" or "vanished worker").
+
 ## Who holds what
 - Signing key: generated on the Ryzen at the console (`release/signing-ed25519.pem`, root, 0600). Never exported; no assistant sees it.
 - GitHub token: entered once at the console with hidden input, root 0600, used only against api/uploads.github.com (no redirects followed).
@@ -34,6 +44,11 @@ approval (passkey); the Ryzen signs, publishes to GitHub and upgrades itself wit
 - Nothing is signed or published before approval; a wrong/replayed/other-request proof publishes nothing (tested).
 
 ## Honest limits
+- Reproducible builds and candidate-owned tests do NOT replace independent source review: the build proves the package matches the commit and the
+  commit's own tests pass, nothing about whether the commit is good. Review of the diff stays a human/assistant step outside this code.
+- Fetch/wheel stages have open internet; stricter destination filtering is tracked before any public release.
+- Dev17 live validation must cover: the real systemd sandbox, tmpfs, build dependencies and non-root test run on the Ryzen; interrupted-release
+  resume; and signing-key recovery (loss/rotation/revocation of the release key).
 - The sandbox and memory-backed work area (`mount -t tmpfs`) are only exercised for real on the Ryzen: if the machine refuses either, the build FAILS CLOSED
   (`work_area_unavailable` or a failed step). Expect to find and fix any such environment detail in the dev17 test release.
 - The fetch/wheel steps have open internet (systemd cannot restrict to GitHub/PyPI names); they run no code from the commit with network and hold no secrets.

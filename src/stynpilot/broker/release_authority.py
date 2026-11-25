@@ -17,13 +17,16 @@ Order of events (nothing is signed or published before the approval):
 """
 from __future__ import annotations
 
+import collections
 import fcntl
 import hashlib
 import json
 import os
 import re
 import shlex
+import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -60,14 +63,42 @@ class AuthorityError(Exception):
         self.code = code
 
 
-def default_run(argv, timeout, cwd=None, env=None):
-    """(returncode, combined output). No shell, bounded time and output."""
+def default_run(argv, timeout, cwd=None, env=None, keep=20000):
+    """(returncode, the LAST ``keep`` bytes of combined output). No shell. Output is bounded while it is read (a runaway build cannot
+    fill this process's memory); when time runs out, the whole process group is killed (124)."""
     try:
-        done = subprocess.run(argv, capture_output=True, timeout=timeout, cwd=cwd, env=env, check=False,
-                              stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd, env=env,
+                                start_new_session=True)
+    except OSError:
         return 127, ""
-    return done.returncode, (done.stdout + done.stderr)[-20000:].decode("utf-8", "replace")
+    tail, size, timed_out = collections.deque(), 0, False
+    deadline = time.monotonic() + timeout
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            timed_out = True
+            break
+        if sel.select(min(left, 1.0)):
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            tail.append(chunk)
+            size += len(chunk)
+            while size > keep and len(tail) > 1:
+                size -= len(tail.popleft())
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)                   # nothing the command started may outlive it
+    except OSError:
+        pass
+    sel.close()
+    proc.stdout.close()
+    try:
+        code = proc.wait(10)
+    except subprocess.TimeoutExpired:
+        code = 124
+    return (124 if timed_out else code), b"".join(tail)[-keep:].decode("utf-8", "replace")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -292,9 +323,18 @@ class Authority:
             try:
                 return self.run(cmd, seconds + 30, cwd=None, env=None)
             finally:
-                self.run(["systemctl", "stop", "stynpilot-job-" + job + ".service"], 30)      # nothing may outlive the step
+                self._stop_unit("stynpilot-job-" + job + ".service")                           # nothing may outlive the step
         base = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C.UTF-8", "GIT_TERMINAL_PROMPT": "0", "HOME": str(work)}
         return self.run(self.build_prefix + argv, seconds, cwd=str(work), env=dict(base, **(env or {})))
+
+    def _stop_unit(self, name):
+        """Stop the unit and VERIFY it is gone; a unit that will not stop fails the build rather than being ignored."""
+        for _ in range(2):
+            self.run(["systemctl", "stop", name], 30)
+            _, state = self.run(["systemctl", "is-active", name], 30)
+            if state.strip() not in ("active", "activating", "deactivating", "reloading"):
+                return
+        raise AuthorityError("sandbox_did_not_stop")
 
     def _mount_work(self, work):
         """A size-limited, memory-backed work area owned by the build account: whatever the build writes can never fill the disk."""
@@ -534,9 +574,19 @@ class Authority:
         status, body = self._api("GET", "%s/releases?per_page=100" % self._base())
         return [r for r in self._json(status, body) if r.get("tag_name") == tag]
 
-    def draft(self, manifest, commit):
-        """Make (or find again) the DRAFT release for this tag. Refuses when the tag already exists for another commit or the
-        release is already public. Returns the release id."""
+    @staticmethod
+    def _marker(rid):
+        return "stynpilot-release-transaction:%s" % rid
+
+    def _owned(self, info, manifest, commit, rid):
+        """Is this GitHub release the one THIS approved transaction made (its marker, tag and exact target commit)?"""
+        if (self._marker(rid) not in (info.get("body") or "") or info.get("tag_name") != manifest["tag"]
+                or info.get("target_commitish") != commit):
+            raise AuthorityError("existing_release_not_owned_by_this_transaction")
+
+    def draft(self, manifest, commit, rid):
+        """Make (or find again) THIS transaction's DRAFT release for the tag. An unrelated release or draft with the same tag is never
+        adopted or changed. Returns the release id."""
         tag = manifest["tag"]
         existing = self.tag_commit(tag)
         if existing is not None and existing != commit:
@@ -545,6 +595,7 @@ class Authority:
         if len(found) > 1:
             raise AuthorityError("more_than_one_release_for_that_tag")
         if found:
+            self._owned(found[0], manifest, commit, rid)
             if not found[0].get("draft"):
                 raise AuthorityError("release_is_already_public")
             return found[0]["id"]
@@ -552,7 +603,7 @@ class Authority:
             raise AuthorityError("tag_exists_but_no_release_to_resume")
         status, body = self._api("POST", self._base() + "/releases", {
             "tag_name": tag, "target_commitish": commit, "name": tag, "draft": True, "prerelease": True,
-            "body": "Built from commit %s and signed after owner approval." % commit})
+            "body": "Built from commit %s and signed after owner approval.\n%s" % (commit, self._marker(rid))})
         return self._json(status, body, ok=(201,))["id"]
 
     def _assets(self, release_id):
@@ -577,11 +628,14 @@ class Authority:
         return {manifest["asset"]: "application/octet-stream", "release-manifest.json": "application/json",
                 "release-manifest.json.sig": "text/plain"}
 
-    def upload_and_verify(self, release_id, manifest, signature, data):
+    def upload_and_verify(self, release_id, manifest, signature, data, commit, rid):
         """Put the three files on the DRAFT and read each one back: it must match byte for byte (a same-named but different file
         is deleted and uploaded again; nothing else is touched)."""
+        if len(data) != manifest["size"] or hashlib.sha256(data).hexdigest() != manifest["sha256"]:
+            raise AuthorityError("package_bytes_differ_from_the_approved_package")
         want, kinds = self._expected_files(manifest, signature, data), self._kinds(manifest)
         info, have = self._assets(release_id)
+        self._owned(info, manifest, commit, rid)
         if not info.get("draft"):
             raise AuthorityError("release_is_already_public")
         for name, content in want.items():
@@ -614,10 +668,11 @@ class Authority:
                 raise AuthorityError("asset_content_differs_%s" % name[:30])
         return info
 
-    def make_public(self, release_id, manifest, signature, data, commit):
+    def make_public(self, release_id, manifest, signature, data, commit, rid):
         """Publish the verified draft, then confirm the real Git tag points at the approved commit and the public assets still
         match. Repeating it on an already published identical release succeeds."""
         info, _ = self._assets(release_id)
+        self._owned(info, manifest, commit, rid)
         if info.get("draft"):
             self.verify_assets(release_id, manifest, signature, data)
             status, body = self._api("PATCH", "%s/releases/%d" % (self._base(), release_id), {"draft": False, "prerelease": True})

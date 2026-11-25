@@ -61,7 +61,7 @@ from .. import runner as runner_policy
 from .jobs import JobError
 from .selftest import clean_diagnostics
 from .passkeys import PasskeyError
-from .release_authority import AuthorityError
+from .release_authority import AuthorityError, _write_private
 from .. import webauthn
 from .proof import ProofDenied, decision_nonce, render_summary, summary_hash
 from .upgrade import UpgradeRefused, Upgrader
@@ -211,7 +211,7 @@ class Executor:
         # settled from its job folder (or left running while its worker is alive), never blamed on this restart.
         for rid in self.runs.running():
             if self.upgrader.is_job(rid):
-                self.upgrader.reconcile(rid)
+                self._settle(rid)
                 continue
             if self._release_pending(rid):
                 continue                      # a spent release approval waiting to be resumed: not damage, never "attention"
@@ -223,7 +223,7 @@ class Executor:
         """What the installer's own durable record says about this request (reconciliation source)."""
         record = self.runs.status(request_id)
         if record["state"] == "running" and self.upgrader.is_job(request_id):
-            self.upgrader.reconcile(request_id)
+            self._settle(request_id)
             record = self.runs.status(request_id)
         tx = self._tx_load(request_id) if re.fullmatch(r"[0-9a-f]{64}", request_id or "") else None
         if tx:
@@ -234,7 +234,7 @@ class Executor:
     def _settle_upgrades(self):
         for rid in self.runs.running():
             if self.upgrader.is_job(rid):
-                self.upgrader.reconcile(rid)
+                self._settle(rid)
 
     def needs_attention(self):
         """Durable records of runs that may have left the machine changed. New installs are refused while any exist.
@@ -720,6 +720,8 @@ class Executor:
     def release_prepare(self, commit, version):
         """GREEN: start building and verifying a release from an exact commit (background). Nothing is signed or published."""
         authority = self._need_authority()
+        if self._pending_release():                       # a pending release's inputs must not change under it
+            raise ExecutionDenied("a_release_is_in_progress")
         try:
             installed = self.upgrader.installed_version()
             if not self.upgrader.version_gt(version, installed):
@@ -789,8 +791,7 @@ class Executor:
             raise ExecutionDenied("not_newer_than_installed")
         if have["from_min"] and not self.upgrader.version_ge(installed, have["from_min"]):
             raise ExecutionDenied("installed_version_too_old_for_this_release")
-        if self.needs_attention():
-            raise ExecutionDenied("owner_intervention_required")
+        self._release_gate(payload_hash(payload)[0])
         if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
             raise ExecutionDenied("already_decided_or_used")
         return have
@@ -831,10 +832,50 @@ class Executor:
             os.close(dfd)
 
     def _tx_resumable(self, tx):
-        return bool(tx and tx["state"] in self.TX_STATES[1:-1] and self.clock_now() - tx["created"] <= self.TX_LIFETIME)
+        return bool(tx and tx["state"] in self.TX_STATES[:-1] and self.clock_now() - tx["created"] <= self.TX_LIFETIME)
 
     def clock_now(self):
         return time.time()
+
+    def _settle(self, rid):
+        """Settle an upgrade run from its job folder - except a release whose worker was never launched: that one belongs to its
+        transaction (it can still be resumed) and must not be blamed on a vanished worker."""
+        if self._release_pending(rid) and not (self.upgrader.job_dir(rid) / "unit").exists():
+            return False
+        return self.upgrader.reconcile(rid)
+
+    def _release_gate(self, rid):
+        """No release step while the machine needs the owner or another change is running."""
+        if self.needs_attention():
+            raise ExecutionDenied("owner_intervention_required")
+        self._settle_upgrades()
+        if [r for r in self.runs.running() if r != rid]:
+            raise ExecutionDenied("another_change_is_still_running")
+
+    def _tx_copy_path(self, rid):
+        return self._tx_path(rid).with_suffix(".deb")
+
+    def _tx_data(self, tx):
+        """The approved package as this transaction pinned it. Re-checked against the approved hash and size every time it is used."""
+        intent = tx["intent"]
+        try:
+            fd = os.open(self._tx_copy_path(tx["rid"]), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            raise AuthorityError("approved_package_missing") from None
+        try:
+            data = os.read(fd, intent["size"] + 1)
+        finally:
+            os.close(fd)
+        if len(data) != intent["size"] or hashlib.sha256(data).hexdigest() != intent["sha256"]:
+            raise AuthorityError("approved_package_changed")
+        return data
+
+    def _pending_release(self):
+        d = self.dir / "release-tx"
+        for p in (d.glob("*.json") if d.is_dir() else ()):
+            if self.runs.status(p.stem)["state"] == "running" and self._release_pending(p.stem):
+                return True
+        return False
 
     def _release_pending(self, rid):
         """True for a spent release approval whose transaction is not finished (it stays 'running' and is not 'attention')."""
@@ -863,8 +904,14 @@ class Executor:
         try:
             authority.preflight(intent)
             self._backup_records(rid)
+            data = authority.package_bytes(intent["commit"])
+            if len(data) != intent["size"] or hashlib.sha256(data).hexdigest() != intent["sha256"]:
+                raise AuthorityError("verified_package_was_altered")
             with statelock.operation(self.dir):
                 tx = {"rid": rid, "intent": intent, "state": "authorized", "created": self.clock_now(), "last": "authorized"}
+                self._tx_path(rid).parent.mkdir(exist_ok=True, mode=0o700)
+                self._tx_copy_path(rid).unlink(missing_ok=True)
+                _write_private(self._tx_copy_path(rid), data)         # this release's own copy: rebuilds and pruning cannot touch it
                 self._tx_save(tx)
                 try:
                     self._used_passkey(passkey, rid, "approve")
@@ -872,6 +919,7 @@ class Executor:
                 except BaseException:
                     if self.runs.status(rid)["state"] == "not_started":
                         self._tx_path(rid).unlink(missing_ok=True)       # nothing was spent: nothing to resume
+                        self._tx_copy_path(rid).unlink(missing_ok=True)
                     raise
                 tx.update(state="reserved", last="reserved")
                 try:
@@ -899,6 +947,9 @@ class Executor:
             raise ExecutionDenied("release_approval_expired_start_again_with_a_new_approval")
         try:
             with statelock.operation(self.dir):
+                if tx["state"] == "authorized":              # the approval WAS spent (the run is 'running'); only the note was lost
+                    tx.update(state="reserved", last="reserved")
+                    self._tx_save(tx)
                 return self._release_continue(tx)
         except statelock.Busy:
             raise ExecutionDenied("a_backup_or_restore_is_running_try_again") from None
@@ -908,18 +959,19 @@ class Executor:
         authority, rid, intent = self.authority, tx["rid"], tx["intent"]
 
         def at(state):
-            tx.update(state=state, last=state)
-            self._tx_save(tx)
+            new = dict(tx, state=state, last=state)
+            self._tx_save(new)                                 # only a state that reached the disk counts as reached
+            tx.update(new)
         try:
-            have = authority.intent(intent["commit"], intent["version"], intent.get("review_note", ""), intent["from_min"])
-            if have != intent:
-                raise ExecutionDenied("release_intent_does_not_match_the_verified_build")
-            if intent["key_id"] not in self.upgrader.keys:
+            self._release_gate(rid)
+            if intent["key_id"] not in self.upgrader.keys or authority.key_entry()["key_id"] != intent["key_id"]:
                 raise ExecutionDenied("release_key_not_trusted_by_this_machine")
             installed = self.upgrader.installed_version()
             if not self.upgrader.version_gt(intent["version"], installed):
                 raise ExecutionDenied("not_newer_than_installed")
-            data = authority.package_bytes(intent["commit"])
+            if intent["from_min"] and not self.upgrader.version_ge(installed, intent["from_min"]):
+                raise ExecutionDenied("installed_version_too_old_for_this_release")
+            data = self._tx_data(tx)
             if tx["state"] == "reserved":
                 note = ["Release approved on the owner's phone; built from commit %s." % intent["commit"][:12],
                         "Tests: %d passed, %d failed; the package built identically twice." % (intent["tests_passed"], intent["tests_failed"])]
@@ -928,14 +980,15 @@ class Executor:
                 at("signed")
             manifest, signature = tx["manifest"], tx["signature"]
             if tx["state"] == "signed":
-                tx["release_id"] = authority.draft(manifest, intent["commit"])
+                tx["release_id"] = authority.draft(manifest, intent["commit"], rid)
                 at("drafted")
             if tx["state"] == "drafted":
-                authority._inspect(self.authority._dir(intent["commit"]) / ("stynpilot_%s_all.deb" % intent["version"]), intent["version"])
-                authority.upload_and_verify(tx["release_id"], manifest, signature, data)
+                authority._inspect(self._tx_copy_path(rid), intent["version"])
+                data = self._tx_data(tx)                           # the actual bytes, against the approved hash and size, right now
+                authority.upload_and_verify(tx["release_id"], manifest, signature, data, intent["commit"], rid)
                 at("uploaded")
             if tx["state"] == "uploaded":
-                authority.make_public(tx["release_id"], manifest, signature, data, intent["commit"])
+                authority.make_public(tx["release_id"], manifest, signature, self._tx_data(tx), intent["commit"], rid)
                 at("published")
             unit, installed = self._release_start_upgrade(tx, manifest, signature)
             at("started")

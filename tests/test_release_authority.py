@@ -477,30 +477,41 @@ class AuthorityTests(unittest.TestCase):
         self.assertIn("PYTHONPATH=src:../vendor", argv[-1])
         self.assertNotIn("pip", argv[-1])
 
-    def test_a_failing_dpkg_deb_says_why_and_probes_the_usual_suspects(self):
-        import contextlib
-        import io
+    def test_the_package_is_written_in_process_with_no_tar_or_dpkg_deb_child(self):
+        # The live builder's seccomp sandbox made GNU tar (run by dpkg-deb) fail with ENOSYS; the package is now written by Python.
+        import os
+        import shutil
         import subprocess as sp
         import sys as _sys
+        import tempfile
         _sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
         import build_deb
-        calls = []
-
-        def fake(argv, **kw):
-            calls.append(argv)
-            if argv[0] == "dpkg-deb" and "--version" not in argv:
-                return sp.CompletedProcess(argv, 2, "", "dpkg-deb: error: something \x1b[0m specific broke")
-            return sp.CompletedProcess(argv, 0, "tool 1.0\n", "")
-        real, build_deb.subprocess.run = build_deb.subprocess.run, fake
-        self.addCleanup(setattr, build_deb.subprocess, "run", real)
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
-            build_deb._explain_failure(Path("/x/pkg"), sp.CompletedProcess([], 2, "", "dpkg-deb: error: something specific broke"), {})
-        self.assertIn("something specific broke", str(caught.exception))
-        shown = err.getvalue()
-        for needle in ("probe threads-max=1: exit 2", "probe gzip: exit 2", "probe no compression: exit 2", "tar:", "xz:", "id:"):
-            self.assertIn(needle, shown)
-        self.assertNotIn("\x1b", shown)
+        with tempfile.TemporaryDirectory() as d:
+            pkg = Path(d) / "pkg"
+            (pkg / "DEBIAN").mkdir(parents=True)
+            (pkg / "DEBIAN/control").write_text("Package: x\nVersion: 1\nArchitecture: all\nMaintainer: a <a@b>\nDescription: t\n")
+            (pkg / "usr/bin").mkdir(parents=True)
+            (pkg / "usr/bin/tool").write_text("#!/bin/sh\n")
+            (pkg / "usr/bin/tool").chmod(0o700)
+            (pkg / "usr/share").mkdir()
+            (pkg / "usr/share/odd").write_text("odd length!")
+            real, build_deb.subprocess.run = build_deb.subprocess.run, lambda *a, **k: self.fail("a child process was started")
+            self.addCleanup(setattr, build_deb.subprocess, "run", real)
+            one, two = Path(d) / "one.deb", Path(d) / "two.deb"
+            build_deb.write_deb(pkg, one, 1763769600)
+            os.utime(pkg / "usr/bin/tool", (5, 5))
+            build_deb.write_deb(pkg, two, 1763769600)
+            self.assertEqual(one.read_bytes(), two.read_bytes())
+            self.assertTrue(one.read_bytes().startswith(b"!<arch>\ndebian-binary   1763769600  0     0     100644  4         `\n2.0\n"))
+            if shutil.which("dpkg-deb"):
+                build_deb.subprocess.run = real
+                out = sp.run(["dpkg-deb", "-c", str(one)], capture_output=True, text=True, check=True).stdout
+                self.assertIn("-rwxr-xr-x root/root", out)
+                self.assertIn("./usr/bin/tool", out)
+                self.assertEqual(sp.run(["dpkg-deb", "-f", str(one), "Package"], capture_output=True, text=True).stdout.strip(), "x")
+            (pkg / "usr/link").symlink_to("bin")
+            with self.assertRaises(SystemExit):
+                build_deb.write_deb(pkg, Path(d) / "bad.deb", 1763769600)
 
     def test_readiness_recognises_the_production_sandbox_builder(self):
         sandboxed = Authority(self.tmp / "rd", run=self.machine, http=self.http, sandbox=lambda *a, **k: [])

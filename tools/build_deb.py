@@ -4,10 +4,13 @@ packaging/vendor.lock, which are verified against their SHA-256 before use. Repr
 (SOURCE_DATE_EPOCH) and sorted contents. The package has NO maintainer scripts: installing it starts, enables
 and changes nothing; removing it deletes only its own files (state and config are left for the owner)."""
 import hashlib
+import io
+import lzma
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
@@ -116,36 +119,63 @@ def build(out_dir=None, cache=None):
         for path in (control, control / "control", control / "md5sums"):
             os.utime(path, (epoch, epoch))
         target = out_dir / ("stynpilot_%s_all.deb" % deb_version())
-        env = dict(os.environ, SOURCE_DATE_EPOCH=str(epoch))
-        done = subprocess.run(["dpkg-deb", "--root-owner-group", "-Zxz", "--build", str(pkg), str(target)], capture_output=True,
-                              text=True, env=env)
-        if done.returncode != 0:
-            _explain_failure(pkg, done, env)
+        write_deb(pkg, target, epoch)
     return target
 
 
-def _short(text, limit=220):
-    text = "".join(c if " " <= c <= "~" else " " for c in (text or "")).strip()
-    return text[-limit:]
+def _entries(root, skip_debian):
+    """(name, mode, data-or-None) for every directory and regular file under root, parents first, in a fixed order. Anything
+    else (a symlink, a device, a fifo) is refused: this package has none, and a surprise there is a build error."""
+    found = [("./", 0o755, None)]
+    for path in sorted(root.rglob("*"), key=lambda p: p.relative_to(root).parts):
+        rel = path.relative_to(root)
+        if skip_debian and rel.parts[0] == "DEBIAN":
+            continue
+        if path.is_symlink():
+            raise SystemExit("symlinks are not allowed in the package: " + str(rel))
+        if path.is_dir():
+            found.append(("./%s/" % rel.as_posix(), 0o755, None))
+        elif path.is_file():
+            found.append(("./" + rel.as_posix(), 0o755 if path.stat().st_mode & 0o111 else 0o644, path.read_bytes()))
+        else:
+            raise SystemExit("unsupported file type in the package: " + str(rel))
+    return found
 
 
-def _explain_failure(pkg, done, env):
-    """dpkg-deb failed: say WHY (its own message), and probe the usual suspects so one failed run is enough to find the cause. This only
-    reports; it never produces a package, and the build still fails."""
-    probes = (("threads-max=1", ["dpkg-deb", "--root-owner-group", "-Zxz", "--threads-max=1", "--build"]),
-              ("gzip", ["dpkg-deb", "--root-owner-group", "-Zgzip", "--build"]),
-              ("no compression", ["dpkg-deb", "--root-owner-group", "-Znone", "--build"]))
-    for name, argv in probes:
-        scratch = pkg.parent / ("probe-" + name.split()[0].split("=")[0] + ".deb")
-        got = subprocess.run(argv + [str(pkg), str(scratch)], capture_output=True, text=True, env=env)
-        print("probe %s: exit %d %s" % (name, got.returncode, _short(got.stderr, 150)), file=sys.stderr)
-    for argv in (["dpkg-deb", "--version"], ["tar", "--version"], ["xz", "--version"], ["id"], ["ls", "-ld", str(pkg), str(pkg / "DEBIAN")]):
-        try:
-            got = subprocess.run(argv, capture_output=True, text=True, timeout=20)
-            print("%s: %s" % (argv[0], _short(got.stdout.splitlines()[0] if got.stdout else got.stderr, 70)), file=sys.stderr)
-        except (OSError, subprocess.SubprocessError) as error:
-            print("%s: %s" % (argv[0], type(error).__name__), file=sys.stderr)
-    raise SystemExit("dpkg-deb failed with exit %d: %s" % (done.returncode, _short(done.stderr or done.stdout, 300)))
+def _tar_xz(entries, epoch):
+    """A deterministic GNU tar, xz-compressed, written entirely in this process: no tar/xz/dpkg-deb child, so the build needs no
+    syscalls beyond Python's own. Every entry is root-owned with the fixed epoch."""
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.GNU_FORMAT) as archive:
+        for name, mode, data in entries:
+            info = tarfile.TarInfo(name)
+            info.mtime, info.mode = epoch, mode
+            info.uid = info.gid = 0
+            info.uname = info.gname = "root"
+            if data is None:
+                info.type = tarfile.DIRTYPE
+                archive.addfile(info)
+            else:
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+    return lzma.compress(raw.getvalue(), format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC64, preset=6)
+
+
+def _ar(members, epoch):
+    out = [b"!<arch>\n"]
+    for name, data in members:
+        out.append(("%-16s%-12d%-6d%-6d%-8s%-10d`\n" % (name, epoch, 0, 0, "100644", len(data))).encode("ascii"))
+        out.append(data)
+        if len(data) % 2:
+            out.append(b"\n")
+    return b"".join(out)
+
+
+def write_deb(pkg, target, epoch):
+    """Write the .deb (an ar archive: debian-binary, control.tar.xz, data.tar.xz) byte-for-byte deterministically."""
+    control = _tar_xz(_entries(pkg / "DEBIAN", False), epoch)
+    data = _tar_xz(_entries(pkg, True), epoch)
+    Path(target).write_bytes(_ar([("debian-binary", b"2.0\n"), ("control.tar.xz", control), ("data.tar.xz", data)], epoch))
 
 
 if __name__ == "__main__":

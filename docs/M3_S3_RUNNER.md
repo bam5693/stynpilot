@@ -30,6 +30,16 @@ state paths inaccessible). Tests: `tests/test_runner_core.py` (hostile folders, 
 S3b root-door job kinds (create runner user, enroll workspace, run, status, cancel, selftest) with approval and a job
 table; S3c MCP tools (workspace request, file edits inside workspaces, job run/status/output/cancel); S3d one-off command.
 
+## dev14: root cause of the live `limit_io` failure (found by dev13's diagnostics on the Ryzen)
+
+Live dev13 self-test: 17 of 18 checks passed; only `limit_io` failed, with expected `259:0:wbps=67108864` and actual `259:0:wbps=64000000`. systemd reads the `64M` suffix of
+`IOWriteBandwidthMax` as decimal (64,000,000), while StyNpilot compared against 64 MiB. The real limit was slightly MORE restrictive than expected, so this was a unit mismatch, not a weakness.
+
+- One exact byte value, `runner.IO_WRITE_BPS = 64 * 1024 * 1024`, is written to the unit as a plain number (no suffix), checked by the self-test, and used by the disk-reserve calculation.
+- Regression tests: the unit has no suffix; the self-test and reserve use the same constant; the decimal value is rejected by the comparison.
+- Diagnostic filter: a `/` is allowed only between a digit and a digit or `-` (soft/hard limits such as `536870912/536870912` or `-1/-1`); paths and words with a slash are still dropped.
+- Nothing else changed: no confinement, permission, gate or rollback change.
+
 ## dev13: ChatGPT's review of dev12 (dae11c0): diagnostics must reach the assistants
 
 dev12 was never installed; dev13 replaces it. Reporting only: no limit, gate rule or confinement changed.

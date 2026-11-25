@@ -257,7 +257,7 @@ class JobRunner:
         poll interval + measurement (deadline + slack + cleanup) + termination (kill + stop), at the per-job write cap, plus the
         dirty (buffered) pages each job's memory limit can hold before the kernel throttles it (20% of the limit)."""
         seconds = self.disk_poll + self.measure_timeout + SLACK + STOP_WAIT + 3 + 5
-        per_writer = runner.IO_WRITE_MBPS * (1 << 20) * seconds + int(0.2 * max(r.memory_mb for r in runner.RECIPES.values()) * (1 << 20))
+        per_writer = runner.IO_WRITE_BPS * seconds + int(0.2 * max(r.memory_mb for r in runner.RECIPES.values()) * (1 << 20))
         return len(self.pool) * int(per_writer)
 
     def _low(self, m, base):

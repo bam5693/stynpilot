@@ -177,7 +177,8 @@ def _owner_can_edit(path, uid, gid):
     return done.returncode == 0
 
 
-_DIAG = re.compile(r"DIAG ([a-z_]{1,32}) ([A-Za-z0-9_:=,.|;\-]{1,80}) ([A-Za-z0-9_:=,.|;\-]{0,200})")
+_TOK = r"(?:[A-Za-z0-9_:=,.|;\-]|(?<=[0-9])/(?=[0-9-]))"          # a "/" is allowed only after a digit and before a digit or "-" (soft/hard limits), never a path
+_DIAG = re.compile(r"DIAG ([a-z_]{1,32}) (" + _TOK + r"{1,80}) (" + _TOK + r"{0,200})")
 
 
 def clean_diagnostics(raw):
@@ -287,7 +288,7 @@ def run_selftest(jr, *, timeout=60):
                   "no_write": ["/etc", "/usr", "/var/lib", "/opt", "/srv", jr.home, str(jr.dir), "/root"], "tasks": TASKS, "memory_mb": MEMORY_MB,
                   "canaries": canaries, "sockets": sockets, "fsize": runner.FSIZE_MB * 1024 * 1024, "tmp_bytes": runner.TMP_MB * 1024 * 1024 + 4096,
                   "decoy_ws": decoy, "decoy_name": "decoy.txt", "late": ["late.txt", "late.env"],
-                  "io_devs": io_devs, "wbps": runner.IO_WRITE_MBPS * 1024 * 1024}
+                  "io_devs": io_devs, "wbps": runner.IO_WRITE_BPS}
         lines, job_status, started, start_error = [], None, time.time(), None
         try:
             limits = {"seconds": SECONDS, "memory_mb": MEMORY_MB, "tasks": TASKS, "writes": True}

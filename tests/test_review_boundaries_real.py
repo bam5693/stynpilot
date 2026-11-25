@@ -287,3 +287,15 @@ class DevSevenWorker(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiagnosticFilter(unittest.TestCase):
+    def test_a_soft_hard_limit_pair_with_a_slash_passes_but_paths_do_not(self):
+        from stynpilot.broker.selftest import OPTIONAL, REQUIRED, _judge
+        lines = ["PASS " + n for n in REQUIRED if n != "owner_edits_runner_files"] + ["PASS " + n for n in OPTIONAL]
+        lines += ["DIAG limit_fsize 536870912 536870912/536870912", "DIAG limit_tmp 268439552 /etc/shadow", "DIAG limit_pids 64 a/b", "DIAG limit_io 1 -1/-1"]
+        d = _judge(lines, True, strict_limits=True)["diagnostics"]
+        self.assertEqual(d["limit_fsize"], {"expected": "536870912", "actual": "536870912/536870912"})
+        self.assertNotIn("limit_tmp", d)
+        self.assertNotIn("limit_pids", d)
+        self.assertEqual(d["limit_io"]["actual"], "-1/-1")            # "unlimited" soft/hard pair stays visible

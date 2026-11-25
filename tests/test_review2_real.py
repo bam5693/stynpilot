@@ -197,7 +197,7 @@ class Watchdog(Base):
     def test_the_reserve_covers_two_writers_termination_latency_and_buffered_writes(self):
         jr = self.jr
         need = jr.worst_overshoot()
-        rate = runner.IO_WRITE_MBPS * (1 << 20)
+        rate = runner.IO_WRITE_BPS
         self.assertGreater(need, 2 * rate * (jr.disk_poll + jr.measure_timeout))        # two writers, poll + measurement
         self.assertGreater(need, 2 * rate * 16)                                          # + helper cleanup and termination latency
         self.assertGreater(need, 2 * 400 * (1 << 20))                                    # + buffered (dirty) pages per memory limit
@@ -277,7 +277,7 @@ class Watchdog(Base):
         cmd = runner.unit_command("c" * 32, ["/usr/bin/true"], "/home/o/StyNpilot-Projects/app", seconds=10, memory_mb=64, tasks=8,
                                   io_devices=["259:0", "8:16"])
         props = [c for c in cmd if c.startswith("IOWriteBandwidthMax=")]
-        self.assertEqual(props, ["IOWriteBandwidthMax=/dev/block/259:0 %dM" % runner.IO_WRITE_MBPS, "IOWriteBandwidthMax=/dev/block/8:16 %dM" % runner.IO_WRITE_MBPS])
+        self.assertEqual(props, ["IOWriteBandwidthMax=/dev/block/259:0 67108864", "IOWriteBandwidthMax=/dev/block/8:16 67108864"])
         with self.assertRaises(runner.RunnerError):
             runner.unit_command("c" * 32, ["/usr/bin/true"], "/home/o/StyNpilot-Projects/app", seconds=10, memory_mb=64, tasks=8, io_devices=["/dev/sda"])
 
@@ -582,3 +582,32 @@ class ProtectedHome(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ByteExactness(unittest.TestCase):
+    """systemd reads '64M' as 64,000,000 bytes (SI), not 64 MiB. The unit, the self-test and the disk reserve must share ONE exact byte value."""
+    def test_one_exact_byte_value_is_shared_by_unit_selftest_and_reserve(self):
+        import inspect
+        from stynpilot.broker import selftest
+        self.assertEqual(runner.IO_WRITE_BPS, 67108864)
+        cmd = runner.unit_command("c" * 32, ["/usr/bin/true"], "/home/o/StyNpilot-Projects/app", seconds=10, memory_mb=64, tasks=8, io_devices=["259:0"])
+        prop = [c for c in cmd if c.startswith("IOWriteBandwidthMax=")]
+        self.assertEqual(prop, ["IOWriteBandwidthMax=/dev/block/259:0 %d" % runner.IO_WRITE_BPS])
+        self.assertNotRegex(prop[0], r"[KMGT]$")                                  # no suffix systemd could read in decimal
+        source = inspect.getsource(selftest)
+        self.assertIn('"wbps": runner.IO_WRITE_BPS', source)
+        self.assertNotIn("IO_WRITE_MBPS", source)
+        self.assertFalse(hasattr(runner, "IO_WRITE_MBPS"))
+
+    def test_the_selftest_accepts_exactly_the_configured_rate_and_rejects_the_decimal_one(self):
+        """The live probe's io.max comparison, run on the two values the Ryzen could show."""
+        wanted = "wbps=%d" % runner.IO_WRITE_BPS
+        for line, ok in (("259:0 rbps=max wbps=67108864 riops=max wiops=max", True), ("259:0 rbps=max wbps=64000000 riops=max wiops=max", False)):
+            self.assertEqual(line.startswith("259:0 ") and wanted in line.split(), ok)
+
+    def test_the_reserve_uses_the_same_value(self):
+        from stynpilot.broker.jobs import JobRunner
+        jr = JobRunner(Path(tempfile.mkdtemp()) / "s", owner_uid=os.getuid(), home="/home/x", backend=LocalBackend(), gate=False,
+                       helper=LocalHelper(os.getuid(), os.getgid()))
+        seconds = jr.disk_poll + jr.measure_timeout + 1 + 2 + 3 + 5
+        self.assertEqual(jr.worst_overshoot(), 2 * int(runner.IO_WRITE_BPS * seconds + 0.2 * 2048 * (1 << 20)))

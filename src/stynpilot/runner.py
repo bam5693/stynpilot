@@ -186,7 +186,8 @@ HIDDEN_PATHS = ("/etc/stynpilot", "/var/lib/stynpilot", "/var/lib/stynpilot-inst
 FSIZE_MB = 512          # largest single file a job may write (RLIMIT_FSIZE)
 TMP_MB = 256            # size of the private /tmp (a memory-backed file system, so it can never fill the disk)
 RUN_MB = 8
-IO_WRITE_MBPS = 64      # bytes per second ceiling per disk: bounds how far the disk can fill between two watchdog checks
+IO_WRITE_BPS = 64 * 1024 * 1024    # EXACT bytes per second ceiling per disk (systemd reads a "64M" suffix as 64,000,000, so a plain byte count is used everywhere:
+                                   # unit, self-test and disk reserve). Bounds how far the disk can fill between two watchdog checks
 
 
 def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=True, network=False, run_user=RUN_USER, masked=(), io_devices=()):
@@ -228,7 +229,7 @@ def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=T
         # how much it can use
         "RuntimeMaxSec=%d" % seconds, "MemoryMax=%dM" % memory_mb, "MemorySwapMax=0", "TasksMax=%d" % tasks, "CPUQuota=200%",
         "KillMode=control-group", "TimeoutStopSec=5",
-    ] + ["IOWriteBandwidthMax=/dev/block/%s %dM" % (dev, IO_WRITE_MBPS) for dev in io_devices]
+    ] + ["IOWriteBandwidthMax=/dev/block/%s %d" % (dev, IO_WRITE_BPS) for dev in io_devices]
     cmd = ["systemd-run", "--quiet", "--collect", "--wait", "--pipe", "--unit", "stynpilot-job-" + job_id]
     for p in props:
         cmd += ["-p", p]

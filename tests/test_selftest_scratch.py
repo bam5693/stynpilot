@@ -79,3 +79,43 @@ class ScratchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FilterCompositionTests(unittest.TestCase):
+    """Dev18 live result: setid_calls_denied failed because setfsgid is NOT in systemd's @privileged (it never was denied). The probe
+    must only expect a kill for calls the effective filter really removes, and every expectation is checked against systemd's own lists."""
+
+    def groups(self):
+        import re
+        import shutil
+        import subprocess
+        if not shutil.which("systemd-analyze"):
+            raise unittest.SkipTest("systemd-analyze not available")
+        out = re.sub(r"\x1b\[[0-9;]*m", "", subprocess.run(["systemd-analyze", "syscall-filter"], capture_output=True, text=True).stdout)
+        sets, cur = {}, None
+        for line in out.splitlines():
+            if line.startswith("@"):
+                cur = sets.setdefault(line.strip(), set())
+            elif cur is not None and line.strip() and not line.strip().startswith("#"):
+                cur.add(line.strip())
+
+        def expand(name):
+            got = set()
+            for item in sets.get(name, ()):
+                got |= expand(item) if item.startswith("@") else {item}
+            return got
+        return expand("@system-service"), expand("@privileged") | expand("@resources")
+
+    def test_expected_kills_are_exactly_calls_the_effective_filter_removes(self):
+        from stynpilot import runner
+        allowed, removed = self.groups()
+        effective = (allowed - removed) | set(runner.ALLOWED_EXTRA_SYSCALLS)
+        for name in ("setuid", "setreuid", "setresuid", "setgroups", "capset"):          # what the probe expects to be killed
+            self.assertNotIn(name, effective, name)
+        for name in ("setfsuid", "setfsgid", "setgid", "setresgid", "setregid"):         # allowed: the probe proves they change nothing
+            self.assertIn(name, effective, name)
+
+    def test_the_probe_numbers_match_the_names(self):
+        probe = selftest.PROBE
+        self.assertIn("for n in (105, 113, 117, 116, 126)", probe)                    # x86-64: setuid, setreuid, setresuid, setgroups, capset
+        self.assertNotIn("(123, 0), (105", probe)                                     # setfsgid is no longer expected to be killed

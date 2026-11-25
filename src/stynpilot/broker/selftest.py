@@ -33,7 +33,7 @@ OPTIONAL = ("limit_pids", "limit_memory", "limit_fsize", "limit_tmp", "limit_io"
 SOCKET_GLOBS = ("/run/*.sock", "/run/*/*.sock", "/run/dbus/system_bus_socket", "/run/systemd/private", "/run/systemd/*/private",
                 "/run/user/*/bus", "/run/user/*/*/bus", "/var/run/docker.sock", "/run/containerd/containerd.sock")
 TASKS, MEMORY_MB, SECONDS = 64, 256, 40
-DIAG_NAMES = OPTIONAL + ("cgroup_path", "limits_unreadable")
+DIAG_NAMES = OPTIONAL + ("cgroup_path", "limits_unreadable", "setid_calls_denied")
 
 PROBE = r'''
 import json, os, pwd, socket, sys
@@ -71,6 +71,12 @@ for target in (0, int(sys.argv[2])):
     except OSError:
         readable = 0
     print("FSID", fs, status, readable, flush=True)
+# The gid calls are allowed by systemd's @system-service (they are not in @privileged): without CAP_SETGID none may change any group id.
+libc.syscall(123, 0)                                                # setfsgid(0)
+libc.syscall(106, 0)                                                # setgid(0)
+libc.syscall(119, 0, 0, 0)                                          # setresgid(0, 0, 0)
+libc.syscall(114, 0, 0)                                             # setregid(0, 0)
+print("GIDS", " ".join([l for l in open("/proc/self/status") if l.startswith("Gid:")][0].split()[1:]), libc.syscall(123, -1), flush=True)
 """
 def fsid():
     try:
@@ -78,17 +84,23 @@ def fsid():
     except (OSError, subprocess.SubprocessError):
         return False
     rows = [l.split() for l in got.stdout.splitlines() if l.startswith("FSID ")]
-    me = str(c["run_uid"])
-    return got.returncode == 0 and len(rows) == 2 and all(r[1:] == [me, me, "0"] for r in rows)
+    gids = [l.split()[1:] for l in got.stdout.splitlines() if l.startswith("GIDS ")]
+    me, group = str(c["run_uid"]), str(c["run_gid"])
+    return (got.returncode == 0 and len(rows) == 2 and all(r[1:] == [me, me, "0"] for r in rows)
+            and gids == [[group] * 5])
 say(fsid(), "fs_identity_fixed")
-def denied(number, arg):
+def denied(number):
     try:
-        got = subprocess.run([sys.executable, "-I", "-c", "import ctypes;ctypes.CDLL(None).syscall(%d, %d);print('ALIVE')" % (number, arg)],
+        got = subprocess.run([sys.executable, "-I", "-c", "import ctypes;ctypes.CDLL(None).syscall(%d, 0, 0, 0);print('ALIVE')" % number],
                              capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.SubprocessError):
-        return False
-    return got.returncode == -31 and "ALIVE" not in got.stdout       # killed by the filter (SIGSYS), not merely refused
-say(all(denied(n, a) for n, a in ((123, 0), (105, 0), (117, 0), (116, 0))), "setid_calls_denied")   # setfsgid, setuid, setresuid, setgroups
+        return "err"
+    return str(got.returncode) if "ALIVE" not in got.stdout else "alive"
+# The uid/capability calls systemd's @privileged removes (setfsuid is the one documented exception) must KILL with SIGSYS (-31).
+# setuid, setreuid, setresuid, setgroups, capset. Each is tried even if an earlier one fails, and every return code is reported.
+codes = [(n, denied(n)) for n in (105, 113, 117, 116, 126)]
+say(all(code == "-31" for _, code in codes), "setid_calls_denied")
+print("DIAG setid_calls_denied -31 " + ",".join("%d:%s" % pair for pair in codes), flush=True)   # setfsgid, setuid, setresuid, setgroups
 say(st.get("NoNewPrivs") == "1", "no_new_privs")
 def reads(path):
     try:

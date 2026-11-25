@@ -422,7 +422,9 @@ class AuthorityTests(unittest.TestCase):
         start = _t.monotonic()
         code, _ = default_run(["sh", "-c", "exec >/dev/null 2>&1; sleep 60"], 3)       # silent and slow: still bounded by the deadline
         self.assertLess(_t.monotonic() - start, 15)
-        self.assertNotEqual(code, 0)
+        self.assertEqual(code, 124)                                              # reported as a timeout
+        code, _ = default_run(["sh", "-c", "exec >/dev/null 2>&1; sleep 35; exit 4"], 60)   # quiet for longer than 30 s: not cut short
+        self.assertEqual(code, 4)
 
     def test_a_sandbox_unit_that_will_not_stop_fails_the_build(self):
         self.machine.unit_state = "active"

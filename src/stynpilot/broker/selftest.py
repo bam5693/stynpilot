@@ -268,6 +268,66 @@ def _create_late_files(ws, uid, gid, delay):
                    capture_output=True, timeout=30, check=False, env={"PATH": "/usr/bin:/bin"})
 
 
+_NOFOLLOW = os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _make_file(dfd, name, data, mode):
+    """Create a NEW root-owned file inside a pinned directory: exclusive, never through a link, mode set on the descriptor."""
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600, dir_fd=dfd)
+    try:
+        os.write(fd, data)
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def _make_dir(dfd, name, mode):
+    """Create a NEW directory inside a pinned directory and return a descriptor pinned to it (never through a link)."""
+    os.mkdir(name, 0o700, dir_fd=dfd)
+    sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW, dir_fd=dfd)
+    os.fchmod(sub, mode)
+    return sub
+
+
+def _prepare_scratch(scratch, owner, jr):
+    """Build the whole self-test scratch tree as ROOT while nobody else can reach it (root-owned 0700, no ACL entries yet), every step on
+    pinned descriptors; only THEN grant access (ACLs) and hand the folder to the owner. After the hand-over root writes nothing in it, so
+    an owner-side process can never swap a link in and make root create, truncate or re-permission a file elsewhere."""
+    scratch.mkdir(mode=0o700)
+    top = os.open(str(scratch), os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW)
+    try:
+        st = os.fstat(top)
+        if st.st_uid != 0 or st.st_mode & 0o077:
+            raise OSError("selftest scratch is not a private root folder")
+        ws = os.path.realpath(scratch)
+        # Canaries: credential-looking files that are WORLD-READABLE (0666), the case an ACL "skip" does not protect against.
+        for sub_name in (".ssh", ".stynpilot-trash"):
+            sub = _make_dir(top, sub_name, 0o777)
+            try:
+                _make_file(sub, "id_ed25519" if sub_name == ".ssh" else "old.txt", b"canary", 0o666)
+            finally:
+                os.close(sub)
+        _make_file(top, ".env", b"canary", 0o666)
+        # A root-only file the probe can SEE: even after asking for file-system uid 0 (setfsuid) it must stay unreadable.
+        _make_file(top, "root-only.bin", b"root", 0o600)
+        # A second workspace used by a job running AT THE SAME TIME under the other sandbox account. It lives inside the probe's own
+        # workspace but is hidden from it, so the only ways to reach it are the ones this test is about (another job's /proc view).
+        sub = _make_dir(top, "decoy", 0o755)
+        try:
+            _make_file(sub, "decoy.txt", b"decoy", 0o644)
+        finally:
+            os.close(sub)
+        decoy = os.path.join(ws, "decoy")
+        jr._acl_scratch(decoy)                       # inner folder first: the owner still has no access to anything here
+        jr._acl_scratch(ws)
+        os.fchown(top, owner.pw_uid, owner.pw_gid)   # hand-over LAST, on the pinned descriptor
+    finally:
+        os.close(top)
+    canaries = [ws + "/.env", ws + "/.ssh/id_ed25519", ws + "/.stynpilot-trash/old.txt"]
+    return ws, decoy, canaries, os.path.join(ws, "root-only.bin")
+
+
 def run_selftest(jr, *, timeout=60):
     """Run the live confinement test. Always records the outcome; only a full pass opens the gate."""
     from .. import projects_helper
@@ -282,40 +342,12 @@ def run_selftest(jr, *, timeout=60):
     scratch = root / "selftest"
     if scratch.is_symlink() or scratch.exists():
         shutil.rmtree(scratch, ignore_errors=True) if not scratch.is_symlink() else scratch.unlink()
-    scratch.mkdir(mode=0o700)
-    os.chown(scratch, owner.pw_uid, owner.pw_gid)
-    ws = str(os.path.realpath(scratch))
-    jr._acl_scratch(ws)
-    # Canaries: credential-looking files that are WORLD-READABLE (0666), the case an ACL "skip" does not protect against.
-    os.makedirs(os.path.join(ws, ".ssh"), mode=0o777)
-    os.makedirs(os.path.join(ws, ".stynpilot-trash"), mode=0o777)
-    for rel in (".env", ".ssh/id_ed25519", ".stynpilot-trash/old.txt"):
-        full = os.path.join(ws, rel)
-        with open(full, "w") as handle:
-            handle.write("canary")
-        os.chmod(full, 0o666)
-    for rel in (".ssh", ".stynpilot-trash"):
-        os.chmod(os.path.join(ws, rel), 0o777)
-    # A second workspace used by a job running AT THE SAME TIME under the other sandbox account. It lives inside the probe's own
-    # workspace but is hidden from it, so the only ways to reach it are the ones this test is about (another job's /proc view).
-    decoy = os.path.join(ws, "decoy")
-    os.mkdir(decoy, 0o755)
-    jr._acl_scratch(decoy)
-    with open(os.path.join(decoy, "decoy.txt"), "w") as handle:
-        handle.write("decoy")
-    os.chmod(os.path.join(decoy, "decoy.txt"), 0o644)
+    ws, decoy, canaries, root_only = _prepare_scratch(scratch, owner, jr)
     try:
         found = projects_helper.scan_protected(ws)
         masked = jr._safe_masked(ws, [ws + "/" + n for n in found] + [decoy])
     except projects_helper.Refuse as refused:
         raise JobError("selftest_scan_incomplete_" + str(refused)) from None
-    canaries = [ws + "/.env", ws + "/.ssh/id_ed25519", ws + "/.stynpilot-trash/old.txt"]
-    # A root-only file the probe can SEE: even after asking for file-system uid 0 (setfsuid) it must stay unreadable.
-    root_only = os.path.join(ws, "root-only.bin")
-    with open(root_only, "w") as handle:
-        handle.write("root")
-    os.chown(root_only, 0, 0)
-    os.chmod(root_only, 0o600)                                      # also masks any inherited ACL entry
     sockets = sorted({p for g in SOCKET_GLOBS for p in glob.glob(g)} | set(getattr(jr.backend, "extra_sockets", ())))
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))

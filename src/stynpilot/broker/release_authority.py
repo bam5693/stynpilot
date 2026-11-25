@@ -97,9 +97,9 @@ def default_run(argv, timeout, cwd=None, env=None, keep=20000):
         # EOF on the pipe means every writer closed it, not that the command has reported its exit status: let it finish (bounded) BEFORE
         # the group is killed, or a command that succeeded could be recorded as killed.
         try:
-            code = proc.wait(max(1.0, min(30.0, deadline - time.monotonic())))
+            code = proc.wait(max(0.1, deadline - time.monotonic()))          # the WHOLE remaining time: a quiet command is not cut short
         except subprocess.TimeoutExpired:
-            code = None
+            code, timed_out = None, True                              # it really ran out of time: report 124, not a kill status
     try:
         os.killpg(proc.pid, signal.SIGKILL)                   # nothing the command started may outlive it
     except OSError:

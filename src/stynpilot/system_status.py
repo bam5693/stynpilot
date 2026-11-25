@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import time
 from pathlib import Path
 
@@ -25,6 +26,7 @@ SLEEP_KEYS = ("AllowSuspend", "AllowHibernation", "AllowHybridSleep", "AllowSusp
 GNOME_POWER = ("sleep-inactive-ac-type", "sleep-inactive-ac-timeout", "sleep-inactive-battery-type", "sleep-inactive-battery-timeout")
 FIRMWARE_NOTE = ("Restore-after-power-loss ('Restore on AC Power Loss' / 'AC Back') is a firmware (BIOS/UEFI) setting. Linux cannot read "
                  "or change it on most PCs; check it once in the firmware setup screen.")
+MAX_VERIFY_BYTES = 64 * 1024 * 1024        # owner-state backups are small; a bigger file is reported, never loaded
 _IFACE = re.compile(r"[A-Za-z0-9_.-]{1,15}\Z")
 _SAFE = re.compile(r"[^A-Za-z0-9 _.,:/+@()%=-]")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
@@ -184,10 +186,15 @@ class SystemStatus:
             st = p.lstat()
             rows.append({"name": _clean(p.name, 60), "size_kb": st.st_size // 1024, "age_days": round((self.clock() - st.st_mtime) / 86400, 1)})
         newest = {"verified": None}
-        if found and not found[0].is_symlink():
+        newest_st = found[0].lstat() if found else None
+        if newest_st and not stat.S_ISREG(newest_st.st_mode):
+            newest = {"verified": False, "problem": "not_a_regular_file"}
+        elif newest_st and newest_st.st_size > MAX_VERIFY_BYTES:
+            newest = {"verified": None, "problem": "too_large_to_verify_here"}
+        elif newest_st:
             from . import backup
             try:
-                manifest, files = backup.read_backup(str(found[0]))
+                manifest, files = backup.read_backup(str(found[0]), expected_kind="owner")
                 newest = {"verified": True, "files": len(files), "kind": _clean(manifest.get("kind", ""), 20)}
             except Exception as error:                                   # BackupError or a damaged archive: report, never raise
                 newest = {"verified": False, "problem": _clean(getattr(error, "code", None) or str(error) or type(error).__name__, 60)}

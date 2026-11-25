@@ -66,6 +66,17 @@ def proof_fingerprint(id_token):
 
 def render_summary(payload):
     """Plain-English text of an install or rollback payload, produced by the root installer itself."""
+    if payload.get("kind") == "passkey":
+        expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
+        if payload.get("action") == "enroll":
+            return ["Add a passkey named \"%s\" for approving StyNpilot changes." % str(payload.get("label")),
+                    "After you approve this, your phone is asked to create the passkey (fingerprint or screen lock). It must be "
+                    "created within 3 minutes, on this page's address only.",
+                    "If your phone syncs passkeys through your Google account, this one can also be used from any device signed in "
+                    "to that account. A passkey that stays on one device is safer; StyNpilot shows which kind each one is.",
+                    expires]
+        return ["Remove the passkey with short ID %s." % str(payload.get("kid")),
+                "It can no longer approve anything. Other passkeys and your Auth0 sign-in keep working.", expires]
     if payload.get("kind") == "runner":
         expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
         name = str(payload.get("name"))

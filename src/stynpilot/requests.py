@@ -35,8 +35,9 @@ _MOVES = {"pending": ("approved", "denied"), "approved": ("running", "needs_owne
 _SAFE_RESULT = ("ok", "stopped", "installed", "rollback_id", "restored", "restored_from_backup", "changed_anything",
                 "not_restored", "needs_owner_intervention", "denied_by_owner", "backup_scope", "limits",
                 "pending", "started", "rolled_back", "from_version", "to_version", "notes", "config_preserved",
-                "action", "workspace", "entries", "skipped", "runner_user", "enabled", "selftest")
-KINDS = ("install", "rollback", "upgrade", "runner")
+                "action", "workspace", "entries", "skipped", "runner_user", "enabled", "selftest",
+                "enrollment_open", "label", "kid", "passkeys_active")
+KINDS = ("install", "rollback", "upgrade", "runner", "passkey")
 MAX_PENDING_PER_CLIENT = 5
 _REQUEST_ID = re.compile(r"[a-f0-9]{64}\Z")
 

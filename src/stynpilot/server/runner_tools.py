@@ -29,6 +29,7 @@ from .router import AccessDenied
 
 _LOG = logging.getLogger("stynpilot.runner_tools")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}\Z")
+_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _-]{0,39}\Z")
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 FILES_A_REQUEST = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 WORKS = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
@@ -140,6 +141,54 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
                  description="Ask the owner to remove the authorization of StyNpilot-Projects/<name>. Files are not deleted.")
     def request_workspace_removal(device_id: str, name: str) -> dict:
         return request("commander_request_workspace_removal", device_id, "unenroll", name)
+
+    # -- passkeys (dev15): ask to add or remove one; the owner approves on his phone ---------------------------------
+    def passkey_request(owner, device_id, *, action, label, kid):
+        info = broker.passkey_list()
+        if not info.get("configured"):
+            raise WorkspaceError("passkeys_not_configured")
+        keys = info.get("passkeys", [])
+        if action == "enroll":
+            if type(label) is not str or not _LABEL.fullmatch(label):
+                raise WorkspaceError("passkey_label_invalid")
+        elif kid not in [k["kid"] for k in keys]:
+            raise WorkspaceError("passkey_unknown")
+        proposer = ctx.proposer
+        expires = now() + timedelta(hours=1)
+        payload = {"kind": "passkey", "action": action, "label": label if action == "enroll" else "",
+                   "kid": kid if action == "revoke" else "", "owner": owner, "device": device_id,
+                   "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        software = "stynpilot-passkey-" + (label.lower().replace(" ", "-") if action == "enroll" else kid)
+        result, _ = store.submit(kind="passkey", software=software, device=device_id, owner=owner, proposer=proposer,
+                                 payload=payload, summary=render_summary(payload), expires=expires.timestamp())
+        return receipt(result)
+
+    @server.tool(name="commander_request_passkey_enrollment", title="Ask the owner to add a passkey", annotations=FILES_A_REQUEST,
+                 description=("Ask the owner to add a passkey (fingerprint or screen lock) for approving StyNpilot changes. label: letters, "
+                              "digits, space, - and _ (e.g. 'Pixel phone'). He approves on his phone, then creates the passkey on the "
+                              "approval page. You cannot approve and never receive the passkey."))
+    def request_passkey_enrollment(device_id: str, label: str) -> dict:
+        return run("commander_request_passkey_enrollment", device_id,
+                   lambda owner: passkey_request(owner, device_id, action="enroll", label=label, kid=""), write=True)
+
+    @server.tool(name="commander_request_passkey_revocation", title="Ask the owner to remove a passkey", annotations=FILES_A_REQUEST,
+                 description="Ask the owner to remove one enrolled passkey by its short ID (see passkey_status). He approves on his phone.")
+    def request_passkey_revocation(device_id: str, kid: str) -> dict:
+        return run("commander_request_passkey_revocation", device_id,
+                   lambda owner: passkey_request(owner, device_id, action="revoke", label="", kid=kid), write=True)
+
+    @server.tool(name="passkey_status", title="Which passkeys are enrolled", annotations=READ_ONLY,
+                 description=("Short ID, label, synced-or-device-only, created and last-used time of each active passkey, whether the "
+                              "installer's passkey audit chain is intact, and whether two passkeys are enrolled (needed before the old "
+                              "release key can be retired). Public key material is never shown."))
+    def passkey_status(device_id: str) -> dict:
+        def work(owner):
+            info = broker.passkey_list()
+            return {"configured": bool(info.get("configured")), "retirement_ready": bool(info.get("retirement_ready")),
+                    "audit_chain_ok": info.get("audit_chain_ok"),
+                    "passkeys": [{k: key[k] for k in ("kid", "label", "synced", "sync_capable", "created", "last_used")}
+                                 for key in info.get("passkeys", [])]}
+        return run("passkey_status", device_id, work, write=False)
 
     # -- reads -----------------------------------------------------------------------------------------------
     @server.tool(name="runner_status", title="Sandbox runner status", annotations=READ_ONLY,

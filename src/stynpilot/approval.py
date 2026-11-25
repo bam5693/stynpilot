@@ -43,6 +43,10 @@ class ApprovalError(Exception):
         self.code = code
 
 
+def b64u(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
 def pkce_challenge(verifier):
     return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
 
@@ -65,11 +69,11 @@ class ApprovalFlow:
         # background=True: the install runs on ONE worker thread, so the approval page and its other requests
         # stay responsive during a long install. Progress is the request's durable state (running -> done...).
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stynpilot-approve") if background else None
-        self._views, self._states = {}, {}
+        self._views, self._states, self._enroll_sessions = {}, {}, {}
 
     def _sweep(self):
         now = self.clock()
-        for table in (self._views, self._states):
+        for table in (self._views, self._states, self._enroll_sessions):
             for key in [k for k, v in table.items() if v["expires"] <= now]:
                 del table[key]
 
@@ -95,16 +99,68 @@ class ApprovalFlow:
         if approve["summary"] != deny["summary"]:
             raise ApprovalError("summary_altered_in_transit")
         view, csrf = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+        passkey = self._passkey_options(approve, deny)
         with self._lock:
             self._sweep()
             if len(self._views) >= MAX_VIEWS:
                 raise ApprovalError("too_many_open_approval_pages")
             self._views[view] = {"request_id": request_id, "csrf": csrf, "challenges": {"approve": approve, "deny": deny},
-                                 "used": False, "expires": self.clock() + VIEW_LIFETIME}
-        return {"view": view, "csrf": csrf, "request_id": request_id, "kind": payload.get("kind", "install"),
+                                 "used": False, "attempts": 0, "expires": self.clock() + VIEW_LIFETIME}
+        return {"passkey": passkey, "view": view, "csrf": csrf, "request_id": request_id, "kind": payload.get("kind", "install"),
                 "summary": list(approve["summary"]), "summary_sha256": approve["summary_sha256"],
                 "fingerprint": request_id[:12], "choices": ["approve", "deny"],
                 "expires_in": VIEW_LIFETIME}
+
+    def _passkey_options(self, approve, deny):
+        """What the page's one-tap button needs: enrolled passkeys and the two challenges (the decision nonces).
+        Absent or unreachable passkeys simply mean the Auth0 buttons are shown instead."""
+        lister = getattr(self.broker, "passkey_list", None)
+        if lister is None:
+            return None
+        try:
+            info = lister()
+        except Exception:
+            return None
+        keys = info.get("passkeys") if isinstance(info, dict) else None
+        if not info.get("configured") or not keys:
+            return None
+        return {"rp_id": info["rp_id"], "credentials": [k["credential_id"] for k in keys],
+                "synced": any(k["synced"] for k in keys),
+                "challenge": {"approve": b64u(bytes.fromhex(approve["nonce"])), "deny": b64u(bytes.fromhex(deny["nonce"]))}}
+
+    # -- 1b. one tap: a passkey signs the exact decision nonce ------------------------------------------------------------
+    MAX_PASSKEY_TRIES = 5
+
+    def passkey_decide(self, view, csrf, decision, assertion):
+        """``assertion``: JSON text of the WebAuthn proof. The installer checks it WITHOUT using anything up first, so a
+        wrong finger, a cancelled prompt or a bad signature leaves the request exactly as it was (up to a few tries)."""
+        if decision not in ("approve", "deny"):
+            raise ApprovalError("invalid_decision")
+        with self._lock:
+            self._sweep()
+            item = self._views.get(view if type(view) is str else "")
+            if item is None or item.get("enroll"):
+                raise ApprovalError("page_expired")
+            if type(csrf) is not str or not hmac.compare_digest(csrf, item["csrf"]):
+                raise ApprovalError("csrf_check_failed")
+            if item["used"]:
+                raise ApprovalError("already_chosen")
+            if item["attempts"] >= self.MAX_PASSKEY_TRIES:
+                raise ApprovalError("too_many_tries_open_the_request_again")
+            item["attempts"] += 1
+        payload = self.store.payload(item["request_id"])
+        if payload is None:
+            raise ApprovalError("unknown_request")
+        challenge = item["challenges"][decision]["challenge"]
+        try:
+            self.broker.passkey_precheck(payload, assertion, challenge, decision)
+        except Exception as error:
+            raise ApprovalError("passkey_refused_%s" % getattr(error, "code", "unavailable")) from None
+        with self._lock:
+            if item["used"]:
+                raise ApprovalError("already_chosen")
+            item["used"] = True
+        return self._conclude(item["request_id"], decision, payload, assertion, challenge, view=view)
 
     # -- 2. the owner picks Approve or Deny: start a fresh Auth0 sign-in for exactly that choice --------
     def choose(self, view, csrf, decision):
@@ -113,7 +169,7 @@ class ApprovalFlow:
         with self._lock:
             self._sweep()
             item = self._views.get(view if type(view) is str else "")
-            if item is None:
+            if item is None or item.get("enroll"):
                 raise ApprovalError("page_expired")
             if type(csrf) is not str or not hmac.compare_digest(csrf, item["csrf"]):
                 raise ApprovalError("csrf_check_failed")
@@ -146,6 +202,10 @@ class ApprovalFlow:
             id_token = self.exchange(code, item["verifier"])
         except Exception:
             raise ApprovalError("sign_in_failed") from None
+        return self._conclude(rid, decision, payload, id_token, item["challenge"], view=item["view"])
+
+    def _conclude(self, rid, decision, payload, proof, challenge, view=None):
+        """Record the owner's decision and act on it exactly once (Auth0 token or passkey assertion: same path)."""
         # One decision per request: the compare-and-set is what stops a double decision.
         target = "approved" if decision == "approve" else "denied"
         try:
@@ -156,24 +216,72 @@ class ApprovalFlow:
             raise ApprovalError("request_not_pending")
         if decision == "deny":
             try:
-                result = self.broker.deny(payload, id_token, item["challenge"])
+                result = self.broker.deny(payload, proof, challenge)
             except Exception as error:
                 # The owner said no. Even if recording the denial at the installer failed, nothing runs.
                 return {"state": "denied", "request_id": rid, "recorded_by_installer": False,
                         "note": getattr(error, "code", "unavailable")}
             return {"state": "denied", "request_id": rid, "recorded_by_installer": bool(result.get("ok"))}
-        wanted = {"rollback": "rollback", "upgrade": "upgrade", "runner": "runner_admin"}.get(payload.get("kind"), "install")
+        if payload.get("kind") == "passkey" and payload.get("action") == "enroll" and view:
+            with self._lock:                 # only the browser that approved may then create the passkey
+                self._enroll_sessions[rid] = {"view": view, "expires": self.clock() + VIEW_LIFETIME}
+        wanted = {"rollback": "rollback", "upgrade": "upgrade", "runner": "runner_admin",
+                  "passkey": "passkey_admin"}.get(payload.get("kind"), "install")
         method = getattr(self.broker, wanted, None)
         if method is None:
             return self._uncertain(rid)
         try:
             self.store.transition(rid, "approved", "running")
             if self._pool is not None:
-                self._pool.submit(self._execute, rid, method, payload, id_token, item["challenge"])
+                self._pool.submit(self._execute, rid, method, payload, proof, challenge)
                 return {"state": "running", "request_id": rid, "ok": None}
         except Exception:
             return self._uncertain(rid)
-        return self._execute(rid, method, payload, id_token, item["challenge"])
+        return self._execute(rid, method, payload, proof, challenge)
+
+    # -- passkey enrollment: after an enrollment request is approved, the phone creates the key -------------------------------
+    def enroll_page(self, request_id, session=""):
+        """Only for an enrollment request the installer has opened a window for, and only in the browser that approved it
+        (the challenge goes to that browser alone). The challenge itself comes from the installer."""
+        with self._lock:
+            self._sweep()
+            owner_session = self._enroll_sessions.get(request_id)
+        if owner_session is None or type(session) is not str or not hmac.compare_digest(session, owner_session["view"]):
+            raise ApprovalError("enrollment_not_for_this_browser")
+        try:
+            info = self.broker.passkey_begin(request_id)
+        except Exception as error:
+            raise ApprovalError("enrollment_%s" % getattr(error, "code", "unavailable")) from None
+        view, csrf = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+        with self._lock:
+            self._sweep()
+            if len(self._views) >= MAX_VIEWS:
+                raise ApprovalError("too_many_open_approval_pages")
+            self._views[view] = {"request_id": request_id, "csrf": csrf, "enroll": True, "used": False, "attempts": 0,
+                                 "expires": self.clock() + min(VIEW_LIFETIME, info["expires_in"])}
+            self._enroll_sessions[request_id] = {"view": view, "expires": self.clock() + VIEW_LIFETIME}
+        return {"view": view, "csrf": csrf, "request_id": request_id, "label": info["label"], "rp_id": info["rp_id"],
+                "challenge": b64u(bytes.fromhex(info["challenge"])), "exclude": list(info["exclude"]),
+                "expires_in": info["expires_in"]}
+
+    def enroll_finish(self, view, csrf, response):
+        with self._lock:
+            self._sweep()
+            item = self._views.get(view if type(view) is str else "")
+            if item is None or not item.get("enroll"):
+                raise ApprovalError("page_expired")
+            if type(csrf) is not str or not hmac.compare_digest(csrf, item["csrf"]):
+                raise ApprovalError("csrf_check_failed")
+            if item["used"] or item["attempts"] >= self.MAX_PASSKEY_TRIES:
+                raise ApprovalError("already_chosen")
+            item["attempts"] += 1
+        try:
+            done = self.broker.passkey_complete(item["request_id"], response)
+        except Exception as error:
+            raise ApprovalError("enrollment_%s" % getattr(error, "code", "unavailable")) from None
+        with self._lock:
+            item["used"] = True
+        return done
 
     def _execute(self, rid, method, payload, id_token, challenge):
         """Run the approved action and settle the request's durable state. Never raises."""

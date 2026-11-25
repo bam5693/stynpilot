@@ -60,6 +60,8 @@ from . import apt
 from .. import runner as runner_policy
 from .jobs import JobError
 from .selftest import clean_diagnostics
+from .passkeys import PasskeyError
+from .. import webauthn
 from .proof import ProofDenied, decision_nonce, render_summary, summary_hash
 from .upgrade import UpgradeRefused, Upgrader
 
@@ -135,6 +137,17 @@ class Runs:
         except sqlite3.IntegrityError:
             raise ExecutionDenied("already_used") from None
 
+    def peek(self, *, challenge, request_id, decision):
+        """The same checks ``consume`` makes, without using the challenge (lets a bad passkey try again)."""
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM challenges WHERE challenge=?", (challenge if type(challenge) is str else "",)).fetchone()
+            if row is None or row["request_id"] != request_id or row["decision"] != decision:
+                raise ExecutionDenied("challenge_unknown")
+            if row["used"] is not None:
+                raise ExecutionDenied("already_used")
+            if row["expires"] <= self.clock():
+                raise ExecutionDenied("challenge_expired")
+
     def finish(self, request_id, state, result):
         with self._tx() as db:
             db.execute("UPDATE runs SET state=?, result=?, finished=? WHERE request_id=?",
@@ -159,7 +172,7 @@ def _sha256(path):
 class Executor:
     def __init__(self, *, state_dir, owner, device, verifier, run=apt.real_run, require_root=True,
                  sources_root="/etc/apt", file_root="/", owner_uid=None, release_keys=None, fetch_release=None,
-                 launch_worker=None, upgrade_options=None, jobs=None):
+                 launch_worker=None, upgrade_options=None, jobs=None, passkeys=None):
         self.dir = Path(state_dir)
         if require_root and not apt.is_root():
             raise ExecutionDenied("installer_must_run_as_root")
@@ -181,6 +194,7 @@ class Executor:
         self.upgrader = Upgrader(self, keys=release_keys, fetch=fetch_release, launch=launch_worker,
                                  options=upgrade_options)
         self.jobs = jobs
+        self.passkeys = passkeys                  # PasskeyStore or None (passkeys not configured)
         if jobs is not None:
             jobs.reconcile()
         # A run still marked "running" means the installer died mid-change. We can't know what state
@@ -291,7 +305,7 @@ class Executor:
                     "nonce": decision_nonce(decision, rid, rid, challenge),
                     "summary": summary, "summary_sha256": summary_hash(summary), "expires_in": CHALLENGE_LIFETIME}
         summary = render_summary(payload)
-        if payload.get("kind") == "runner":
+        if payload.get("kind") in ("runner", "passkey"):
             return {"request_id": rid, "decision": decision, "challenge": challenge,
                     "nonce": decision_nonce(decision, rid, rid, challenge),
                     "summary": summary, "summary_sha256": summary_hash(summary), "expires_in": CHALLENGE_LIFETIME}
@@ -311,6 +325,8 @@ class Executor:
     def _check_payload(self, payload):
         if type(payload) is not dict:
             raise ExecutionDenied("plan_invalid_or_expired")
+        if payload.get("kind") == "passkey":                  # pure bookkeeping: must keep working (revocation!) in any state
+            return self._check_passkey_payload(payload)
         self._settle_upgrades()
         if any(self.upgrader.is_job(r) for r in self.runs.running()):
             raise ExecutionDenied("an_upgrade_is_still_running")
@@ -322,17 +338,156 @@ class Executor:
             return self._check_rollback_payload(payload)
         return self._check_install_payload(payload)
 
-    def _decide(self, payload, proof_token, challenge, decision, kind):
-        rid, _ = payload_hash(payload)
+    def _prove(self, rid, proof_token, challenge, decision):
+        """Check the owner's proof (Auth0 token or passkey assertion) for exactly this decision; uses nothing up.
+        Returns (fingerprint, passkey-or-None). The ONLY place an owner proof is accepted."""
         if type(challenge) is not str or len(challenge) != 64:
             raise ExecutionDenied("challenge_unknown")
         try:
             nonce = decision_nonce(decision, rid, rid, challenge)
-            fingerprint = self.verifier.verify(proof_token, owner=self.owner, expected_nonce=nonce)
+            if type(proof_token) is str and proof_token.startswith("{"):
+                return self._verify_passkey(proof_token, nonce, rid, decision)
+            return self.verifier.verify(proof_token, owner=self.owner, expected_nonce=nonce), None
         except ProofDenied as denied:
             raise ExecutionDenied(denied.code) from None
+
+    def _used_passkey(self, passkey, rid, decision):
+        if passkey is not None:
+            try:
+                self.passkeys.record_use(passkey[0]["credential_id"], passkey[1], request_id=rid, decision=decision)
+            except Exception:
+                pass                                       # the approval is already durable; the audit write failing must not undo it
+
+    def _decide(self, payload, proof_token, challenge, decision, kind):
+        rid, _ = payload_hash(payload)
+        fingerprint, passkey = self._prove(rid, proof_token, challenge, decision)
         self.runs.consume(challenge=challenge, request_id=rid, decision=decision, proof=fingerprint, kind=kind)
+        self._used_passkey(passkey, rid, decision)
         return rid
+
+    # -- passkey proofs --------------------------------------------------------------------------------------------
+    _PASSKEY_PROOF_KEYS = {"credential_id", "client_data_json", "authenticator_data", "signature"}
+
+    def _verify_passkey(self, token, nonce, rid, decision):
+        """A WebAuthn assertion whose challenge IS the decision nonce (request, exact plan, decision, root challenge).
+        Needs an enrolled, un-revoked passkey, the exact origin, user verification, and a valid signature."""
+        if self.passkeys is None:
+            raise ExecutionDenied("passkeys_not_configured")
+        try:
+            data = json.loads(token) if len(token) <= 8192 else None
+        except ValueError:
+            data = None
+        if type(data) is not dict or set(data) != self._PASSKEY_PROOF_KEYS or any(type(v) is not str for v in data.values()):
+            raise ExecutionDenied("proof_invalid")
+        try:
+            row = self.passkeys.lookup(data["credential_id"])
+            if row is None:
+                raise ExecutionDenied("passkey_unknown_or_revoked")
+            try:
+                auth = webauthn.verify_assertion(data, rp_id=self.passkeys.rp_id, origin=self.passkeys.origin,
+                                                 challenge=bytes.fromhex(nonce), public_key_xy=bytes.fromhex(row["public_key"]))
+            except webauthn.WebAuthnError as error:
+                raise ExecutionDenied("passkey_" + error.code) from None
+            try:
+                self.passkeys.check_counter(row, auth)
+            except PasskeyError as error:
+                raise ExecutionDenied(error.code) from None
+        except ExecutionDenied as refused:
+            try:
+                self.passkeys.audit("refused", {"request_id": rid, "decision": decision, "code": refused.code})
+            except Exception:
+                pass
+            raise
+        fingerprint = hashlib.sha256(("passkey|%s|%s" % (row["credential_id"], data["signature"])).encode()).hexdigest()
+        return fingerprint, (row, auth)
+
+    def passkey_precheck(self, payload, proof_token, challenge, decision):
+        """Would this passkey proof be accepted right now? Changes nothing and uses nothing up, so a wrong fingerprint or a
+        cancelled prompt leaves the request exactly as it was and the owner can simply try again."""
+        if decision not in ("approve", "deny"):
+            raise ExecutionDenied("invalid_decision")
+        self._check_payload(payload)
+        rid, _ = payload_hash(payload)
+        if type(challenge) is not str or len(challenge) != 64:
+            raise ExecutionDenied("challenge_unknown")
+        self.runs.peek(challenge=challenge, request_id=rid, decision=decision)
+        try:
+            nonce = decision_nonce(decision, rid, rid, challenge)
+        except ProofDenied as denied:
+            raise ExecutionDenied(denied.code) from None
+        if type(proof_token) is not str or not proof_token.startswith("{"):
+            raise ExecutionDenied("proof_invalid")
+        self._verify_passkey(proof_token, nonce, rid, decision)
+        return {"ok": True}
+
+    # -- passkey administration (YELLOW): enroll one, revoke one ---------------------------------------------------------
+    _PASSKEY_KEYS = {"kind", "action", "label", "kid", "owner", "device", "expires_at"}
+
+    def _check_passkey_payload(self, payload):
+        if self.passkeys is None:
+            raise ExecutionDenied("passkeys_not_configured")
+        action = payload.get("action")
+        if (set(payload) != self._PASSKEY_KEYS or payload.get("kind") != "passkey" or action not in ("enroll", "revoke")
+                or payload.get("owner") != self.owner or payload.get("device") != self.device):
+            raise ExecutionDenied("passkey_request_invalid")
+        from .passkeys import KID, LABEL
+        label, kid = payload.get("label"), payload.get("kid")
+        if action == "enroll" and not (type(label) is str and LABEL.fullmatch(label) and kid == ""):
+            raise ExecutionDenied("passkey_request_invalid")
+        if action == "revoke" and not (label == "" and type(kid) is str and KID.fullmatch(kid)):
+            raise ExecutionDenied("passkey_request_invalid")
+        try:
+            expires = datetime.strptime(payload["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            raise ExecutionDenied("passkey_request_invalid") from None
+        if expires <= datetime.now(timezone.utc):
+            raise ExecutionDenied("plan_invalid_or_expired")
+        if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
+            raise ExecutionDenied("already_decided_or_used")
+        return payload
+
+    def passkey_admin(self, payload, proof_token, challenge):
+        """Execute an owner-approved passkey change. Enrolling only OPENS a short window; the phone creates the key inside it."""
+        self._check_payload(payload)
+        rid = self._decide(payload, proof_token, challenge, "approve", "passkey")
+        by = "passkey" if type(proof_token) is str and proof_token.startswith("{") else "auth0"
+        try:
+            if payload["action"] == "enroll":
+                self.passkeys.open_window(rid, payload["label"], by)
+                result = {"ok": True, "action": "enroll", "enrollment_open": True, "label": payload["label"]}
+            else:
+                left = self.passkeys.revoke(payload["kid"], rid)
+                result = {"ok": True, "action": "revoke", "kid": payload["kid"], "passkeys_active": left}
+        except PasskeyError as stopped:
+            result = {"ok": False, "stopped": stopped.code, "changed_anything": False, "action": payload["action"]}
+        except Exception as error:
+            result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__, "changed_anything": None,
+                      "action": payload["action"]}
+        self._record_result(rid, "done" if result.get("ok") else "failed", result)
+        return result
+
+    def passkey_list(self):
+        if self.passkeys is None:
+            return {"configured": False, "passkeys": [], "retirement_ready": False}
+        active = self.passkeys.active()
+        return {"configured": True, "rp_id": self.passkeys.rp_id, "origin": self.passkeys.origin, "passkeys": active,
+                "retirement_ready": len(active) >= 2, "audit_chain_ok": self.passkeys.audit_ok()}
+
+    def passkey_begin(self, request_id):
+        if self.passkeys is None:
+            raise ExecutionDenied("passkeys_not_configured")
+        try:
+            return self.passkeys.begin(request_id)
+        except PasskeyError as refused:
+            raise ExecutionDenied(refused.code) from None
+
+    def passkey_complete(self, request_id, response):
+        if self.passkeys is None:
+            raise ExecutionDenied("passkeys_not_configured")
+        try:
+            return self.passkeys.complete(request_id, response)
+        except PasskeyError as refused:
+            raise ExecutionDenied(refused.code) from None
 
     def deny(self, payload, proof_token, challenge):
         """The owner said no. Recorded; this request can never be approved afterwards."""
@@ -481,11 +636,7 @@ class Executor:
         rid, _ = payload_hash(payload)
         if type(challenge) is not str or len(challenge) != 64:
             raise ExecutionDenied("challenge_unknown")
-        try:
-            nonce = decision_nonce("approve", rid, rid, challenge)
-            fingerprint = self.verifier.verify(proof_token, owner=self.owner, expected_nonce=nonce)
-        except ProofDenied as denied:
-            raise ExecutionDenied(denied.code) from None
+        fingerprint, passkey = self._prove(rid, proof_token, challenge, "approve")
         try:
             self._backup_records(rid)
             _, _, installed = self.upgrader.check(payload)
@@ -494,6 +645,7 @@ class Executor:
                 try:
                     self.runs.consume(challenge=challenge, request_id=rid, decision="approve", proof=fingerprint,
                                       kind="upgrade")
+                    self._used_passkey(passkey, rid, "approve")
                     unit = self.upgrader.start(rid, job)
                 except BaseException:
                     if self.runs.status(rid)["state"] == "not_started":

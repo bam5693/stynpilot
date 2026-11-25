@@ -8,6 +8,7 @@ It talks to the installer with one JSON line per call:
   {"op": "rollback",     "payload": {...}, "proof": "<ID token>", "challenge": "<64 hex>"}
   {"op": "upgrade",      "payload": {...}, "proof": "<ID token>", "challenge": "<64 hex>"}   -> returns at once (pending)
   {"op": "deny",         "payload": {...}, "proof": "<ID token>", "challenge": "<64 hex>"}
+  {"op": "passkey_list" | "passkey_begin" | "passkey_complete" | "passkey_precheck" | "passkey_admin", ...}   (dev15 passkeys)
   {"op": "status",       "request_id": "<64 hex>"}
   {"op": "rollbackable", "rollback_id": "<hex>", "software": "<catalog id>"}
 
@@ -94,15 +95,25 @@ class BrokerService:
                 except LedgerError as refused:
                     return {"ok": False, "error": refused.code}
                 return {"ok": True, "request_id": entry["request_id"], "snapshot_id": entry["snapshot_id"]}
+            if op == "passkey_list":
+                return {"ok": True, "result": self.executor.passkey_list()}
+            if op == "passkey_begin":
+                return {"ok": True, "result": self.executor.passkey_begin(message.get("request_id"))}
+            if op == "passkey_complete":
+                return {"ok": True, "result": self.executor.passkey_complete(message.get("request_id"), message.get("response"))}
+            if op == "passkey_precheck":
+                return {"ok": True, "result": self.executor.passkey_precheck(message.get("payload"), message.get("proof"),
+                                                                              message.get("challenge"), message.get("decision"))}
             if op == "runner":
                 return {"ok": True, "result": self.executor.runner_call(message.get("call"), message.get("args"))}
-            if op in ("install", "rollback", "upgrade", "deny", "runner_admin"):
+            if op in ("install", "rollback", "upgrade", "deny", "runner_admin", "passkey_admin"):
                 if not self._busy.acquire(blocking=False):
                     return {"ok": False, "error": "busy"}          # one change at a time
                 try:
                     method = {"install": self.executor.install, "rollback": self.executor.rollback,
                               "upgrade": self.executor.upgrade, "deny": self.executor.deny,
-                              "runner_admin": self.executor.runner_admin}[op]
+                              "runner_admin": self.executor.runner_admin,
+                              "passkey_admin": self.executor.passkey_admin}[op]
                     result = method(message.get("payload"), message.get("proof"), message.get("challenge"))
                 finally:
                     self._busy.release()
@@ -243,6 +254,22 @@ class BrokerClient:
     def runner(self, call, args=None):
         """GREEN runner operations on the owner-only socket (no approval): status, self-test, run, jobs, output, cancel."""
         return self._ask({"op": "runner", "call": call, "args": args or {}}, 120)["result"]
+
+    def passkey_admin(self, payload, proof, challenge):
+        return self._ask({"op": "passkey_admin", "payload": payload, "proof": proof, "challenge": challenge}, 60)["result"]
+
+    def passkey_list(self):
+        return self._ask({"op": "passkey_list"}, 30)["result"]
+
+    def passkey_begin(self, request_id):
+        return self._ask({"op": "passkey_begin", "request_id": request_id}, 30)["result"]
+
+    def passkey_complete(self, request_id, response):
+        return self._ask({"op": "passkey_complete", "request_id": request_id, "response": response}, 30)["result"]
+
+    def passkey_precheck(self, payload, proof, challenge, decision):
+        return self._ask({"op": "passkey_precheck", "payload": payload, "proof": proof, "challenge": challenge,
+                          "decision": decision}, 30)["result"]
 
     def deny(self, payload, proof, challenge):
         return self._ask({"op": "deny", "payload": payload, "proof": proof, "challenge": challenge}, 60)["result"]

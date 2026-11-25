@@ -40,13 +40,14 @@ OWNER_KEYS = {"issuer", "approval_client_id", "authorize_endpoint", "token_endpo
 PROVISIONED = ("requests.sqlite3", "revoked-clients.json", "token-revocations.sqlite3", "provisioned.json")
 PROJECT_ROOTS_FILE = "read-roots.json"        # optional, owner-private; absent = no project folders readable
 INSTALLER_KEYS = {"issuer", "approval_client_id", "owner", "device", "owner_uid", "state_dir", "socket_path"}
+INSTALLER_OPTIONAL = {"passkey_rp_id", "passkey_origin"}     # both or neither; absent = passkeys not enabled
 
 
 class ConfigError(ValueError):
     pass
 
 
-def read_private_json(path, keys):
+def read_private_json(path, keys, optional=frozenset()):
     """A config file the owner (or root) wrote: regular file, ours, not group/world readable, exact keys."""
     path = Path(path)
     try:
@@ -65,7 +66,7 @@ def read_private_json(path, keys):
             raise ConfigError("config_not_valid_json") from None
     finally:
         os.close(fd)
-    if type(data) is not dict or set(data) != keys:
+    if type(data) is not dict or not (keys <= set(data) <= keys | optional):
         raise ConfigError("config_has_unexpected_or_missing_fields")
     return data
 
@@ -334,10 +335,12 @@ class InstallerConfig:
     owner_uid: int
     state_dir: Path
     socket_path: Path
+    passkey_rp_id: str = None
+    passkey_origin: str = None
 
     @classmethod
     def from_file(cls, path):
-        return cls.from_dict(read_private_json(path, INSTALLER_KEYS))
+        return cls.from_dict(read_private_json(path, INSTALLER_KEYS, INSTALLER_OPTIONAL))
 
     @classmethod
     def from_dict(cls, data):
@@ -351,8 +354,17 @@ class InstallerConfig:
         uid = data["owner_uid"]
         if type(uid) is not int or isinstance(uid, bool) or uid < 1000:
             raise ConfigError("owner_uid_must_be_a_normal_user")
+        rp_id, origin = data.get("passkey_rp_id"), data.get("passkey_origin")
+        if (rp_id is None) != (origin is None):
+            raise ConfigError("passkey_rp_id_and_origin_go_together")
+        if rp_id is not None:
+            from .broker.passkeys import PasskeyStore
+            try:
+                PasskeyStore.check_identity(rp_id, origin)
+            except ValueError:
+                raise ConfigError("passkey_identity_invalid") from None
         return cls(data["issuer"], data["approval_client_id"], data["owner"], data["device"], uid,
-                   _abs(data["state_dir"], "state_dir"), _abs(data["socket_path"], "socket_path"))
+                   _abs(data["state_dir"], "state_dir"), _abs(data["socket_path"], "socket_path"), rp_id, origin)
 
 
 def fetch_jwks(issuer, fetch=None):
@@ -388,6 +400,11 @@ def build_installer(config, *, jwks, jwks_loader=None, run_command=apt.real_run,
         home = pwd.getpwuid(config.owner_uid).pw_dir
         executor_options["jobs"] = JobRunner(config.state_dir, owner_uid=config.owner_uid, home=home, run=run_command,
                                              projects_dir=os.path.join(home, "StyNpilot-Projects"), version=__version__)
+    if config.passkey_rp_id is not None and "passkeys" not in executor_options:
+        from .broker.passkeys import PasskeyStore
+        config.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        executor_options["passkeys"] = PasskeyStore(config.state_dir / "passkeys.sqlite3", rp_id=config.passkey_rp_id,
+                                                    origin=config.passkey_origin)
     executor = Executor(state_dir=config.state_dir, owner=config.owner, device=config.device, verifier=verifier,
                         run=run_command, require_root=require_root, **executor_options)
     return BrokerService(socket_path=config.socket_path, executor=executor, allowed_uid=config.owner_uid)

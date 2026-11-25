@@ -18,6 +18,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,7 +26,7 @@ import urllib.request
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import HTMLResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Route
 
 from .approval import ApprovalError, ApprovalFlow
@@ -35,16 +36,68 @@ _RID = re.compile(r"[a-f0-9]{64}\Z")
 MAX_FORM = 4096
 _STYLE = ("body{font-family:system-ui,sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem}"
           "li{margin:.4rem 0}button{font-size:1.1rem;padding:.7rem 1.4rem;margin:.5rem .5rem .5rem 0}"
-          ".deny{background:#eee}code{background:#f3f3f3;padding:0 .3rem}")
+          ".deny{background:#eee}.primary{background:#0a5;color:#fff;border:0;border-radius:.4rem;font-size:1.3rem;padding:1rem 1.6rem}code{background:#f3f3f3;padding:0 .3rem}")
 
 
-def _page(title, body, status=200, extra_origin=""):
+_PASSKEY_JS = r"""
+const box=document.getElementById('pk');const o=JSON.parse(box.dataset.o);const msg=document.getElementById('msg');
+const u2b=s=>{s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';const r=atob(s);const b=new Uint8Array(r.length);for(let i=0;i<r.length;i++)b[i]=r.charCodeAt(i);return b};
+const b2u=a=>{a=new Uint8Array(a);let t='';for(const x of a)t+=String.fromCharCode(x);return btoa(t).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')};
+const buttons=[...document.querySelectorAll('button[data-d]')];
+function note(t){msg.textContent=t}
+async function go(d){
+  if(!window.PublicKeyCredential){note('This browser cannot use passkeys. Use the Auth0 sign-in below.');return}
+  buttons.forEach(b=>b.disabled=true);note('Waiting for your fingerprint or screen lock...');
+  try{
+    const c=await navigator.credentials.get({publicKey:{challenge:u2b(o.challenge[d]),rpId:o.rp_id,timeout:120000,userVerification:'required',
+      allowCredentials:o.credentials.map(id=>({type:'public-key',id:u2b(id)}))}});
+    const r=c.response;
+    const a={credential_id:b2u(c.rawId),client_data_json:b2u(r.clientDataJSON),authenticator_data:b2u(r.authenticatorData),signature:b2u(r.signature)};
+    note('Checking...');
+    const reply=await fetch('/approve/passkey',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({view:o.view,csrf:o.csrf,decision:d,assertion:JSON.stringify(a)})});
+    const j=await reply.json();
+    if(j.ok){location.href=j.next;return}
+    note(j.message||'Refused.');if(j.next){location.href=j.next;return}
+  }catch(e){note('Cancelled or not completed. Nothing was changed. You can try again.')}
+  buttons.forEach(b=>b.disabled=false);
+}
+buttons.forEach(b=>b.addEventListener('click',()=>go(b.dataset.d)));
+"""
+
+_ENROLL_JS = r"""
+const box=document.getElementById('pk');const o=JSON.parse(box.dataset.o);const msg=document.getElementById('msg');
+const u2b=s=>{s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';const r=atob(s);const b=new Uint8Array(r.length);for(let i=0;i<r.length;i++)b[i]=r.charCodeAt(i);return b};
+const b2u=a=>{a=new Uint8Array(a);let t='';for(const x of a)t+=String.fromCharCode(x);return btoa(t).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')};
+const btn=document.getElementById('make');
+btn.addEventListener('click',async()=>{
+  if(!window.PublicKeyCredential){msg.textContent='This browser cannot create passkeys.';return}
+  btn.disabled=true;msg.textContent='Waiting for your fingerprint or screen lock...';
+  try{
+    const c=await navigator.credentials.create({publicKey:{challenge:u2b(o.challenge),rp:{id:o.rp_id,name:'StyNpilot'},
+      user:{id:u2b(o.user_id),name:'owner',displayName:'StyNpilot owner'},pubKeyCredParams:[{type:'public-key',alg:-7}],
+      authenticatorSelection:{residentKey:'preferred',userVerification:'required'},attestation:'none',timeout:120000,
+      excludeCredentials:o.exclude.map(id=>({type:'public-key',id:u2b(id)}))}});
+    const r=c.response;
+    const reply=await fetch('/approve/enroll/finish',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({view:o.view,csrf:o.csrf,response:{client_data_json:b2u(r.clientDataJSON),attestation_object:b2u(r.attestationObject)}})});
+    const j=await reply.json();
+    msg.textContent=j.message||'Done.';
+    if(j.ok){return}
+  }catch(e){msg.textContent='Cancelled or not completed. You can try again until the time runs out.'}
+  btn.disabled=false;
+});
+"""
+
+
+def _page(title, body, status=200, extra_origin="", nonce=None):
     text = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
             "<title>%s</title><style>%s</style>%s" % (html.escape(title), _STYLE, body))
     response = HTMLResponse(text, status_code=status)
     response.headers["Cache-Control"] = "no-store"
-    response.headers["Content-Security-Policy"] = ("default-src 'none'; style-src 'unsafe-inline'; "
-                                                   "form-action 'self' %s; frame-ancestors 'none'" % extra_origin)
+    script = "script-src 'nonce-%s'; connect-src 'self'; " % nonce if nonce else ""
+    response.headers["Content-Security-Policy"] = ("default-src 'none'; style-src 'unsafe-inline'; %sbase-uri 'none'; "
+                                                   "form-action 'self' %s; frame-ancestors 'none'" % (script, extra_origin))
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -60,6 +113,16 @@ _MESSAGES = {
     "unknown_or_used_state": "This sign-in link was already used or is not valid here. Nothing was changed.",
     "sign_in_failed": "The sign-in could not be completed. Nothing was changed; the request is still waiting.",
     "summary_altered_in_transit": "The summary did not match what the installer produced, so it is not shown.",
+    "too_many_tries_open_the_request_again": "Too many tries on this page. Open the request again.",
+}
+_PASSKEY_REFUSALS = {
+    "passkey_user_verification_required": "Your phone did not confirm it was you (fingerprint or screen lock). Try again.",
+    "passkey_unknown_or_revoked": "That passkey is not enrolled here, or was removed.",
+    "passkey_wrong_origin": "That passkey was used on a different address. Use the approval address.",
+    "passkey_signature_invalid": "The passkey's signature did not check out. Nothing was changed.",
+    "passkey_wrong_challenge": "This approval is for a different request. Open the request again.",
+    "already_used": "This approval was already used. Open the request again.",
+    "challenge_expired": "This approval page expired. Open the request again.",
 }
 
 
@@ -69,6 +132,13 @@ def _message(error):
     if code in _MESSAGES:
         return _MESSAGES[code], True
     return "The request could not be completed (%s). Check its status before trying again." % html.escape(code[:60]), False
+
+
+def _user_handle():
+    """A fixed, non-secret account handle: one owner, so a new passkey replaces rather than duplicates on the phone."""
+    import base64
+    import hashlib
+    return base64.urlsafe_b64encode(hashlib.sha256(b"stynpilot-owner").digest()[:16]).rstrip(b"=").decode("ascii")
 
 
 def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
@@ -104,15 +174,31 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
             return _page("Not found", "<p>Not found.</p>", 404)
         view = await run_in_threadpool(flow.page, rid)
         lines = "".join("<li>%s</li>" % html.escape(line) for line in view["summary"])
-        body = ("<h1>Approve or deny</h1><p>This text was written by the installer on your computer, not by an "
-                "assistant. Request fingerprint: <code>%s</code></p><ul>%s</ul>"
-                "<form method=post action=/approve/choose>"
-                "<input type=hidden name=view value='%s'><input type=hidden name=csrf value='%s'>"
-                "<button name=decision value=approve>Approve</button>"
-                "<button class=deny name=decision value=deny>Deny</button></form>"
-                "<p>Either choice asks you to sign in again to confirm. Nothing happens until you do.</p>"
-                % (html.escape(view["fingerprint"]), lines, html.escape(view["view"]), html.escape(view["csrf"])))
-        response = _page("Approve or deny", body, 200, authorize_origin)
+        intro = ("<h1>Approve or deny</h1><p>This text was written by the installer on your computer, not by an "
+                 "assistant. Request fingerprint: <code>%s</code></p><ul>%s</ul>" % (html.escape(view["fingerprint"]), lines))
+        auth0 = ("<form method=post action=/approve/choose>"
+                 "<input type=hidden name=view value='%s'><input type=hidden name=csrf value='%s'>"
+                 "<button name=decision value=approve>Approve</button>"
+                 "<button class=deny name=decision value=deny>Deny</button></form>"
+                 "<p>Either choice asks you to sign in again to confirm. Nothing happens until you do.</p>"
+                 % (html.escape(view["view"]), html.escape(view["csrf"])))
+        nonce = None
+        passkey = view.get("passkey")
+        if passkey:
+            nonce = secrets.token_urlsafe(18)
+            options = dict(passkey, view=view["view"], csrf=view["csrf"])
+            warning = ("<p><b>Note:</b> at least one enrolled passkey is synced through your Google account, so anyone who can "
+                       "sign in to that account could use it. Add a device-only passkey when you can.</p>"
+                       if passkey["synced"] else "")
+            body = (intro + "<div id=pk data-o='%s'></div>"
+                    "<button class=primary data-d=approve>Approve with fingerprint or PIN</button>"
+                    "<button class=deny data-d=deny>Deny</button><p id=msg role=status></p>%s"
+                    "<details><summary>Use the Auth0 sign-in instead</summary>%s</details>"
+                    "<script nonce='%s'>%s</script>"
+                    % (html.escape(json.dumps(options, sort_keys=True), quote=True), warning, auth0, nonce, _PASSKEY_JS))
+        else:
+            body = intro + auth0
+        response = _page("Approve or deny", body, 200, authorize_origin, nonce=nonce)
         response.set_cookie(COOKIE, view["view"], max_age=view["expires_in"], httponly=True, secure=secure_cookie,
                             samesite="lax", path="/approve")
         return response
@@ -131,6 +217,91 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         started = await run_in_threadpool(flow.choose, view, form.get("csrf"), form.get("decision"))
         return RedirectResponse(started["url"] + "?" + urllib.parse.urlencode(started["params"]), status_code=303)
 
+    def json_ok(origin):
+        return origin == allowed_origin
+
+    async def read_json(request):
+        if not json_ok(request.headers.get("origin")) or "application/json" not in request.headers.get("content-type", ""):
+            return None
+        raw = await request.body()
+        if len(raw) > 16384:
+            return None
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def refused(error):
+        code = error.code
+        if code in _PASSKEY_REFUSALS:
+            text = _PASSKEY_REFUSALS[code]
+        elif code.startswith("passkey_refused_"):
+            text = _PASSKEY_REFUSALS.get(code[len("passkey_refused_"):], "The passkey was not accepted (%s). Nothing was changed." % code[16:60])
+        elif code in _MESSAGES:
+            text = _MESSAGES[code]
+        else:
+            text = "Not completed (%s). Nothing was changed unless the status page says so." % code[:60]
+        return JSONResponse({"ok": False, "message": text}, status_code=400, headers={"Cache-Control": "no-store"})
+
+    async def passkey(request):
+        data = await read_json(request)
+        view = None if data is None else data.get("view")
+        if data is None or request.cookies.get(COOKIE) != view or not view:
+            return JSONResponse({"ok": False, "message": _MESSAGES["page_expired"]}, status_code=403)
+        try:
+            outcome = await run_in_threadpool(flow.passkey_decide, view, data.get("csrf"), data.get("decision"),
+                                              data.get("assertion"))
+        except ApprovalError as error:
+            return refused(error)
+        except Exception:
+            return JSONResponse({"ok": False, "message": "Something unexpected happened. Check the request's status page "
+                                 "before trying again."}, status_code=500)
+        response = JSONResponse({"ok": True, "state": outcome["state"], "next": "/approve/status/" + outcome["request_id"]},
+                                headers={"Cache-Control": "no-store"})
+        try:
+            keep = flow.status(outcome["request_id"]).get("kind") == "passkey"       # the enrollment page needs this browser session
+        except Exception:
+            keep = False
+        if not keep:
+            response.delete_cookie(COOKIE, path="/approve")
+        return response
+
+    async def enroll(request):
+        rid = request.path_params["rid"]
+        if not _RID.fullmatch(rid):
+            return _page("Not found", "<p>Not found.</p>", 404)
+        info = await run_in_threadpool(flow.enroll_page, rid, request.cookies.get(COOKIE, ""))
+        nonce = secrets.token_urlsafe(18)
+        options = dict(info, user_id=_user_handle())
+        body = ("<h1>Create your passkey</h1><p>Name: <b>%s</b>. Tap the button, then use your fingerprint or screen lock. "
+                "This must be done within a few minutes.</p><div id=pk data-o='%s'></div>"
+                "<button class=primary id=make>Create passkey</button><p id=msg role=status></p>"
+                "<script nonce='%s'>%s</script>"
+                % (html.escape(info["label"]), html.escape(json.dumps(options, sort_keys=True), quote=True), nonce, _ENROLL_JS))
+        response = _page("Create passkey", body, 200, authorize_origin, nonce=nonce)
+        response.set_cookie(COOKIE, info["view"], max_age=info["expires_in"], httponly=True, secure=secure_cookie,
+                            samesite="lax", path="/approve")
+        return response
+
+    async def enroll_finish(request):
+        data = await read_json(request)
+        view = None if data is None else data.get("view")
+        if data is None or request.cookies.get(COOKIE) != view or not view:
+            return JSONResponse({"ok": False, "message": _MESSAGES["page_expired"]}, status_code=403)
+        try:
+            done = await run_in_threadpool(flow.enroll_finish, view, data.get("csrf"), data.get("response"))
+        except ApprovalError as error:
+            return refused(error)
+        except Exception:
+            return JSONResponse({"ok": False, "message": "Something unexpected happened. Check the passkey list before trying again."},
+                                status_code=500)
+        text = "Passkey added: %s (%s)." % (done["label"], "synced through your Google account" if done["synced"]
+                                              else "stays on this device")
+        response = JSONResponse({"ok": True, "message": text}, headers={"Cache-Control": "no-store"})
+        response.delete_cookie(COOKIE, path="/approve")
+        return response
+
     async def callback(request):
         if request.query_params.get("error"):
             return _page("Cancelled", "<h1>Cancelled</h1><p>The sign-in was cancelled. Nothing was changed; "
@@ -139,6 +310,8 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         if not state or not code:
             raise ApprovalError("unknown_or_used_state")
         outcome = await run_in_threadpool(flow.finish, state, code, request.cookies.get(COOKIE, ""))
+        if outcome["state"] in ("running", "done") and (flow.status(outcome["request_id"]).get("kind") == "passkey"):
+            return RedirectResponse("/approve/status/" + outcome["request_id"], status_code=303)      # cookie kept for enrollment
         if outcome["state"] == "running":              # long install: answer now, show progress on the status page
             redirect = RedirectResponse("/approve/status/" + outcome["request_id"], status_code=303)
             redirect.delete_cookie(COOKIE, path="/approve")
@@ -175,6 +348,10 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         result = record.get("result") or {}
         if result.get("stopped"):
             extra += "<p>Reason: <code>%s</code></p>" % html.escape(str(result["stopped"])[:80])
+        if record.get("kind") == "passkey" and state == "done" and result.get("enrollment_open"):
+            extra += "<p><a href='/approve/enroll/%s'>Create the passkey now</a> (fingerprint or screen lock).</p>" % html.escape(rid)
+        if result.get("kid"):
+            extra += "<p>Passkey short ID: <code>%s</code></p>" % html.escape(str(result["kid"]))
         if result.get("limits"):
             extra += "<p>%s</p>" % html.escape(str(result["limits"]))
         if result.get("to_version"):
@@ -191,6 +368,9 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
                                                           html.escape(_STATUS_TEXT.get(state, state)), extra))
 
     return Starlette(routes=[Route("/approve/choose", wrap(choose), methods=["POST"]),
+                             Route("/approve/passkey", wrap(passkey, may_have_acted=True), methods=["POST"]),
+                             Route("/approve/enroll/finish", wrap(enroll_finish), methods=["POST"]),
+                             Route("/approve/enroll/{rid}", wrap(enroll), methods=["GET"]),
                              Route("/approve/callback", wrap(callback, may_have_acted=True), methods=["GET"]),
                              Route("/approve/status/{rid}", wrap(status), methods=["GET"]),
                              Route("/approve/{rid}", wrap(show), methods=["GET"])])

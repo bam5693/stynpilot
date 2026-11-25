@@ -783,20 +783,35 @@ class InstallerConfigTests(unittest.TestCase):
                 with self.assertRaises(ConfigError):
                     InstallerConfig.from_dict(dict(self.BASE, **bad))
 
-    def test_the_config_file_reader_accepts_only_the_known_optional_keys(self):
+    def test_passkey_settings_live_in_their_own_file_so_installer_json_keeps_dev14s_exact_shape(self):
         import tempfile
         from pathlib import Path
-        from stynpilot.service import INSTALLER_KEYS, INSTALLER_OPTIONAL, ConfigError, read_private_json
+        from stynpilot.service import INSTALLER_KEYS, PASSKEY_KEYS, ConfigError, InstallerConfig, read_private_json
         with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "c.json"
-            for extra, ok in (({"passkey_rp_id": RP, "passkey_origin": ORIGIN}, True), ({}, True), ({"surprise": 1}, False)):
-                path.write_text(json.dumps(dict(self.BASE, **extra)))
+            main, side = Path(folder) / "installer.json", Path(folder) / "passkeys.json"
+
+            def put(path, data):
+                if path.exists():
+                    path.unlink()
+                path.write_text(json.dumps(data))
                 os.chmod(path, 0o600)
-                if ok:
-                    self.assertEqual(set(read_private_json(path, INSTALLER_KEYS, INSTALLER_OPTIONAL)), set(self.BASE) | set(extra))
-                else:
-                    with self.assertRaises(ConfigError):
-                        read_private_json(path, INSTALLER_KEYS, INSTALLER_OPTIONAL)
+            put(main, self.BASE)
+            self.assertIsNone(InstallerConfig.from_file(main).passkey_rp_id)               # dev14-shaped file alone: passkeys off
+            put(side, {"passkey_rp_id": RP, "passkey_origin": ORIGIN})
+            got = InstallerConfig.from_file(main)
+            self.assertEqual((got.passkey_rp_id, got.passkey_origin), (RP, ORIGIN))
+            put(main, dict(self.BASE, passkey_rp_id=RP, passkey_origin=ORIGIN))            # the main file must NEVER carry them
+            with self.assertRaises(ConfigError):
+                read_private_json(main, INSTALLER_KEYS)
+            with self.assertRaises(ConfigError):
+                InstallerConfig.from_file(main)
+            put(main, self.BASE)
+            for bad in ({"passkey_rp_id": RP}, {"passkey_rp_id": RP, "passkey_origin": ORIGIN, "x": 1}):
+                put(side, bad)
+                with self.assertRaises(ConfigError):
+                    InstallerConfig.from_file(main)
+            self.assertEqual(set(INSTALLER_KEYS), {"issuer", "approval_client_id", "owner", "device", "owner_uid", "state_dir", "socket_path"})
+            self.assertEqual(set(PASSKEY_KEYS), {"passkey_rp_id", "passkey_origin"})
 
     def test_building_the_installer_creates_a_persistent_private_passkey_store(self):
         import tempfile

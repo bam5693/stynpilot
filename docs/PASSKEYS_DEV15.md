@@ -68,3 +68,19 @@ so a compromised service cannot get its own key activated. The Auth0-approved re
 passkey is marked quarantined and cannot approve anything until `--action confirm-restored --kid <ID>` is run at the console with the
 same fingerprint check. A key revoked after the backup was taken therefore cannot silently return, and a key revoked before the
 backup stays revoked. Restore is written to the hash-chained audit log. A corrupt passkey database makes the backup fail loudly.
+
+## Review round 3 corrections
+
+**Restore is quarantined before it exists.** `restore_backup` now quarantines the passkey database image in memory, before anything is
+written (and before the restore lock matters): the file only ever appears on disk already quarantined. If quarantining fails nothing is
+written, not even the folder. A crash mid-write leaves a folder that cannot be reused as a restore target, and any passkey file in it is
+already quarantined. Tests: image checked at write time, failed quarantine, simulated power cut, real credential lookup (original
+works, restored copy cannot approve until console re-confirmation).
+
+**Rollback to dev14.** dev14's installer config parser accepts exactly seven keys. In dev15 `installer.json` keeps exactly those
+seven; the passkey identity lives in a separate private `passkeys.json` beside it (`passkey_rp_id`, `passkey_origin`), which dev14
+never reads, and putting passkey fields in `installer.json` is refused. Drill (dev14 source at 9e17379 against a passkey-enabled
+dev15 layout): dev14 parses the unchanged `installer.json`, opens runs/installs ledgers, makes and restores its own root backup (it
+simply does not include `passkeys.sqlite3`). One honest limit: dev14 cannot restore a dev15 backup that contains `passkeys.sqlite3`
+(it rejects unknown members); rollback means running dev14 on the existing state, not restoring a dev15 archive. Rolling back to dev14
+turns passkey approvals off; Auth0 approval keeps working. Enable passkeys by creating `/etc/stynpilot/passkeys.json` (root, 0600).

@@ -70,6 +70,24 @@ def quarantine_after_restore(path, *, clock=time.time):
     return count
 
 
+def quarantine_bytes(data, *, clock=time.time):
+    """Quarantine a passkey database IMAGE before it is ever written where the installer could open it. Returns (bytes, count)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        scratch = os.path.join(tmp, "p.sqlite3")
+        with open(scratch, "wb") as handle:
+            handle.write(data)
+        count = quarantine_after_restore(scratch, clock=clock)
+        db = sqlite3.connect(scratch)
+        try:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            db.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            db.close()
+        with open(scratch, "rb") as handle:
+            return handle.read(), count
+
+
 class PasskeyError(Exception):
     def __init__(self, code):
         super().__init__(code)

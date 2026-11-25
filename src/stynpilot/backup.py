@@ -259,6 +259,15 @@ def restore_backup(archive, state_dir, *, kind="owner"):
     """Into an EMPTY private folder only. Everything is verified first; nothing existing is overwritten.
     A root restore also needs the installer stopped and idle (statelock), enforced here."""
     manifest, files = read_backup(archive, expected_kind=kind)
+    if kind == "root" and "passkeys.sqlite3" in files:
+        # Quarantine the passkey database IMAGE before anything is written: the file only ever appears on disk already quarantined,
+        # so there is no moment (not even after a crash or an early unlock) when a restored passkey could approve anything.
+        from .broker import passkeys as _passkeys
+        try:
+            files["passkeys.sqlite3"], count = _passkeys.quarantine_bytes(files["passkeys.sqlite3"])
+        except Exception:
+            raise BackupError("passkey_database_could_not_be_quarantined_nothing_was_restored") from None
+        manifest["passkeys_quarantined"] = count
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     _check_dir(state_dir)
@@ -269,9 +278,6 @@ def restore_backup(archive, state_dir, *, kind="owner"):
         except statelock.Busy as busy:
             raise BackupError(busy.code) from None
         (state_dir / "downloads").mkdir(mode=0o700, exist_ok=True)
-        if "passkeys.sqlite3" in files:                    # a restore can never silently bring back approval power
-            from .broker import passkeys as _passkeys
-            manifest["passkeys_quarantined"] = _passkeys.quarantine_after_restore(state_dir / "passkeys.sqlite3")
     else:
         _write_all(state_dir, files, ignore=())
     return manifest

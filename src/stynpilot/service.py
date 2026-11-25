@@ -40,7 +40,9 @@ OWNER_KEYS = {"issuer", "approval_client_id", "authorize_endpoint", "token_endpo
 PROVISIONED = ("requests.sqlite3", "revoked-clients.json", "token-revocations.sqlite3", "provisioned.json")
 PROJECT_ROOTS_FILE = "read-roots.json"        # optional, owner-private; absent = no project folders readable
 INSTALLER_KEYS = {"issuer", "approval_client_id", "owner", "device", "owner_uid", "state_dir", "socket_path"}
-INSTALLER_OPTIONAL = {"passkey_rp_id", "passkey_origin"}     # both or neither; absent = passkeys not enabled
+PASSKEY_KEYS = {"passkey_rp_id", "passkey_origin"}
+PASSKEY_SETTINGS_NAME = "passkeys.json"      # beside installer.json; installer.json itself keeps exactly dev14's keys, so rolling back
+                                             # to dev14 never meets a field it rejects (dev14 simply never reads this file)
 
 
 class ConfigError(ValueError):
@@ -340,7 +342,11 @@ class InstallerConfig:
 
     @classmethod
     def from_file(cls, path):
-        return cls.from_dict(read_private_json(path, INSTALLER_KEYS, INSTALLER_OPTIONAL))
+        data = dict(read_private_json(path, INSTALLER_KEYS))
+        sibling = Path(path).with_name(PASSKEY_SETTINGS_NAME)
+        if os.path.lexists(sibling):
+            data.update(read_private_json(sibling, PASSKEY_KEYS))
+        return cls.from_dict(data)
 
     @classmethod
     def from_dict(cls, data):

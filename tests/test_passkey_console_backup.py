@@ -90,6 +90,80 @@ class PasskeyBackup(unittest.TestCase):
         self.store.activate(key["kid"], key["label"], key["pub"], "console", "console")
         return key
 
+    @staticmethod
+    def credential_id(store, kid):
+        import sqlite3
+        db = sqlite3.connect(str(store.path))
+        try:
+            return db.execute("SELECT credential_id FROM passkeys WHERE kid=?", (kid,)).fetchone()[0]
+        finally:
+            db.close()
+
+    def test_the_database_only_ever_appears_on_disk_already_quarantined(self):
+        key = self.add_active("Pixel")
+        archive = self.tmp / "q.tar"
+        backup.make_backup(self.state, archive, kind="root")
+        seen = []
+        real = backup._write_all
+
+        def spy(state_dir, files, ignore):
+            import sqlite3
+            import tempfile
+            with tempfile.TemporaryDirectory() as t:
+                image = Path(t) / "i.sqlite3"
+                image.write_bytes(files["passkeys.sqlite3"])
+                db = sqlite3.connect(str(image))
+                seen.append(db.execute("SELECT quarantined FROM passkeys WHERE kid=?", (key["kid"],)).fetchone()[0])
+                db.close()
+            return real(state_dir, files, ignore)
+        backup._write_all = spy
+        try:
+            backup.restore_backup(archive, self.tmp / "rs", kind="root")
+        finally:
+            backup._write_all = real
+        self.assertEqual(seen, [1])
+
+    def test_an_interrupted_restore_never_leaves_an_unquarantined_passkey_database(self):
+        key = self.add_active("Pixel")
+        archive = self.tmp / "i.tar"
+        backup.make_backup(self.state, archive, kind="root")
+        # (a) quarantining fails: nothing at all is written
+        from stynpilot.broker import passkeys as pk
+        real = pk.quarantine_bytes
+
+        def boom(*_a, **_k):
+            raise RuntimeError("disk full")
+        pk.quarantine_bytes = boom
+        try:
+            with self.assertRaises(backup.BackupError) as refused:
+                backup.restore_backup(archive, self.tmp / "ra", kind="root")
+        finally:
+            pk.quarantine_bytes = real
+        self.assertIn("nothing_was_restored", str(refused.exception))
+        self.assertFalse((self.tmp / "ra").exists())                    # not even the folder was created
+        # (b) the process dies part-way through writing: whatever passkey file exists is already quarantined
+        real_fsync, calls = os.fsync, []
+
+        def dying(fd):
+            calls.append(fd)
+            if len(calls) == 3:
+                raise OSError("power cut")
+            return real_fsync(fd)
+        os.fsync = dying
+        try:
+            with self.assertRaises(OSError):
+                backup.restore_backup(archive, self.tmp / "rb", kind="root")
+        finally:
+            os.fsync = real_fsync
+        left = self.tmp / "rb" / "passkeys.sqlite3"
+        if left.exists() and left.stat().st_size:
+            half = PasskeyStore(left, rp_id=RP, origin=ORIGIN)
+            self.assertEqual(half.active(), [])
+        # and the half-written folder cannot be reused as a restore target
+        with self.assertRaises(backup.BackupError) as again:
+            backup.restore_backup(archive, self.tmp / "rb", kind="root")
+        self.assertIn("not_empty", str(again.exception))
+
     def restore(self):
         archive = self.tmp / ("b%d.tar" % len(list(self.tmp.glob("b*.tar"))))
         manifest = backup.make_backup(self.state, archive, kind="root")
@@ -113,7 +187,11 @@ class PasskeyBackup(unittest.TestCase):
         _, restored = self.restore()
         self.assertEqual(restored.active(), [])
         self.assertEqual([k["kid"] for k in restored.quarantined()], [key["kid"]])
-        self.assertIsNone(restored.lookup(bytes.fromhex(key["kid"])) if False else None)
+        cred = self.credential_id(self.store, key["kid"])
+        self.assertIsNotNone(self.store.lookup(cred))                         # the original still works...
+        self.assertIsNone(restored.lookup(cred))                              # ...the restored copy cannot approve anything
+        passkey_console.confirm_restored(restored, key["kid"], input_fn=lambda _p: key["pub"][:8], is_tty=True, out=lambda _l: None)
+        self.assertEqual(restored.lookup(cred)["kid"], key["kid"])            # until the owner re-confirms it at the console
         self.assertFalse(restored.retirement_ready())
         self.assertTrue(restored.audit_ok())
 

@@ -39,6 +39,28 @@ _STYLE = ("body{font-family:system-ui,sans-serif;max-width:40rem;margin:2rem aut
           ".deny{background:#eee}.primary{background:#0a5;color:#fff;border:0;border-radius:.4rem;font-size:1.3rem;padding:1rem 1.6rem}code{background:#f3f3f3;padding:0 .3rem}")
 
 
+RETURN_HOSTS = frozenset({"chatgpt.com", "www.chatgpt.com", "claude.ai"})
+
+
+def safe_return(url):
+    """A place the browser may go back to after a decision: https on an exact allow-listed chat host, nothing else (no other host,
+    no credentials, port, backslash, control character or oversized text). Returns the URL or "" - never raises. Going there is a
+    plain navigation: it carries no secret and approves nothing."""
+    if type(url) is not str or not url or len(url) > 2048:
+        return ""
+    if any(ord(c) < 0x21 or ord(c) > 0x7e for c in url) or "\\" in url or "@" in url.split("?", 1)[0].split("#", 1)[0]:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return ""
+    if (parts.scheme != "https" or host not in RETURN_HOSTS or port is not None or parts.netloc != host
+            or parts.username is not None or not parts.path.startswith("/") or parts.path.startswith("//")):
+        return ""
+    return url
+
+
 _PASSKEY_JS = r"""
 const box=document.getElementById('pk');const o=JSON.parse(box.dataset.o);const msg=document.getElementById('msg');
 const u2b=s=>{s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';const r=atob(s);const b=new Uint8Array(r.length);for(let i=0;i<r.length;i++)b[i]=r.charCodeAt(i);return b};
@@ -58,7 +80,8 @@ async function go(d){
     const reply=await fetch('/approve/passkey',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({view:o.view,csrf:o.csrf,decision:d,assertion:JSON.stringify(a)})});
     const j=await reply.json();
-    if(j.ok){location.href=j.next;return}
+    if(j.ok){if(o.return_url){note('Done. Returning to your chat...');setTimeout(()=>{location.replace(o.return_url)},900)}
+      else{location.href=j.next}return}
     note(j.message||'Refused.');if(j.next){location.href=j.next;return}
   }catch(e){
     if(sent){note('The answer did not arrive, so the result is uncertain. Opening the request status - check it before trying again.');
@@ -67,6 +90,9 @@ async function go(d){
   buttons.forEach(b=>b.disabled=false);
 }
 buttons.forEach(b=>b.addEventListener('click',()=>go(b.dataset.d)));
+// Opt-in (link carries go=1): ask the phone to confirm right away. The summary is already on screen, only APPROVE auto-starts,
+// and cancelling or a refusal just leaves the normal buttons. Opening or previewing the page proves nothing without the fingerprint.
+if(o.autostart&&document.visibilityState==='visible'){setTimeout(()=>{if(!buttons[0].disabled)go('approve')},900)}
 """
 
 _ENROLL_JS = r"""
@@ -187,7 +213,9 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         passkey = view.get("passkey")
         if passkey:
             nonce = secrets.token_urlsafe(18)
-            options = dict(passkey, view=view["view"], csrf=view["csrf"], status_url=view["status_url"])
+            options = dict(passkey, view=view["view"], csrf=view["csrf"], status_url=view["status_url"],
+                           return_url=safe_return(request.query_params.get("redirectUrl")),
+                           autostart=request.query_params.get("go") == "1")
             warning = ("<p><b>Note:</b> at least one enrolled passkey is synced through your Google account, so anyone who can "
                        "sign in to that account could use it. Add a device-only passkey when you can.</p>"
                        if passkey["synced"] else "")

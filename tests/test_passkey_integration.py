@@ -290,6 +290,44 @@ class InstallWithPasskey(unittest.TestCase, Enrolling):
             self.flow.passkey_decide(shown["view"], shown["csrf"], "approve", "{}")
         self.assertEqual(caught.exception.code, "too_many_tries_open_the_request_again")
 
+    # -- external round trip: validated return + opt-in autostart ------------------------------------------
+    def test_safe_return_accepts_only_exact_chat_hosts_over_https(self):
+        from stynpilot.approval_web import safe_return
+        good = ["https://chatgpt.com/c/abc-123", "https://claude.ai/chat/xyz?a=1#f", "https://www.chatgpt.com/"]
+        for url in good:
+            self.assertEqual(safe_return(url), url)
+        bad = ["http://chatgpt.com/c/1", "https://chatgpt.com.evil.example/c/1", "https://evil.example/https://chatgpt.com/",
+               "https://chatgpt.com@evil.example/", "https://evil.example@chatgpt.com/", "https://user:pw@chatgpt.com/",
+               "https://chatgpt.com:8443/c/1", "//chatgpt.com/c/1", "https://chatgpt.com//evil.example", "https://chatgpt.com\\@evil.example/",
+               "javascript:alert(1)", "data:text/html,x", "https://chatgpt.com/\nSet-Cookie:x", "https://chatgpt.com/ x",
+               "https://chatgpt.com", "https://sub.chatgpt.com/c/1", "https://xn--chatgpt.com/c/1", "https://chatgpt.com/" + "a" * 2100,
+               "", None, 5, ["https://chatgpt.com/"], "https://c\u200bhatgpt.com/c/1", "ftp://chatgpt.com/c/1"]
+        for url in bad:
+            self.assertEqual(safe_return(url), "", url)
+
+    def test_page_carries_a_valid_return_and_autostart_only_when_asked(self):
+        payload, rid = self.file()
+        import html as _html
+        import re
+        def opts(query):
+            reply = self.client.get("/approve/" + rid + query)
+            self.assertEqual(reply.status_code, 200)
+            return json.loads(_html.unescape(re.search(r"id=pk data-o='([^']*)'", reply.text).group(1)))
+        plain = opts("")
+        self.assertEqual((plain["return_url"], plain["autostart"]), ("", False))
+        both = opts("?go=1&redirectUrl=" + urllib.parse.quote("https://chatgpt.com/c/abc", safe=""))
+        self.assertEqual((both["return_url"], both["autostart"]), ("https://chatgpt.com/c/abc", True))
+        evil = opts("?go=1&redirectUrl=" + urllib.parse.quote("https://evil.example/c/abc", safe=""))
+        self.assertEqual(evil["return_url"], "")
+        self.assertEqual(opts("?go=0")["autostart"], False)
+
+    def test_opening_or_previewing_the_page_never_decides_anything(self):
+        payload, rid = self.file()
+        for query in ("", "?go=1", "?go=1&redirectUrl=https%3A%2F%2Fchatgpt.com%2Fc%2F1"):
+            for _ in range(3):
+                self.client.get("/approve/" + rid + query)
+        self.assertEqual(self.flow.status(rid)["state"], "pending")
+
     # -- the one-tap page ----------------------------------------------------------------------------------
     def open(self, rid):
         reply = self.client.get("/approve/" + rid)

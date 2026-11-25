@@ -40,3 +40,18 @@ installer must not trust that path. So it can never authorize YELLOW.
 ## Plan
 No dev16 dependency. Probe (item 3) is a small separate GREEN task after the release publisher; revisit when the OpenAI help page is
 readable and Claude's connector docs describe elicitation/UI permissions.
+
+## Experiment: external approval round trip (ships with dev16, not dev15)
+Link shape: `https://<approval host>/approve/<rid>?go=1&redirectUrl=<chat url>` (ChatGPT's `openExternal` appends `redirectUrl` itself for
+allow-listed domains; the assistant can add `go=1`).
+- `go=1`: after the exact summary is on screen, the page asks the phone for fingerprint/PIN after ~1 s. Only APPROVE auto-starts; Deny
+  stays a button; cancel/failure leaves the normal buttons. Without `go=1` the dev15 page behaves exactly as before (fallback).
+- `redirectUrl`: after the installer accepts the proof the page says "Returning to your chat" and navigates there (~1 s). Only `https` on
+  exactly chatgpt.com, www.chatgpt.com or claude.ai, no credentials/port/backslash/control characters (`safe_return`, tested against
+  look-alike hosts, userinfo tricks, `//` paths, encodings, oversized input). Anything else is ignored and the status page shows.
+- Opening or previewing the link changes nothing (tested); the proof is still the WebAuthn assertion bound to the exact request,
+  verified by the root installer. The return is a plain navigation carrying no secret.
+- Auth0 fallback path unchanged. Browsers cannot close a tab they did not open, so "return" = navigate back, not close.
+Android test (owner device): tap link from chat -> expect fingerprint prompt ~1 s later -> expect landing back in the chat. Record:
+whether a link-safety dialog appears, whether the prompt auto-starts, whether Chrome reuses the chat tab or opens a new one.
+Not built here: an Apps-SDK card with an in-chat Approve button (needs an OpenAI-registered app and `redirect_domains` approval).

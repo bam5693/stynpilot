@@ -5,7 +5,7 @@ the system name resolver. Dev17 adds exactly one read-only file, /run/systemd/re
 (git fetch, wheel download) and records the failing step, exit code and output tail in the build record. Builds and tests stay
 fully offline. Everything below applies to the first run that the Ryzen does by itself, now dev18.)
 
-Dev18 is deliberately harmless: the only change from dev18 is the version number and this note. Its purpose is to prove, live on the
+Dev18 is deliberately harmless: the only change from dev17 is the version number and this note. Its purpose is to prove, live on the
 Ryzen, the whole path that dev16 built: build in the sandbox, review, ONE fingerprint approval, sign, publish, install, health check.
 
 Nothing about dev18 is built, signed, staged or published by hand. The Ryzen does all of it.

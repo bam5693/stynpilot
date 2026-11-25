@@ -17,13 +17,14 @@ from mcp.types import ToolAnnotations
 
 from .. import safefs
 from ..diagnostics import Diagnostics, DiagnosticsError
+from ..system_status import SystemStatus
 from .router import AccessDenied
 
 _LOG = logging.getLogger("stynpilot.audit")
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 NOT_AUTHORIZED = {"ok": False, "error": "device_unavailable_or_not_authorized"}
 CALLS_PER_MINUTE = 60
-DIAG_TOOLS = ("computer_diagnostics", "computer_logs", "files_list", "files_stat", "files_read", "files_search")
+DIAG_TOOLS = ("computer_diagnostics", "computer_system_status", "computer_logs", "files_list", "files_stat", "files_read", "files_search")
 
 
 class RateLimit:
@@ -46,8 +47,9 @@ class RateLimit:
             return True
 
 
-def register(server, *, router, bearer, policy, diagnostics=None, limiter=None):
+def register(server, *, router, bearer, policy, diagnostics=None, limiter=None, system=None):
     diagnostics = diagnostics or Diagnostics()
+    system = system or SystemStatus()
     limiter = limiter or RateLimit()
 
     def guarded(tool, device_id, work):
@@ -83,6 +85,14 @@ def register(server, *, router, bearer, policy, diagnostics=None, limiter=None):
                               "problems, reboot-required. Fixed checks only; shows program names, never command lines."))
     def computer_diagnostics(device_id: str) -> dict:
         return guarded("computer_diagnostics", device_id, diagnostics.report)
+
+    @server.tool(name="computer_system_status", title="Read system-management status", annotations=READ_ONLY,
+                 description=("Read-only: sleep and hibernation (targets, masking, logind and sleep.conf settings, desktop idle sleep), "
+                              "Wi-Fi/network auto-reconnect settings (never passwords), which services start at boot and linger, power "
+                              "supplies and Wake-on-LAN support per network card, pending reboot, firmware power-loss recovery (usually "
+                              "not readable from Linux) and StyNpilot backup status with the newest backup verified. Changes nothing."))
+    def computer_system_status(device_id: str) -> dict:
+        return guarded("computer_system_status", device_id, system.report)
 
     @server.tool(name="computer_logs", title="Read service logs", annotations=READ_ONLY,
                  description=("Read recent systemd journal lines for ONE unit (for example stynpilot-installer.service, "

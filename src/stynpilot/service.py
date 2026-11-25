@@ -278,11 +278,12 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
                        fetch_release=release.https_get, installed_version=_installed_stynpilot_version)
         from . import safefs
         from .diagnostics import Diagnostics
+        from .system_status import SystemStatus
         home = os.path.expanduser("~")
         diag = dict(policy=safefs.Policy(home=home,
                                          project_roots=safefs.load_project_roots(state / PROJECT_ROOTS_FILE, home),
                                          extra_deny=[config.state_dir, config.pairing_db, config.broker_socket]),
-                    diagnostics=Diagnostics())
+                    diagnostics=Diagnostics(), system=SystemStatus(backup_dir=config.state_dir.parent))
         runner_tools = dict(broker=broker, projects_dir=os.path.join(home, "StyNpilot-Projects"))
         service.mcp = (start_mcp or run.start)(router=router, public_host=config.mcp_public_host,
                                                port=config.mcp_port, propose=propose, diag=diag, runner=runner_tools)

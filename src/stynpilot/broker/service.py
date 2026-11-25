@@ -111,6 +111,13 @@ class BrokerService:
             if op == "release_intent":
                 return {"ok": True, "result": self.executor.release_intent(message.get("commit"), message.get("version"),
                                                                            message.get("review_note", ""))}
+            if op == "release_resume":
+                if not self._busy.acquire(blocking=False):
+                    return {"ok": False, "error": "busy"}
+                try:
+                    return {"ok": True, "result": self.executor.release_resume(message.get("request_id"))}
+                finally:
+                    self._busy.release()
             if op == "runner":
                 return {"ok": True, "result": self.executor.runner_call(message.get("call"), message.get("args"))}
             if op in ("install", "rollback", "upgrade", "release", "deny", "runner_admin", "passkey_admin"):
@@ -258,6 +265,9 @@ class BrokerClient:
 
     def release(self, payload, proof, challenge):
         return self._ask({"op": "release", "payload": payload, "proof": proof, "challenge": challenge}, 900)["result"]
+
+    def release_resume(self, request_id):
+        return self._ask({"op": "release_resume", "request_id": request_id}, 900)["result"]
 
     def release_prepare(self, commit, version):
         return self._ask({"op": "release_prepare", "commit": commit, "version": version}, 30)["result"]

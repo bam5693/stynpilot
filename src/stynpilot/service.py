@@ -405,9 +405,16 @@ def build_authority(config, state_dir=None, **options):
         raise ConfigError("release_build_user_does_not_exist") from None
     if account.pw_uid == 0:
         raise ConfigError("release_build_user_invalid")
-    prefix = ["setpriv", "--reuid=%d" % account.pw_uid, "--regid=%d" % account.pw_gid, "--clear-groups", "--no-new-privs", "--"]
+    from . import runner
+
+    def sandbox(job, argv, workspace, *, seconds, memory_mb, tasks, network):
+        # The same sandbox the owner's project jobs use (systemd-run unit: no privileges, read-only system, hidden installer folders,
+        # memory/process/CPU/time limits, own /tmp), run as the build account. Network only where a step is allowed it.
+        return runner.unit_command(job, argv, workspace, seconds=seconds, memory_mb=memory_mb, tasks=tasks, writes=True,
+                                   network=network, run_user=account.pw_name)
+
     options.setdefault("work_root", BUILD_ROOT)
-    return Authority(state_dir or config.state_dir, build_prefix=prefix, build_uid=account.pw_uid, **options)
+    return Authority(state_dir or config.state_dir, sandbox=sandbox, mount_work=True, build_uid=account.pw_uid, **options)
 
 
 def fetch_jwks(issuer, fetch=None):

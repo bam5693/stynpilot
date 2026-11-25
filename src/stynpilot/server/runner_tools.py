@@ -190,6 +190,18 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
             return receipt(result)
         return run("commander_request_stynpilot_release", device_id, work, write=True)
 
+    @server.tool(name="commander_resume_stynpilot_release", title="Resume an interrupted release", annotations=FILES_A_REQUEST,
+                 description=("If a release approval was already given but publishing or installing stopped part-way (the status shows the "
+                              "approval as spent and resumable), continue that exact operation. This needs no new approval and can do nothing "
+                              "else: it repeats only the remaining steps of what the owner approved, within 24 hours. request_id is the "
+                              "request's id."))
+    def resume_release(device_id: str, request_id: str) -> dict:
+        def work(owner):
+            if type(request_id) is not str or not re.fullmatch(r"[0-9a-f]{64}", request_id):
+                raise WorkspaceError("request_id_invalid")
+            return broker.release_resume(request_id)
+        return run("commander_resume_stynpilot_release", device_id, work, write=True)
+
     # -- passkeys (dev15): ask to add or remove one; the owner approves on his phone ---------------------------------
     def passkey_request(owner, device_id, *, action, label, kid):
         info = broker.passkey_list()

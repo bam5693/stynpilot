@@ -88,8 +88,8 @@ class Upgrader:
     # -- small helpers ----------------------------------------------------------------------------------
     @property
     def keys(self):
-        if self._keys is None:
-            self._keys = release.load_trusted_keys()
+        if self._keys is None:                                # read fresh every time: a console-added or revoked key counts at once
+            return release.load_trusted_keys()
         return self._keys
 
     def _run(self, argv, timeout=120):

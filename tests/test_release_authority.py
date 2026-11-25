@@ -27,21 +27,40 @@ VERSION = "0.1.0~dev4"
 
 
 class FakeMachine:
-    """Pretends to be git + the build + pytest inside the builder's work folder, and records what ran."""
-    def __init__(self, deb_bytes, *, tests="1 passed in 1.0s", second_build=None, commit=COMMIT, version="0.1.0.dev4"):
-        self.deb, self.tests, self.second, self.commit, self.version = deb_bytes, tests, second_build, commit, version
-        self.calls = []
+    """Pretends to be git + the build + pytest inside the builder's work folder, and records every step that ran."""
+    LOCK = "# vendored\nmcp==1.30.0 " + "a" * 64 + "\n"
+
+    def __init__(self, deb_bytes, *, tests="1 passed in 1.0s", tests_code=0, second_build=None, commit=None, version="0.1.0.dev4",
+                 pip_code=0):
+        self.deb, self.tests, self.tests_code, self.second = deb_bytes, tests, tests_code, second_build
+        self.commit, self.version, self.pip_code = commit, version, pip_code
+        self.calls, self.fetched, self.stopped, self.mounts = [], None, [], []
 
     def __call__(self, argv, timeout, cwd=None, env=None):
-        assert argv[:1] == ["env"], argv            # always run through the unprivileged-account prefix
-        script = argv[-1]
-        self.calls.append(script)
-        work = Path(cwd)
-        if "git init" in script:
-            (work / "src").mkdir()
-            return 0, "...\n" + self.commit + "\n"
-        if "__version__" in script:
+        if argv[0] in ("systemctl", "mount", "umount"):
+            (self.stopped if argv[0] == "systemctl" else self.mounts).append(argv)
+            return 0, ""
+        assert argv[0] == "env", argv                  # always run through the unprivileged-account prefix
+        args, work = list(argv[1:]), cwd
+        if args and args[0].startswith("WORKSPACE="):
+            work, args = args[0].split("=", 1)[1], args[1:]
+        work = Path(work)
+        self.calls.append(args)
+        if args[0] == "/usr/bin/git":
+            if "init" in args:
+                (work / "src").mkdir()
+            elif "fetch" in args:
+                self.fetched = args[-1]
+            elif "rev-parse" in args:
+                return 0, "...\n" + (self.commit or self.fetched) + "\n"
+            return 0, ""
+        if args[:3] == ["/usr/bin/python3", "-I", "-c"]:
             return 0, self.version + "\n"
+        if args[0] == "/usr/bin/cat":
+            return 0, self.LOCK
+        if args[:4] == ["/usr/bin/python3", "-m", "pip", "download"]:
+            return self.pip_code, ""
+        script = args[-1]
         m = re.search(r"build_deb\.build\('\.\./out(\d)'", script)
         if m:
             out = work / ("out" + m.group(1))
@@ -49,45 +68,85 @@ class FakeMachine:
             data = self.deb if m.group(1) == "0" or self.second is None else self.second
             (out / "stynpilot_x_all.deb").write_bytes(data)
             return 0, ""
-        m = re.search(r"sha256sum out(\d)/", script)
-        if m:
-            return 0, hashlib.sha256((work / ("out" + m.group(1)) / "stynpilot_x_all.deb").read_bytes()).hexdigest() + "\n"
         if "pytest" in script:
-            return 0, "....\n" + self.tests + "\n"
+            return self.tests_code, "....\n" + self.tests + "\n"
         return 1, "unexpected command"
 
 
 class FakeGitHub:
-    def __init__(self, existing=None):
-        self.calls, self.releases, self.assets, self.next_id = [], dict(existing or {}), {}, 100
-        self.fail_upload = False
+    """A small GitHub: draft releases, assets served through a redirect, real tag creation when a release goes public."""
+    def __init__(self):
+        self.calls, self.releases, self.blobs, self.tags = [], {}, {}, {}
+        self.next_id, self.fail_upload, self.token_status = 100, False, 200
+        self.tag_override, self.serve_override, self.annotated = None, {}, set()
+
+    def tag_url(self, tag):
+        return "https://api.github.com/repos/bam5693/stynpilot/git/ref/tags/" + tag
 
     def __call__(self, method, url, headers, body, max_bytes=0):
         self.calls.append((method, url, headers, body))
         assert headers["Authorization"].startswith("Bearer ")
-        m = re.fullmatch(r"https://api\.github\.com/repos/([^/]+/[^/]+)/releases/tags/(.+)", url)
+        base = "https://api.github.com/repos/bam5693/stynpilot"
+        j = lambda obj, code=200: (code, json.dumps(obj).encode())
+        if url == base:
+            return (200, json.dumps({"permissions": {"push": True}}).encode()) if self.token_status == 200 else (self.token_status, b"{}")
+        m = re.fullmatch(re.escape(base) + r"/git/ref/tags/(.+)", url)
         if m:
-            rel = self.releases.get(m.group(2))
-            return (200, json.dumps(rel).encode()) if rel else (404, b"{}")
-        if url.endswith("/releases") and method == "POST":
+            sha = self.tags.get(m.group(1))
+            if sha is None:
+                return 404, b"{}"
+            if m.group(1) in self.annotated:
+                return j({"object": {"type": "tag", "sha": "t" * 40}})
+            return j({"object": {"type": "commit", "sha": sha}})
+        if url == base + "/git/tags/" + "t" * 40:
+            tag = next(iter(self.annotated))
+            return j({"object": {"type": "commit", "sha": self.tags[tag]}})
+        if url == base + "/releases?per_page=100":
+            return j(list(self.releases.values()))
+        if url == base + "/releases" and method == "POST":
             data = json.loads(body)
             self.next_id += 1
-            rel = {"id": self.next_id, "tag_name": data["tag_name"], "target_commitish": data["target_commitish"], "assets": []}
-            self.releases[data["tag_name"]] = rel
-            return 201, json.dumps(rel).encode()
+            rel = {"id": self.next_id, "tag_name": data["tag_name"], "target_commitish": data["target_commitish"],
+                   "draft": data["draft"], "prerelease": data["prerelease"], "assets": []}
+            self.releases[self.next_id] = rel
+            return j(rel, 201)
+        m = re.fullmatch(re.escape(base) + r"/releases/(\d+)", url)
+        if m:
+            rel = self.releases[int(m.group(1))]
+            if method == "PATCH":
+                rel["draft"] = json.loads(body)["draft"]
+                if not rel["draft"]:
+                    self.tags[rel["tag_name"]] = self.tag_override or rel["target_commitish"]
+            return j(rel)
         m = re.fullmatch(r"https://uploads\.github\.com/repos/[^/]+/[^/]+/releases/(\d+)/assets\?name=(.+)", url)
         if m:
             if self.fail_upload:
                 return 500, b"{}"
-            name = m.group(2)
-            self.assets[name] = body
-            for rel in self.releases.values():
-                if rel["id"] == int(m.group(1)):
-                    rel["assets"].append({"name": name})
+            self.next_id += 1
+            self.blobs[self.next_id] = body
+            self.releases[int(m.group(1))]["assets"].append({"id": self.next_id, "name": m.group(2), "size": len(body)})
             return 201, b"{}"
-        if url.endswith("/repos/bam5693/stynpilot"):
-            return 200, json.dumps({"permissions": {"push": True}}).encode()
-        raise AssertionError(url)
+        m = re.fullmatch(re.escape(base) + r"/releases/assets/(\d+)", url)
+        if m:
+            aid = int(m.group(1))
+            if method == "DELETE":
+                for rel in self.releases.values():
+                    rel["assets"] = [a for a in rel["assets"] if a["id"] != aid]
+                return 204, b""
+            assert headers["Accept"] == "application/octet-stream"
+            return 302, ("https://objects.githubusercontent.com/blob/%d" % aid).encode()
+        raise AssertionError((method, url))
+
+    def fetch(self, url, max_bytes):
+        aid = int(url.rsplit("/", 1)[1])
+        return self.serve_override.get(aid, self.blobs[aid])
+
+    def assets(self):
+        return {a["name"]: self.blobs[a["id"]] for rel in self.releases.values() for a in rel["assets"]}
+
+
+def accept_all(path, version):
+    return None
 
 
 @unittest.skipIf(tu is None, "needs the upgrade test harness")
@@ -100,9 +159,14 @@ class AuthorityTests(unittest.TestCase):
         self.deb_bytes = b"!<arch>\npretend package contents" * 100
         self.machine = FakeMachine(self.deb_bytes)
         self.http = FakeGitHub()
-        self.auth = Authority(self.tmp, run=self.machine, http=self.http, build_prefix=["env"])
-        self.auth.init_key()
-        self.auth.set_token("github_pat_" + "A" * 30)
+        self.auth = self.make(self.tmp, self.machine)
+
+    def make(self, folder, machine, **kw):
+        auth = Authority(folder, run=machine, http=self.http, build_prefix=["env"], inspect=kw.pop("inspect", accept_all),
+                         fetch=self.http.fetch, **kw)
+        auth.init_key()
+        auth.set_token("github_pat_" + "A" * 30)
+        return auth
 
     def prepared(self):
         return self.auth.prepare(COMMIT, VERSION, "0.1.0~dev3")
@@ -117,37 +181,111 @@ class AuthorityTests(unittest.TestCase):
 
     def test_every_way_a_build_can_be_wrong_is_a_failed_record_never_a_ready_one(self):
         cases = {"build_is_not_reproducible": FakeMachine(self.deb_bytes, second_build=b"different"),
-                 "tests_failed_2_passed_5": FakeMachine(self.deb_bytes, tests="2 failed, 5 passed in 3s"),
-                 "test_result_unreadable": FakeMachine(self.deb_bytes, tests="boom"),
+                 "tests_failed_2_passed_5": FakeMachine(self.deb_bytes, tests="2 failed, 5 passed in 3s", tests_code=1),
+                 "test_result_unreadable": FakeMachine(self.deb_bytes, tests="boom", tests_code=1),
                  "could_not_fetch_that_exact_commit": FakeMachine(self.deb_bytes, commit="d" * 40),
-                 "source_version_differs_from_requested_version": FakeMachine(self.deb_bytes, version="0.1.0.dev9")}
+                 "source_version_differs_from_requested_version": FakeMachine(self.deb_bytes, version="0.1.0.dev9"),
+                 "dependency_download_failed": FakeMachine(self.deb_bytes, pip_code=1)}
         for why, machine in cases.items():
-            auth = Authority(self.tmp / ("a-" + why[:8]), run=machine, http=self.http, build_prefix=["env"])
-            auth.init_key()
-            auth.set_token("github_pat_" + "B" * 30)
-            got = auth.prepare(COMMIT, VERSION, "x")
+            got = self.make(self.tmp / ("a-" + why[:8]), machine).prepare(COMMIT, VERSION, "x")
             self.assertEqual((got["state"], got["why"]), ("failed", why), why)
             with self.assertRaises(AuthorityError):
-                auth.intent(COMMIT, VERSION)
+                self.make(self.tmp / ("a-" + why[:8]), machine).intent(COMMIT, VERSION)
+
+    def test_a_failing_test_run_cannot_hide_behind_a_green_looking_summary(self):
+        """The shell pipeline through tail used to mask pytest's exit status. The status itself must be honoured."""
+        machine = FakeMachine(self.deb_bytes, tests="7 passed in 2s", tests_code=1)
+        got = self.make(self.tmp / "mask", machine).prepare(COMMIT, VERSION, "x")
+        self.assertEqual((got["state"], got["why"]), ("failed", "tests_exit_status_1"))
+
+    def test_the_package_must_pass_the_upgrade_path_checks_before_it_is_ever_offered(self):
+        def refuse(path, version):
+            raise type("Refused", (Exception,), {"code": "package_has_install_scripts"})()
+        got = self.make(self.tmp / "ins", self.machine, inspect=refuse).prepare(COMMIT, VERSION, "x")
+        self.assertEqual((got["state"], got["why"]), ("failed", "package_not_acceptable_package_has_install_scripts"))
+        none = self.make(self.tmp / "ins2", self.machine, inspect=None)
+        none.inspect = None
+        self.assertEqual(none.prepare(COMMIT, VERSION, "x")["why"], "package_inspection_not_configured")
 
     def test_the_builder_cannot_make_root_publish_a_file_from_elsewhere(self):
         class Sneaky(FakeMachine):
+            mode = "file"
+
             def __call__(self, argv, timeout, cwd=None, env=None):
                 result = super().__call__(argv, timeout, cwd=cwd, env=env)
                 m = re.search(r"build_deb\.build\('\.\./out(\d)'", argv[-1])
-                if m and m.group(1) == "0":                  # swap the built package for a link to some other file
-                    target = Path(cwd).parent / "elsewhere.deb"
-                    target.write_bytes(self.deb)
-                    link = Path(cwd) / "out0" / "stynpilot_x_all.deb"
-                    link.unlink()
-                    link.symlink_to(target)
+                if m and m.group(1) == "0":
+                    out, target = Path(cwd) / "out0", Path(cwd).parent / "elsewhere"
+                    if self.mode == "file":                   # the package becomes a link to some other file
+                        target.write_bytes(self.deb)
+                        (out / "stynpilot_x_all.deb").unlink()
+                        (out / "stynpilot_x_all.deb").symlink_to(target)
+                    elif self.mode == "folder":               # the whole output folder becomes a link elsewhere
+                        target.mkdir()
+                        (target / "stynpilot_x_all.deb").write_bytes(self.deb)
+                        for f in out.iterdir():
+                            f.unlink()
+                        out.rmdir()
+                        out.symlink_to(target)
+                    elif self.mode == "two":                  # a second package appears next to it
+                        (out / "other.deb").write_bytes(self.deb)
+                    elif self.mode == "fifo":                 # a pipe where a file should be
+                        (out / "stynpilot_x_all.deb").unlink()
+                        os.mkfifo(out / "stynpilot_x_all.deb")
                 return result
-        work = self.tmp / "buildroot"
-        auth = Authority(self.tmp / "sn", run=Sneaky(self.deb_bytes), http=self.http, build_prefix=["env"], work_root=work)
-        auth.init_key()
-        auth.set_token("github_pat_" + "F" * 30)
-        got = auth.prepare(COMMIT, VERSION, "x")
-        self.assertEqual((got["state"], got["why"]), ("failed", "package_not_where_the_builder_should_have_put_it"))
+        expect = {"file": "package_not_where_the_builder_should_have_put_it", "folder": "package_missing",
+                  "two": "more_than_one_package_built", "fifo": "package_not_where_the_builder_should_have_put_it"}
+        for mode, why in expect.items():
+            machine = Sneaky(self.deb_bytes)
+            machine.mode = mode
+            auth = self.make(self.tmp / ("sn" + mode), machine, work_root=self.tmp / ("root" + mode))
+            got = auth.prepare(COMMIT, VERSION, "x")
+            self.assertEqual((got["state"], got["why"]), ("failed", why), mode)
+
+    def test_the_size_limit_is_enforced_while_reading(self):
+        from stynpilot.broker import release_authority as ra
+        old, ra.MAX_ASSET = ra.MAX_ASSET, 1000
+        self.addCleanup(setattr, ra, "MAX_ASSET", old)
+        self.assertEqual(self.prepared()["why"], "package_not_where_the_builder_should_have_put_it")
+
+    def test_only_one_build_runs_at_a_time_and_only_the_latest_few_are_kept(self):
+        lock = self.auth._take_lock()
+        with self.assertRaises(AuthorityError) as e:
+            self.auth.prepare(COMMIT, VERSION, "x")
+        self.assertEqual(e.exception.code, "another_build_is_running")
+        os.close(lock)
+        times = iter(range(1000, 2000))
+        self.auth.clock = lambda: next(times)
+        commits = [c * 40 for c in "abcde"]
+        for c in commits:
+            self.assertEqual(self.auth.prepare(c, VERSION, "x")["state"], "ready")
+        kept = sorted(p.name for p in (self.tmp / "release/builds").iterdir())
+        self.assertEqual(kept, sorted(commits[-3:]))
+
+    def test_each_step_runs_in_the_sandbox_and_only_fetching_has_network(self):
+        seen = []
+
+        def sandbox(job, argv, workspace, *, seconds, memory_mb, tasks, network):
+            seen.append((argv, network, seconds, memory_mb, tasks))
+            return ["env", "WORKSPACE=" + workspace] + argv
+        auth = self.make(self.tmp / "sb", self.machine, sandbox=sandbox, work_root=self.tmp / "sbroot")
+        self.assertEqual(auth.prepare(COMMIT, VERSION, "x")["state"], "ready")
+        networked = [a[0][:2] if a[0][0] != "/usr/bin/git" else [x for x in a[0] if x in ("fetch",)] for a in seen if a[1]]
+        self.assertEqual(sorted(map(str, networked)), sorted(["['fetch']", "['/usr/bin/python3', '-m']"]))
+        self.assertTrue(all(0 < s[2] <= 1500 and 0 < s[3] <= 4096 and 0 < s[4] <= 256 for s in seen))
+        self.assertGreaterEqual(len(self.machine.stopped), len(seen))         # every unit is stopped afterwards, whatever happened
+        git = [a[0] for a in seen if a[0][0] == "/usr/bin/git"]
+        self.assertTrue(all("core.hooksPath=/dev/null" in a for a in git[1:]))
+        tests = [a for a in seen if "pytest" in a[0][-1]]
+        self.assertEqual(len(tests), 1)
+        self.assertFalse(tests[0][1])                                          # the test run has no network
+
+    def test_the_work_area_is_a_size_limited_memory_file_system_when_enabled(self):
+        auth = self.make(self.tmp / "mt", self.machine, mount_work=True, build_uid=0, tmpfs_mb=64)
+        auth.prepare(COMMIT, VERSION, "x")
+        mount = [m for m in self.machine.mounts if m[0] == "mount"][0]
+        self.assertIn("size=64m", mount[4])
+        self.assertTrue(any(m[0] == "umount" for m in self.machine.mounts))
 
     def test_unusable_requests_are_refused_up_front(self):
         for commit, version in (("abc", VERSION), (COMMIT.upper(), VERSION), (COMMIT, "bad version")):
@@ -180,37 +318,99 @@ class AuthorityTests(unittest.TestCase):
             with self.assertRaises(AuthorityError):
                 self.auth.set_token(bad)
 
-    def test_publishing_goes_only_to_githubs_api_hosts_at_the_exact_commit_and_can_be_repeated(self):
+    # -- publication ---------------------------------------------------------------------------------------------------------
+    def staged(self):
         self.prepared()
         intent = self.auth.intent(COMMIT, VERSION)
         manifest = self.auth.manifest_for(intent, ["note"])
-        signature = self.auth.sign(manifest)
-        self.auth.publish(manifest, signature, COMMIT)
-        self.auth.publish(manifest, signature, COMMIT)                       # repeat: nothing new is uploaded
+        return manifest, self.auth.sign(manifest), self.auth.package_bytes(COMMIT)
+
+    def publish_all(self):
+        manifest, sig, data = self.staged()
+        rid = self.auth.draft(manifest, COMMIT)
+        self.auth.upload_and_verify(rid, manifest, sig, data)
+        self.auth.make_public(rid, manifest, sig, data, COMMIT)
+        return manifest, sig, data, rid
+
+    def test_publication_is_a_verified_draft_made_public_at_the_exact_commit(self):
+        manifest, sig, data, rid = self.publish_all()
         hosts = {re.match(r"https://([^/]+)/", c[1]).group(1) for c in self.http.calls}
         self.assertEqual(hosts, {"api.github.com", "uploads.github.com"})
-        creates = [c for c in self.http.calls if c[0] == "POST" and c[1].endswith("/releases")]
-        self.assertEqual(len(creates), 1)
-        self.assertEqual(json.loads(creates[0][3])["target_commitish"], COMMIT)
-        self.assertEqual(set(self.http.assets), {manifest["asset"], "release-manifest.json", "release-manifest.json.sig"})
-        self.assertEqual(self.http.assets[manifest["asset"]], self.deb_bytes)
-        release.verify(json.loads(self.http.assets["release-manifest.json"]), self.http.assets["release-manifest.json.sig"].decode(),
+        creates = [json.loads(c[3]) for c in self.http.calls if c[0] == "POST" and c[1].endswith("/releases")]
+        self.assertEqual([(c["draft"], c["target_commitish"]) for c in creates], [(True, COMMIT)])      # born as a DRAFT
+        order = [c[0] for c in self.http.calls if c[0] in ("POST", "PATCH")]
+        self.assertEqual(order[-1], "PATCH")                                    # made public only after every upload
+        self.assertEqual(self.http.assets(), {manifest["asset"]: data, "release-manifest.json": release.canonical(manifest),
+                                              "release-manifest.json.sig": sig.encode()})
+        self.assertEqual(self.http.tags[manifest["tag"]], COMMIT)
+        release.verify(json.loads(self.http.assets()["release-manifest.json"]), self.http.assets()["release-manifest.json.sig"].decode(),
                        {self.auth.key_entry()["key_id"]: self.auth._private().public_key()})
-
-    def test_a_tag_that_already_exists_for_a_different_commit_is_refused(self):
-        self.prepared()
-        manifest = self.auth.manifest_for(self.auth.intent(COMMIT, VERSION), ["n"])
-        self.http.releases[manifest["tag"]] = {"id": 7, "tag_name": manifest["tag"], "target_commitish": "e" * 40, "assets": []}
+        # repeating the last step on the already-public identical release succeeds and changes nothing
+        before = len(self.http.calls)
+        self.auth.make_public(rid, manifest, sig, data, COMMIT)
+        self.assertFalse([c for c in self.http.calls[before:] if c[0] in ("POST", "PATCH", "DELETE")])
         with self.assertRaises(AuthorityError) as e:
-            self.auth.publish(manifest, self.auth.sign(manifest), COMMIT)
-        self.assertEqual(e.exception.code, "tag_exists_for_a_different_commit")
-        self.assertEqual(self.http.assets, {})
+            self.auth.draft(manifest, COMMIT)                                   # a public release is never reopened
+        self.assertEqual(e.exception.code, "release_is_already_public")
 
-    def test_the_http_helper_refuses_other_hosts_and_never_follows_redirects(self):
+    def test_an_existing_tag_for_a_different_commit_is_refused_even_when_annotated(self):
+        manifest, sig, data = self.staged()
+        for annotated in (False, True):
+            self.http.tags[manifest["tag"]] = "e" * 40
+            if annotated:
+                self.http.annotated.add(manifest["tag"])
+            with self.assertRaises(AuthorityError) as e:
+                self.auth.draft(manifest, COMMIT)
+            self.assertEqual(e.exception.code, "tag_exists_for_a_different_commit")
+            self.assertEqual(self.auth.tag_commit(manifest["tag"]), "e" * 40)
+        self.assertEqual(self.http.assets(), {})
+        self.http.tags[manifest["tag"]] = COMMIT                                # the same commit, annotated: accepted as the same
+        self.assertEqual(self.auth.tag_commit(manifest["tag"]), COMMIT)
+
+    def test_a_public_tag_that_ends_up_somewhere_else_is_never_reported_as_published(self):
+        manifest, sig, data = self.staged()
+        rid = self.auth.draft(manifest, COMMIT)
+        self.auth.upload_and_verify(rid, manifest, sig, data)
+        self.http.tag_override = "f" * 40
+        with self.assertRaises(AuthorityError) as e:
+            self.auth.make_public(rid, manifest, sig, data, COMMIT)
+        self.assertEqual(e.exception.code, "published_tag_does_not_point_at_the_approved_commit")
+
+    def test_an_asset_with_the_right_name_but_wrong_content_is_replaced_on_the_draft_and_checked_by_content(self):
+        manifest, sig, data = self.staged()
+        rid = self.auth.draft(manifest, COMMIT)
+        self.auth.upload_and_verify(rid, manifest, sig, data)
+        aid = next(a["id"] for a in self.http.releases[rid]["assets"] if a["name"] == "release-manifest.json")
+        self.http.blobs[aid] = b"x" * len(self.http.blobs[aid])                 # same name, same size, different bytes
+        with self.assertRaises(AuthorityError) as e:
+            self.auth.verify_assets(rid, manifest, sig, data)
+        self.assertTrue(e.exception.code.startswith("asset_content_differs"))
+        self.auth.upload_and_verify(rid, manifest, sig, data)                   # repairs it
+        self.assertEqual(self.http.assets()["release-manifest.json"], release.canonical(manifest))
+        self.assertEqual(len(self.http.releases[rid]["assets"]), 3)
+
+    def test_an_extra_or_missing_asset_stops_publication(self):
+        manifest, sig, data = self.staged()
+        rid = self.auth.draft(manifest, COMMIT)
+        self.auth.upload_and_verify(rid, manifest, sig, data)
+        self.http.releases[rid]["assets"].append({"id": 999, "name": "extra.sh", "size": 1})
+        self.http.blobs[999] = b"x"
+        with self.assertRaises(AuthorityError) as e:
+            self.auth.make_public(rid, manifest, sig, data, COMMIT)
+        self.assertEqual(e.exception.code, "release_assets_are_not_exactly_the_approved_three")
+        self.assertTrue(self.http.releases[rid]["draft"])                      # still a draft: nothing became public
+
+    def test_the_http_helpers_refuse_other_hosts_and_never_follow_redirects(self):
+        from stynpilot.broker.release_authority import default_fetch
         for url in ("https://evil.example/x", "http://api.github.com/x", "https://api.github.com:444/x",
                     "https://user@api.github.com/x", "https://api.github.com.evil.example/x"):
             with self.assertRaises(AuthorityError):
                 default_http("GET", url, {}, None)
+        for url in ("https://evil.example/x", "http://objects.githubusercontent.com/x", "https://githubusercontent.com.evil.example/x",
+                    "https://user@objects.githubusercontent.com/x", "https://objects.githubusercontent.com:444/x",
+                    "https://api.github.com/x"):
+            with self.assertRaises(AuthorityError):
+                default_fetch(url, 10)
 
     def test_token_check_reports_whether_it_can_write(self):
         self.assertTrue(self.auth.check_token()["ok"])
@@ -218,20 +418,31 @@ class AuthorityTests(unittest.TestCase):
 
 @unittest.skipIf(tu is None, "needs the upgrade test harness")
 class OneApprovalTests(tu.UpgradeTests):
-    """The real executor: challenge, proof, sign, publish, protected upgrade - all behind one Auth0-signed approval."""
+    """The real executor: challenge, proof, reservation, sign, draft, verify, publish, protected upgrade - behind one approval."""
     def setUp(self):
         tu.UpgradeTests.setUp(self)
         self.deb = Path(self.pkg.deb(VERSION))
         self.machine = FakeMachine(self.deb.read_bytes())
         self.http = FakeGitHub()
-        self.auth = Authority(self.tmp / "broker", run=self.machine, http=self.http, build_prefix=["env"])
+        self.auth = Authority(self.tmp / "broker", run=self.machine, http=self.http, build_prefix=["env"], fetch=self.http.fetch)
         # the machine's own signing key IS the trusted key of this test machine
         (self.tmp / "broker" / "release").mkdir(parents=True, exist_ok=True)
         (self.auth.keyfile).write_bytes(release.private_pem(self.signing))
         os.chmod(self.auth.keyfile, 0o600)
         self.auth.set_token("github_pat_" + "C" * 30)
         self.build(authority=self.auth, sleep=lambda s: None)
+        self.executor._need_authority()                                        # wires the real package inspection
         self.auth.prepare(COMMIT, VERSION, "0.1.0~dev3")
+        self.seen = []
+        real = self.http.__call__
+
+        def wrapped(method, url, *a, **k):
+            if method in ("POST", "PATCH") and not self.seen:
+                self.seen.append(self.executor.runs.status(self.rid)["state"] if getattr(self, "rid", None) else "no-rid")
+            result = real(method, url, *a, **k)
+            self.publish_into_downloads()
+            return result
+        self.auth.http = wrapped
 
     def release_payload(self, note="reviewed", minutes=30):
         from datetime import datetime, timedelta, timezone
@@ -242,10 +453,15 @@ class OneApprovalTests(tu.UpgradeTests):
     def publish_into_downloads(self):
         """Make what the fake GitHub received downloadable the way the real GitHub would serve it."""
         for rel in self.http.releases.values():
-            tag = rel["tag_name"]
-            base = "https://github.com/bam5693/stynpilot/releases/download/%s/" % tag
-            for name, body in self.http.assets.items():
+            base = "https://github.com/bam5693/stynpilot/releases/download/%s/" % rel["tag_name"]
+            for name, body in self.http.assets().items():
                 self.downloads[base + name] = body
+
+    def go(self, payload=None):
+        payload = payload or self.release_payload()
+        self.rid = request_id(payload)[0]
+        challenge, proof = self.approve(payload)
+        return payload, challenge, proof
 
     def test_the_owner_reads_exact_facts_and_nothing_is_signed_or_published_before_approval(self):
         payload = self.release_payload()
@@ -259,36 +475,128 @@ class OneApprovalTests(tu.UpgradeTests):
         self.assertEqual(self.launched, [])
 
     def test_approval_signs_publishes_and_starts_the_protected_upgrade_once(self):
-        payload = self.release_payload()
-        challenge, proof = self.approve(payload)
-        # downloads are filled as the fake GitHub receives the assets; wire it by wrapping the http call
-        real = self.http.__call__
-
-        def wrapped(*a, **k):
-            result = real(*a, **k)
-            self.publish_into_downloads()
-            return result
-        self.auth.http = wrapped
+        payload, challenge, proof = self.go()
         result = self.executor.release(payload, proof, challenge)
         self.assertEqual((result["pending"], result["to_version"], result["from_version"]), (True, VERSION, "0.1.0~dev3"))
         self.assertEqual(len(self.launched), 1)
-        self.assertEqual(set(self.http.assets), {"stynpilot-v0.1.0-dev4.deb", "release-manifest.json", "release-manifest.json.sig"})
-        manifest = json.loads(self.http.assets["release-manifest.json"])
+        self.assertEqual(set(self.http.assets()), {"stynpilot-v0.1.0-dev4.deb", "release-manifest.json", "release-manifest.json.sig"})
+        manifest = json.loads(self.http.assets()["release-manifest.json"])
         self.assertEqual((manifest["git_commit"], manifest["sha256"]), (COMMIT, payload["intent"]["sha256"]))
+        self.assertEqual(self.executor._tx_load(self.rid)["state"], "started")
         self.denied("already_decided_or_used", self.executor.release, payload, proof, challenge)        # no replay
         self.assertEqual(len(self.launched), 1)
 
-    def test_a_wrong_proof_publishes_nothing(self):
+    def test_the_approval_is_reserved_before_anything_external_happens(self):
+        payload, challenge, proof = self.go()
+        self.executor.release(payload, proof, challenge)
+        self.assertEqual(self.seen, ["running"])                  # at the first change on GitHub the approval was already spent
+
+    def test_a_wrong_proof_or_stale_challenge_publishes_nothing_and_spends_nothing(self):
         payload = self.release_payload()
+        self.rid = request_id(payload)[0]
         challenge, _ = self.approve(payload)
         other = self.release_payload(note="a different note")
-        bad_proof = self.proof(other, challenge)                       # signed for a different request
         with self.assertRaises(ExecutionDenied):
-            self.executor.release(payload, bad_proof, challenge)
+            self.executor.release(payload, self.proof(other, challenge), challenge)     # signed for a different request
         with self.assertRaises(ExecutionDenied):
             self.executor.release(payload, "not a token", challenge)
+        good = self.proof(payload, challenge)
+        with self.assertRaises(ExecutionDenied):
+            self.executor.release(payload, good, "0" * 64)                              # a challenge that was never issued
         self.assertEqual(self.http.calls, [])
         self.assertEqual(self.launched, [])
+        self.assertEqual(self.executor.runs.status(self.rid)["state"], "not_started")
+        self.executor.runs.peek(challenge=challenge, request_id=self.rid, decision="approve")        # still usable
+
+    def test_an_unusable_token_or_a_foreign_tag_is_found_before_the_approval_is_spent(self):
+        payload, challenge, proof = self.go()
+        self.http.token_status = 401
+        with self.assertRaises(ExecutionDenied) as caught:
+            self.executor.release(payload, proof, challenge)
+        self.assertTrue(caught.exception.code.startswith("release_github_token_not_usable"))
+        self.http.token_status = 200
+        self.http.tags["v0.1.0-dev4"] = "e" * 40
+        with self.assertRaises(ExecutionDenied) as caught:
+            self.executor.release(payload, proof, challenge)
+        self.assertEqual(caught.exception.code, "release_tag_exists_for_a_different_commit")
+        self.assertEqual(self.executor.runs.status(self.rid)["state"], "not_started")
+        self.assertEqual(self.http.releases, {})
+        del self.http.tags["v0.1.0-dev4"]
+        self.assertEqual(self.executor.release(payload, proof, challenge)["pending"], True)       # same approval, now fine
+
+    def test_an_interrupted_publication_is_resumable_and_never_called_unspent(self):
+        payload, challenge, proof = self.go()
+        self.http.fail_upload = True
+        with self.assertRaises(ExecutionDenied) as caught:
+            self.executor.release(payload, proof, challenge)
+        code = caught.exception.code
+        self.assertTrue(code.startswith("release_approval_spent_stopped_after_drafted_resumable_yes"), code)
+        self.assertNotIn("unchanged", code)
+        self.assertEqual(self.executor.runs.status(self.rid)["state"], "running")
+        info = self.executor.status(self.rid)["release"]
+        self.assertEqual(info, {"state": "drafted", "approval_spent": True, "resumable": True})
+        self.denied("already_decided_or_used", self.executor.release, payload, proof, challenge)   # the approval cannot be reused
+        self.assertEqual(self.launched, [])
+        self.assertFalse(self.executor.needs_attention())                       # a spent-but-unfinished release is not "damage"
+        self.http.fail_upload = False
+        result = self.executor.release_resume(self.rid)
+        self.assertEqual((result["pending"], result["to_version"]), (True, VERSION))
+        self.assertEqual(len(self.launched), 1)
+        self.assertEqual(len([c for c in self.http.calls if c[0] == "POST" and c[1].endswith("/releases")]), 1)   # same draft reused
+        self.denied("nothing_to_resume", self.executor.release_resume, self.rid)
+        self.assertEqual(len(self.launched), 1)
+
+    def test_a_restart_in_the_middle_leaves_the_release_resumable(self):
+        payload, challenge, proof = self.go()
+        self.http.fail_upload = True
+        with self.assertRaises(ExecutionDenied):
+            self.executor.release(payload, proof, challenge)
+        self.build(authority=self.auth, sleep=lambda s: None)                  # the installer restarts
+        self.assertEqual(self.executor.runs.status(self.rid)["state"], "running")
+        self.assertFalse(self.executor.needs_attention())
+        self.http.fail_upload = False
+        self.assertTrue(self.executor.release_resume(self.rid)["pending"])
+
+    def test_resume_can_only_finish_the_exact_approved_operation(self):
+        payload, challenge, proof = self.go()
+        self.http.fail_upload = True
+        with self.assertRaises(ExecutionDenied):
+            self.executor.release(payload, proof, challenge)
+        self.http.fail_upload = False
+        deb = next((self.tmp / "broker/release/builds" / COMMIT).glob("*.deb"))
+        os.chmod(deb, 0o600)
+        deb.write_bytes(b"swapped after the approval")
+        with self.assertRaises(ExecutionDenied) as caught:
+            self.executor.release_resume(self.rid)
+        self.assertIn("verified_package_was_altered", caught.exception.code)
+        self.assertEqual(self.launched, [])
+        self.assertEqual(self.http.assets(), {})
+        for bad in ("short", "g" * 64, None, "../x", "0" * 64):
+            with self.assertRaises(ExecutionDenied):
+                self.executor.release_resume(bad)
+
+    def test_an_old_spent_release_cannot_be_resumed_and_is_closed_honestly(self):
+        import time as _time
+        payload, challenge, proof = self.go()
+        self.http.fail_upload = True
+        with self.assertRaises(ExecutionDenied):
+            self.executor.release(payload, proof, challenge)
+        self.http.fail_upload = False
+        self.executor.clock_now = lambda: _time.time() + 25 * 3600
+        self.denied("release_approval_expired_start_again_with_a_new_approval", self.executor.release_resume, self.rid)
+        record = self.executor.runs.status(self.rid)
+        self.assertEqual(record["state"], "failed")
+        self.assertTrue(record["result"]["approval_spent"])
+        self.assertFalse(record["result"]["resumable"])
+        self.assertEqual(self.launched, [])
+
+    def test_a_github_failure_never_starts_the_upgrade(self):
+        payload, challenge, proof = self.go()
+        self.http.fail_upload = True
+        with self.assertRaises(ExecutionDenied):
+            self.executor.release(payload, proof, challenge)
+        self.assertEqual(self.launched, [])
+        self.assertTrue(self.http.releases[next(iter(self.http.releases))]["draft"])           # nothing public
 
     def test_a_changed_intent_is_refused_before_anyone_is_asked(self):
         for field, value in (("sha256", "0" * 64), ("commit", "d" * 40), ("tests_failed", 3), ("tests_passed", 99),
@@ -307,19 +615,20 @@ class OneApprovalTests(tu.UpgradeTests):
         self.assertEqual(self.http.calls, [])
 
     def test_a_key_this_machine_does_not_trust_cannot_even_be_requested(self):
-        self.executor.upgrader._keys = {}
         self.executor.upgrader._keys = {"1" * 16: release.new_private_key().public_key()}
         self.denied("release_key_not_trusted_by_this_machine", self.executor.challenge, self.release_payload(), "approve")
 
-    def test_a_github_failure_before_the_upgrade_leaves_the_approval_unspent(self):
-        payload = self.release_payload()
-        challenge, proof = self.approve(payload)
-        self.http.fail_upload = True
-        with self.assertRaises(ExecutionDenied) as caught:
-            self.executor.release(payload, proof, challenge)
-        self.assertTrue(caught.exception.code.startswith("release_upload_failed"))
-        self.assertEqual(self.launched, [])
-        self.assertEqual(self.executor.runs.status(request_id(payload)[0])["state"], "not_started")
+    def test_the_trusted_keys_are_read_fresh_each_time_they_are_needed(self):
+        self.executor.upgrader._keys = None
+        calls = []
+        real = release.load_trusted_keys
+        release.load_trusted_keys = lambda *a, **k: calls.append(1) or {"k": object()}
+        try:
+            self.executor.upgrader.keys
+            self.executor.upgrader.keys
+        finally:
+            release.load_trusted_keys = real
+        self.assertEqual(len(calls), 2)
 
     def test_not_newer_expired_and_unconfigured_cases(self):
         stale = self.release_payload(minutes=-5)
@@ -329,6 +638,7 @@ class OneApprovalTests(tu.UpgradeTests):
         self.build(sleep=lambda s: None)                               # no authority configured
         self.denied("release_publishing_not_configured", self.executor.challenge, {"kind": "release"}, "approve")
         self.denied("release_publishing_not_configured", self.executor.release_prepare, COMMIT, VERSION)
+        self.denied("release_publishing_not_configured", self.executor.release_resume, "0" * 64)
 
 
 @unittest.skipIf(tu is None, "needs the upgrade test harness")
@@ -350,15 +660,15 @@ class TrustAndConsoleTests(unittest.TestCase):
 
     def test_console_init_creates_the_key_and_makes_the_machine_trust_it_only_then(self):
         self.assertEqual(len(self.trusted()), 1)
-        self.assertEqual(release_console.init(self.auth, self.addendum, out=self.out.append), 0)
+        self.assertEqual(release_console.init(self.auth, self.addendum, keys_file=self.keys, out=self.out.append), 0)
         mine = self.auth.key_entry()["key_id"]
         self.assertIn(mine, self.trusted())
         self.assertEqual(len(self.trusted()), 2)
-        self.assertEqual(release_console.init(self.auth, self.addendum, out=self.out.append), 0)          # idempotent
+        self.assertEqual(release_console.init(self.auth, self.addendum, keys_file=self.keys, out=self.out.append), 0)          # idempotent
         self.assertEqual(len(self.trusted()), 2)
 
     def test_a_revoked_key_stops_being_trusted_and_a_damaged_addendum_is_an_error(self):
-        release_console.init(self.auth, self.addendum, out=self.out.append)
+        release_console.init(self.auth, self.addendum, keys_file=self.keys, out=self.out.append)
         mine = self.auth.key_entry()["key_id"]
         data = json.loads(self.addendum.read_text())
         data["revoked"] = [mine, release.public_entry(self.package_key)["key_id"]]
@@ -377,6 +687,23 @@ class TrustAndConsoleTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseError):
             self.trusted()
 
+    def test_init_never_silently_undoes_a_revocation(self):
+        release_console.init(self.auth, self.addendum, keys_file=self.keys, out=self.out.append)
+        mine = self.auth.key_entry()["key_id"]
+        data = json.loads(self.addendum.read_text())
+        data["revoked"] = [mine]
+        self.addendum.write_text(json.dumps(data, sort_keys=True))
+        before = self.addendum.read_text()
+        self.assertEqual(release_console.init(self.auth, self.addendum, keys_file=self.keys, out=self.out.append), 1)
+        self.assertEqual(self.addendum.read_text(), before)
+        self.assertNotIn(mine, self.trusted())
+        self.assertIn("revoked", "\n".join(self.out))
+
+    def test_init_checks_that_the_machine_really_trusts_the_key_it_just_wrote(self):
+        self.keys.write_text("{broken")
+        self.assertEqual(release_console.init(self.auth, self.addendum, keys_file=self.keys, out=self.out.append), 1)
+        self.assertIn("could not be re-read", "\n".join(self.out))
+
     def test_the_token_needs_a_terminal_and_a_well_formed_value(self):
         token = "github_pat_" + "D" * 30
         self.assertEqual(release_console.set_token(self.auth, getpass_fn=lambda _p: token, is_tty=False, out=self.out.append), 2)
@@ -388,7 +715,7 @@ class TrustAndConsoleTests(unittest.TestCase):
         self.assertNotIn(token, "\n".join(self.out))
 
     def test_status_never_prints_secrets(self):
-        release_console.init(self.auth, self.addendum, out=self.out.append)
+        release_console.init(self.auth, self.addendum, keys_file=self.keys, out=self.out.append)
         self.auth.set_token("github_pat_" + "E" * 30)
         release_console.status(self.auth, self.addendum, keys_file=self.keys, out=self.out.append)
         text = "\n".join(self.out)

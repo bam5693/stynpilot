@@ -17,6 +17,7 @@ Order of events (nothing is signed or published before the approval):
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -45,6 +46,11 @@ _TOKEN = re.compile(r"[A-Za-z0-9_]{20,255}\Z")
 _REVIEW = re.compile(r"[ -~]{0,200}\Z")
 BUILD_TIMEOUT, TEST_TIMEOUT, GIT_TIMEOUT = 600, 1500, 300
 MAX_ASSET = release.MAX_SIZE
+RETAIN_BUILDS = 3
+_LOCK_LINE = re.compile(r"([A-Za-z0-9_.\-]{1,80})==([A-Za-z0-9_.!+\-]{1,40}) [0-9a-f]{64}")
+_VERSION_SCRIPT = ("import re;m=re.search(r'^__version__ = \"([^\"]+)\"', open('src/src/stynpilot/__init__.py').read(), re.M);"
+                   "print(m.group(1) if m else '')")
+_ASSET_HOSTS = (".githubusercontent.com",)
 _TESTS_LINE = re.compile(r"(?:(\d+) failed, )?(?:(\d+) passed)(?:, (\d+) skipped)?(?:, (\d+) (?:error|errors))?")
 
 
@@ -80,9 +86,25 @@ def default_http(method, url, headers, body, max_bytes=2_000_000, timeout=120):
         with opener.open(request, timeout=timeout) as reply:
             return reply.status, reply.read(max_bytes)
     except urllib.error.HTTPError as err:
+        if err.code in (301, 302, 303, 307) and method == "GET":
+            return err.code, (err.headers.get("Location") or "").encode("ascii", "replace")    # the caller decides where it may go
         return err.code, err.read(max_bytes)
     except (urllib.error.URLError, OSError):
         raise AuthorityError("github_unreachable") from None
+
+
+def default_fetch(url, max_bytes):
+    """The file a GitHub asset redirect points at: HTTPS to GitHub's own storage hosts only, no credentials, no further redirects."""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if parts.scheme != "https" or parts.username or parts.port or not host.endswith(_ASSET_HOSTS):
+        raise AuthorityError("asset_address_not_allowed")
+    request = urllib.request.Request(url, headers={"User-Agent": "stynpilot-release-authority"})
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(request, timeout=120) as reply:
+            return reply.read(max_bytes)
+    except (urllib.error.URLError, OSError):
+        raise AuthorityError("asset_unreadable") from None
 
 
 def _write_private(path, data, *, replace=False):
@@ -102,7 +124,8 @@ def _write_private(path, data, *, replace=False):
 
 class Authority:
     def __init__(self, state_dir, *, run=default_run, http=default_http, clock=time.time, build_prefix=None, build_uid=None,
-                 clone_url=CLONE_URL, repository=release.REPOSITORY, work_root=None):
+                 clone_url=CLONE_URL, repository=release.REPOSITORY, work_root=None, sandbox=None, mount_work=False,
+                 tmpfs_mb=2048, inspect=None, fetch=None):
         self.root = Path(state_dir) / "release"
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
@@ -113,6 +136,10 @@ class Authority:
         # Where the unprivileged builder works. It must be reachable by the build account, so it cannot sit inside the installer's
         # private (0700) folder; root only ever READS results back out of it and re-hashes them.
         self.work_root = Path(work_root) if work_root else None
+        # sandbox(job_id, argv, workspace, seconds=, memory_mb=, tasks=, network=) -> the full command that runs ``argv`` as the build
+        # account inside the S3 sandbox; inspect(path, version) raises unless the upgrade path would accept the package.
+        self.sandbox, self.mount_work, self.tmpfs_mb, self.inspect = sandbox, mount_work, tmpfs_mb, inspect
+        self.fetch = fetch or default_fetch
         self.keyfile, self.tokenfile = self.root / "signing-ed25519.pem", self.root / "github-token"
 
     # -- console-provisioned secrets ------------------------------------------------------------------------------------
@@ -146,8 +173,8 @@ class Authority:
             raise AuthorityError("github_token_unreadable")
         return token
 
-    def _api(self, method, url, body=None, content_type="application/json", max_bytes=2_000_000):
-        headers = {"Authorization": "Bearer " + self._token(), "Accept": "application/vnd.github+json",
+    def _api(self, method, url, body=None, content_type="application/json", max_bytes=2_000_000, accept="application/vnd.github+json"):
+        headers = {"Authorization": "Bearer " + self._token(), "Accept": accept,
                    "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "stynpilot-release-authority"}
         data = body
         if body is not None:
@@ -192,9 +219,6 @@ class Authority:
         return {k: rec[k] for k in ("state", "version", "why", "sha256", "size", "tests_passed", "tests_failed", "tests_skipped",
                                     "reproducible", "commit", "started", "finished") if k in rec}
 
-    def _as_builder(self, argv):
-        return self.build_prefix + argv
-
     def prepare_check(self, commit, version):
         """Refuse an unusable request up front (before any background work)."""
         if type(commit) is not str or not _HEX40.fullmatch(commit):
@@ -203,18 +227,33 @@ class Authority:
             release.tag_for_version(version)
         except ReleaseError:
             raise AuthorityError("version_invalid") from None
-        if not self.build_prefix:
+        if not self.build_prefix and not self.sandbox:
             raise AuthorityError("builder_not_configured")
         if not self.keyfile.exists() or not self.tokenfile.exists():
             raise AuthorityError("release_authority_not_provisioned")
+        lock = self._take_lock()                              # one build at a time, machine-wide
+        os.close(lock)
+
+    def _take_lock(self):
+        fd = os.open(self.root / "build.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise AuthorityError("another_build_is_running") from None
+        return fd
 
     def prepare(self, commit, version, installed_version):
         """Build and verify (synchronous; the installer runs it in the background). Records the outcome; raises nothing for a
-        failed build - the record says why."""
+        failed build - the record says why. Only one build runs at a time and only the most recent few are kept."""
         self.prepare_check(commit, version)
-        previous = self._state(commit)
-        if previous and previous.get("state") == "building" and self.clock() - previous.get("started", 0) < BUILD_TIMEOUT + TEST_TIMEOUT:
-            raise AuthorityError("already_building")
+        lock = self._take_lock()
+        try:
+            return self._prepare_locked(commit, version)
+        finally:
+            os.close(lock)
+
+    def _prepare_locked(self, commit, version):
         d = self._dir(commit)
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True, mode=0o700)
@@ -229,65 +268,174 @@ class Authority:
             record.update(state="failed", why="unexpected_%s" % type(error).__name__)
         record["finished"] = self.clock()
         self._save(commit, record)
+        self._prune(keep=commit)
         return self.status(commit)
 
-    def _sh(self, argv, timeout, cwd=None, env=None):
-        return self.run(argv, timeout, cwd=cwd, env=env) if cwd is not None or env is not None else self.run(argv, timeout)
+    def _prune(self, keep, limit=RETAIN_BUILDS):
+        """Keep the newest few build folders (always including the one just made, and never one still being built)."""
+        found = []
+        for d in (self.root / "builds").iterdir():
+            rec = self._state(d.name) if _HEX40.fullmatch(d.name) else None
+            found.append((rec.get("finished", rec.get("started", 0)) if rec else 0, d.name))
+        found.sort(reverse=True)
+        for _, name in found[limit:]:
+            if name != keep:
+                shutil.rmtree(self.root / "builds" / name, ignore_errors=True)
+
+    # -- the sandboxed builder -----------------------------------------------------------------------------------------
+    def _phase(self, commit, name, argv, work, *, seconds, network=False, memory_mb=2048, tasks=256, env=None):
+        """Run one step as the unprivileged build account inside the sandbox. Returns (exit code, output). A step that runs out
+        of time is stopped together with everything it started; nothing it spawned survives."""
+        if self.sandbox:
+            job = hashlib.sha256(("%s|%s|%r" % (commit, name, self.clock())).encode()).hexdigest()[:24]
+            cmd = self.sandbox(job, argv, str(work), seconds=seconds, memory_mb=memory_mb, tasks=tasks, network=network)
+            try:
+                return self.run(cmd, seconds + 30, cwd=None, env=None)
+            finally:
+                self.run(["systemctl", "stop", "stynpilot-job-" + job + ".service"], 30)      # nothing may outlive the step
+        base = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C.UTF-8", "GIT_TERMINAL_PROMPT": "0", "HOME": str(work)}
+        return self.run(self.build_prefix + argv, seconds, cwd=str(work), env=dict(base, **(env or {})))
+
+    def _mount_work(self, work):
+        """A size-limited, memory-backed work area owned by the build account: whatever the build writes can never fill the disk."""
+        if not self.mount_work:
+            return False
+        code, _ = self.run(["mount", "-t", "tmpfs", "-o", "size=%dm,uid=%d,gid=%d,mode=0700,nosuid,nodev" % (
+            self.tmpfs_mb, self.build_uid or 0, self.build_uid or 0), "tmpfs", str(work)], 30)
+        if code != 0:
+            raise AuthorityError("work_area_unavailable")
+        return True
 
     def _build(self, commit, version, d):
-        env_base = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LC_ALL": "C.UTF-8", "GIT_TERMINAL_PROMPT": "0"}
         work = (self.work_root / commit) if self.work_root else d / "work"
         shutil.rmtree(work, ignore_errors=True)
         work.mkdir(parents=True, mode=0o700)
         if self.build_uid is not None:
             os.chown(work, self.build_uid, -1)
             os.chmod(work, 0o700)
-        src = work / "src"
-        shell = lambda script, timeout, **kw: self.run(self._as_builder(["sh", "-c", script]), timeout, cwd=str(work),
-                                                        env=dict(env_base, HOME=str(work), **kw))
-        steps = ("git init -q src && cd src && git remote add origin %s && git fetch -q --depth 1 origin %s && "
-                 "git checkout -q --detach FETCH_HEAD && git rev-parse HEAD" % (shlex.quote(self.clone_url), commit))
-        code, out = shell(steps, GIT_TIMEOUT)
+        mounted = False
+        try:
+            mounted = self._mount_work(work)
+            if mounted:
+                os.chmod(work, 0o700)
+            return self._build_in(commit, version, d, work)
+        finally:
+            if mounted:
+                self.run(["umount", "-l", str(work)], 30)
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _build_in(self, commit, version, d, work):
+        git = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never",
+               "-c", "protocol.https.allow=always", "-c", "advice.detachedHead=false"]
+        ph = lambda name, argv, **kw: self._phase(commit, name, argv, work, **kw)
+        steps = ((["/usr/bin/git", "init", "-q", "src"], False), (git + ["-C", "src", "remote", "add", "origin", self.clone_url], False),
+                 (git + ["-C", "src", "fetch", "-q", "--depth", "1", "origin", commit], True),
+                 (git + ["-C", "src", "checkout", "-q", "--detach", "FETCH_HEAD"], False))
+        for n, (argv, net) in enumerate(steps):
+            code, _ = ph("git%d" % n, argv, seconds=GIT_TIMEOUT, network=net, memory_mb=1024, tasks=64)
+            if code != 0:
+                raise AuthorityError("could_not_fetch_that_exact_commit")
+        code, out = ph("head", git + ["-C", "src", "rev-parse", "HEAD"], seconds=30, memory_mb=256, tasks=16)
         if code != 0 or out.strip().splitlines()[-1:] != [commit]:
             raise AuthorityError("could_not_fetch_that_exact_commit")
-        code, out = shell("cd src && sed -n 's/^__version__ = \"\\(.*\\)\"/\\1/p' src/stynpilot/__init__.py", 30)
+        code, out = ph("version", ["/usr/bin/python3", "-I", "-c", _VERSION_SCRIPT], seconds=30, memory_mb=256, tasks=16)
         if code != 0 or out.strip().replace(".dev", "~dev") != version:
             raise AuthorityError("source_version_differs_from_requested_version")
-        hashes = []
+        # The only step with network besides the fetch: download exactly the vendored wheels the lock file names (never code from
+        # the commit). The build itself re-checks every wheel's SHA-256 against the lock.
+        code, out = ph("lock", ["/usr/bin/cat", "src/packaging/vendor.lock"], seconds=30, memory_mb=256, tasks=16)
+        if code != 0:
+            raise AuthorityError("vendor_lock_unreadable")
+        for line in out.splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            m = _LOCK_LINE.fullmatch(line.strip())
+            if not m:
+                raise AuthorityError("vendor_lock_line_not_understood")
+            code, _ = ph("wheel", ["/usr/bin/python3", "-m", "pip", "download", "--no-deps", "--only-binary=:all:", "--no-input",
+                                   "--no-cache-dir", "-d", "cache", "%s==%s" % (m.group(1), m.group(2))],
+                         seconds=BUILD_TIMEOUT, network=True, memory_mb=1024, tasks=64)
+            if code != 0:
+                raise AuthorityError("dependency_download_failed")
         for n, mask in enumerate(("022", "077")):
-            code, out = shell("umask %s && cd src && mkdir -p ../out%d && python3 -c \"import sys;sys.path.insert(0,'tools');"
-                              "import build_deb;print(build_deb.build('../out%d','../cache'))\"" % (mask, n, n), BUILD_TIMEOUT)
+            script = ("umask %s && cd src && mkdir -p ../out%d && /usr/bin/python3 -c \"import sys;sys.path.insert(0,'tools');"
+                      "import build_deb;print(build_deb.build('../out%d','../cache'))\"" % (mask, n, n))
+            code, _ = ph("build%d" % n, ["/usr/bin/sh", "-c", script], seconds=BUILD_TIMEOUT)
             if code != 0:
                 raise AuthorityError("build_failed")
-            code, out = shell("sha256sum out%d/*.deb | cut -d' ' -f1" % n, 60)
-            if code != 0 or not re.fullmatch(r"[0-9a-f]{64}", out.strip()):
-                raise AuthorityError("build_output_unreadable")
-            hashes.append(out.strip())
-        if hashes[0] != hashes[1]:
-            raise AuthorityError("build_is_not_reproducible")
-        code, out = shell("cd src && PYTHONPATH=src python3 -m pytest -q -p no:cacheprovider tests 2>&1 | tail -3", TEST_TIMEOUT)
+        # Run the tests directly (no pipe: the exit status must be pytest's own).
+        code, out = ph("tests", ["/usr/bin/sh", "-c", "cd src && PYTHONPATH=src exec /usr/bin/python3 -m pytest -q -p no:cacheprovider tests"],
+                       seconds=TEST_TIMEOUT)
         counts = self._count_tests(out)
         if counts is None:
             raise AuthorityError("test_result_unreadable")
         passed, failed, skipped = counts
         if failed or not passed:
             raise AuthorityError("tests_failed_%d_passed_%d" % (failed, passed))
-        # Copy the verified package out of the builder's folder (root re-reads and re-hashes it: the builder is not trusted).
-        deb = next((work / "out0").glob("*.deb"), None)
-        if deb is None:
-            raise AuthorityError("package_missing")
-        real = os.path.realpath(deb)                          # the build account controls this folder: never follow it elsewhere
-        info = os.lstat(real)
-        if (not real.startswith(os.path.realpath(work) + os.sep) or not stat.S_ISREG(info.st_mode) or info.st_size > MAX_ASSET):
-            raise AuthorityError("package_not_where_the_builder_should_have_put_it")
-        data = Path(real).read_bytes()
-        if hashlib.sha256(data).hexdigest() != hashes[0]:
-            raise AuthorityError("package_changed_after_build")
+        if code != 0:
+            raise AuthorityError("tests_exit_status_%d" % code)
+        datas = [self._read_artifact(work, "out%d" % n) for n in (0, 1)]       # root reads and hashes BOTH, itself
+        hashes = [hashlib.sha256(x).hexdigest() for x in datas]
+        if hashes[0] != hashes[1]:
+            raise AuthorityError("build_is_not_reproducible")
         target = d / ("stynpilot_%s_all.deb" % version)
-        _write_private(target, data)
-        shutil.rmtree(work, ignore_errors=True)
-        return {"sha256": hashes[0], "size": len(data), "reproducible": True, "tests_passed": passed, "tests_failed": failed,
+        _write_private(target, datas[0])
+        self._inspect(target, version)
+        return {"sha256": hashes[0], "size": len(datas[0]), "reproducible": True, "tests_passed": passed, "tests_failed": failed,
                 "tests_skipped": skipped, "deb": target.name}
+
+    def _inspect(self, path, version):
+        if self.inspect is None:
+            raise AuthorityError("package_inspection_not_configured")
+        try:
+            self.inspect(path, version)
+        except AuthorityError:
+            raise
+        except Exception as refused:
+            raise AuthorityError("package_not_acceptable_%s" % str(getattr(refused, "code", type(refused).__name__))[:60]) from None
+
+    @staticmethod
+    def _read_artifact(work, name):
+        """The package a build left in ``work/name``, read by root WITHOUT trusting the builder's folder: every step is relative
+        to an open directory handle and refuses links, exactly one .deb is allowed, and the size limit applies while reading."""
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            top = os.open(work, flags)
+        except OSError:
+            raise AuthorityError("package_missing") from None
+        try:
+            try:
+                folder = os.open(name, flags, dir_fd=top)
+            except OSError:
+                raise AuthorityError("package_missing") from None
+            try:
+                debs = [n for n in os.listdir(folder) if n.endswith(".deb")]
+                if len(debs) != 1:
+                    raise AuthorityError("package_missing" if not debs else "more_than_one_package_built")
+                try:
+                    fd = os.open(debs[0], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=folder)
+                except OSError:
+                    raise AuthorityError("package_not_where_the_builder_should_have_put_it") from None
+                try:
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_ASSET:
+                        raise AuthorityError("package_not_where_the_builder_should_have_put_it")
+                    chunks, total = [], 0
+                    while True:
+                        block = os.read(fd, 1 << 20)
+                        if not block:
+                            break
+                        total += len(block)
+                        if total > MAX_ASSET:
+                            raise AuthorityError("package_too_large")
+                        chunks.append(block)
+                finally:
+                    os.close(fd)
+            finally:
+                os.close(folder)
+        finally:
+            os.close(top)
+        return b"".join(chunks)
 
     @staticmethod
     def _count_tests(text):
@@ -299,19 +447,47 @@ class Authority:
 
     # -- what the owner is asked to approve (from the verified record only) --------------------------------------------------
     def intent(self, commit, version, review_note="", from_min=""):
-        """The exact, installer-derived intent for a verified build. Raises unless the build is ready and still matches."""
+        """The exact, installer-derived intent for a verified build. Raises unless the build is ready and still matches.
+        ``review_note`` is the assistant's own words and is shown to the owner labelled as UNVERIFIED."""
         rec = self._state(commit) if type(commit) is str and _HEX40.fullmatch(commit) else None
         if not rec or rec.get("state") != "ready" or rec.get("version") != version:
             raise AuthorityError("build_not_ready")
         if type(review_note) is not str or not _REVIEW.fullmatch(review_note):
             raise AuthorityError("review_note_invalid")
-        deb = self._dir(commit) / rec["deb"]
-        data = deb.read_bytes()
+        data = self.package_bytes(commit, rec)
         if hashlib.sha256(data).hexdigest() != rec["sha256"] or len(data) != rec["size"]:
             raise AuthorityError("verified_package_was_altered")
         return {"commit": commit, "version": version, "sha256": rec["sha256"], "size": rec["size"],
                 "tests_passed": rec["tests_passed"], "tests_failed": rec["tests_failed"], "tests_skipped": rec["tests_skipped"],
-                "reproducible": True, "key_id": self.key_entry()["key_id"], "from_min": from_min, "review_note": review_note}
+                "reproducible": True, "key_id": self.key_entry()["key_id"], "from_min": from_min,
+                "review_note": review_note}
+
+    def package_bytes(self, commit, rec=None):
+        rec = rec or self._state(commit)
+        if not rec or "deb" not in rec:
+            raise AuthorityError("build_not_ready")
+        path = self._dir(commit) / rec["deb"]
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            raise AuthorityError("verified_package_was_altered") from None
+        try:
+            return os.read(fd, MAX_ASSET + 1) if os.fstat(fd).st_size <= MAX_ASSET else b"x" * (MAX_ASSET + 1)
+        finally:
+            os.close(fd)
+
+    def preflight(self, intent):
+        """Everything that can be checked BEFORE the owner's approval is used up, without any external effect: the token still
+        works, the verified package is intact and still acceptable to the upgrade path."""
+        check = self.check_token()
+        if not check.get("ok"):
+            raise AuthorityError("github_token_not_usable_%s" % check.get("why", "unknown"))
+        tagged = self.tag_commit(release.tag_for_version(intent["version"]))
+        if tagged is not None and tagged != intent["commit"]:
+            raise AuthorityError("tag_exists_for_a_different_commit")
+        path = self._dir(intent["commit"]) / ("stynpilot_%s_all.deb" % intent["version"])
+        self.intent(intent["commit"], intent["version"], intent.get("review_note", ""), intent["from_min"])
+        self._inspect(path, intent["version"])
 
     # -- after approval ---------------------------------------------------------------------------------------------------
     def manifest_for(self, intent, notes):
@@ -327,38 +503,128 @@ class Authority:
     def sign(self, manifest):
         return release.sign(manifest, self._private())
 
-    def publish(self, manifest, signature, commit):
-        """Create the GitHub release for the tag at the exact commit and upload the three files. Safe to repeat: an existing
-        identical release is accepted; anything different is refused."""
-        tag, repo = manifest["tag"], self.repository
-        deb_path = self._dir(commit) / ("stynpilot_%s_all.deb" % manifest["version"])
-        data = deb_path.read_bytes()
-        if hashlib.sha256(data).hexdigest() != manifest["sha256"] or len(data) != manifest["size"]:
-            raise AuthorityError("verified_package_was_altered")
-        base = "https://%s/repos/%s" % (API_HOST, repo)
-        status, body = self._api("GET", "%s/releases/tags/%s" % (base, tag))
-        if status == 200:
-            info = json.loads(body.decode())
-            have = {a["name"] for a in info.get("assets", [])}
-            if info.get("target_commitish") not in (commit, None) and len(info.get("target_commitish", "")) == 40:
-                raise AuthorityError("tag_exists_for_a_different_commit")
-        elif status == 404:
-            status, body = self._api("POST", base + "/releases", {"tag_name": tag, "target_commitish": commit, "name": tag,
-                                                                  "draft": False, "prerelease": True,
-                                                                  "body": "Built from commit %s and signed after owner approval." % commit})
-            if status != 201:
-                raise AuthorityError("release_not_created_status_%d" % status)
-            info, have = json.loads(body.decode()), set()
-        else:
+    # -- publication, in separately repeatable steps (the installer records which one it reached) --------------------------
+    def _base(self):
+        return "https://%s/repos/%s" % (API_HOST, self.repository)
+
+    def _json(self, status, body, ok=(200,)):
+        if status not in ok:
             raise AuthorityError("github_status_%d" % status)
-        files = {manifest["asset"]: (data, "application/octet-stream"),
-                 "release-manifest.json": (release.canonical(manifest), "application/json"),
-                 "release-manifest.json.sig": (signature.encode("ascii"), "text/plain")}
-        for name, (content, kind) in files.items():
-            if name in have:
+        try:
+            return json.loads(body.decode())
+        except ValueError:
+            raise AuthorityError("github_reply_unreadable") from None
+
+    def tag_commit(self, tag):
+        """The commit the Git tag really points at (None when the tag does not exist)."""
+        status, body = self._api("GET", "%s/git/ref/tags/%s" % (self._base(), urllib.parse.quote(tag)))
+        if status == 404:
+            return None
+        obj = self._json(status, body)["object"]
+        for _ in range(3):                                    # an annotated tag points at a tag object, which points at the commit
+            if obj.get("type") == "commit":
+                return obj["sha"]
+            if obj.get("type") != "tag":
+                raise AuthorityError("tag_points_at_something_unexpected")
+            status, body = self._api("GET", "%s/git/tags/%s" % (self._base(), obj["sha"]))
+            obj = self._json(status, body)["object"]
+        raise AuthorityError("tag_points_at_something_unexpected")
+
+    def _releases(self, tag):
+        status, body = self._api("GET", "%s/releases?per_page=100" % self._base())
+        return [r for r in self._json(status, body) if r.get("tag_name") == tag]
+
+    def draft(self, manifest, commit):
+        """Make (or find again) the DRAFT release for this tag. Refuses when the tag already exists for another commit or the
+        release is already public. Returns the release id."""
+        tag = manifest["tag"]
+        existing = self.tag_commit(tag)
+        if existing is not None and existing != commit:
+            raise AuthorityError("tag_exists_for_a_different_commit")
+        found = self._releases(tag)
+        if len(found) > 1:
+            raise AuthorityError("more_than_one_release_for_that_tag")
+        if found:
+            if not found[0].get("draft"):
+                raise AuthorityError("release_is_already_public")
+            return found[0]["id"]
+        if existing is not None:
+            raise AuthorityError("tag_exists_but_no_release_to_resume")
+        status, body = self._api("POST", self._base() + "/releases", {
+            "tag_name": tag, "target_commitish": commit, "name": tag, "draft": True, "prerelease": True,
+            "body": "Built from commit %s and signed after owner approval." % commit})
+        return self._json(status, body, ok=(201,))["id"]
+
+    def _assets(self, release_id):
+        status, body = self._api("GET", "%s/releases/%d" % (self._base(), release_id))
+        info = self._json(status, body)
+        return info, {a["name"]: a for a in info.get("assets", [])}
+
+    def _asset_bytes(self, asset):
+        status, body = self._api("GET", "%s/releases/assets/%d" % (self._base(), asset["id"]), accept="application/octet-stream",
+                                 max_bytes=MAX_ASSET + 1)
+        if status in (301, 302, 303, 307):                    # the real file is served from GitHub's own storage hosts
+            return self.fetch(body.decode("ascii", "replace"), MAX_ASSET + 1)
+        if status != 200:
+            raise AuthorityError("asset_unreadable_status_%d" % status)
+        return body
+
+    def _expected_files(self, manifest, signature, data):
+        return {manifest["asset"]: data, "release-manifest.json": release.canonical(manifest),
+                "release-manifest.json.sig": signature.encode("ascii")}
+
+    def _kinds(self, manifest):
+        return {manifest["asset"]: "application/octet-stream", "release-manifest.json": "application/json",
+                "release-manifest.json.sig": "text/plain"}
+
+    def upload_and_verify(self, release_id, manifest, signature, data):
+        """Put the three files on the DRAFT and read each one back: it must match byte for byte (a same-named but different file
+        is deleted and uploaded again; nothing else is touched)."""
+        want, kinds = self._expected_files(manifest, signature, data), self._kinds(manifest)
+        info, have = self._assets(release_id)
+        if not info.get("draft"):
+            raise AuthorityError("release_is_already_public")
+        for name, content in want.items():
+            asset = have.get(name)
+            if asset is not None and self._matches(asset, content):
                 continue
-            url = "https://%s/repos/%s/releases/%d/assets?name=%s" % (UPLOAD_HOST, repo, info["id"], urllib.parse.quote(name))
-            status, body = self._api("POST", url, content, content_type=kind, max_bytes=200_000)
+            if asset is not None:
+                status, _ = self._api("DELETE", "%s/releases/assets/%d" % (self._base(), asset["id"]))
+                if status != 204:
+                    raise AuthorityError("could_not_replace_a_wrong_asset")
+            url = "https://%s/repos/%s/releases/%d/assets?name=%s" % (UPLOAD_HOST, self.repository, release_id, urllib.parse.quote(name))
+            status, _ = self._api("POST", url, content, content_type=kinds[name], max_bytes=200_000)
             if status != 201:
                 raise AuthorityError("upload_failed_%s_status_%d" % (name[:30], status))
-        return {"tag": tag, "release_id": info["id"]}
+        self.verify_assets(release_id, manifest, signature, data)
+
+    def _matches(self, asset, content):
+        if asset.get("size") != len(content):
+            return False
+        return hashlib.sha256(self._asset_bytes(asset)).digest() == hashlib.sha256(content).digest()
+
+    def verify_assets(self, release_id, manifest, signature, data):
+        """All three files exist exactly once, with exactly the approved content."""
+        info, have = self._assets(release_id)
+        want = self._expected_files(manifest, signature, data)
+        if set(have) != set(want) or len(info.get("assets", [])) != len(want):
+            raise AuthorityError("release_assets_are_not_exactly_the_approved_three")
+        for name, content in want.items():
+            if not self._matches(have[name], content):
+                raise AuthorityError("asset_content_differs_%s" % name[:30])
+        return info
+
+    def make_public(self, release_id, manifest, signature, data, commit):
+        """Publish the verified draft, then confirm the real Git tag points at the approved commit and the public assets still
+        match. Repeating it on an already published identical release succeeds."""
+        info, _ = self._assets(release_id)
+        if info.get("draft"):
+            self.verify_assets(release_id, manifest, signature, data)
+            status, body = self._api("PATCH", "%s/releases/%d" % (self._base(), release_id), {"draft": False, "prerelease": True})
+            self._json(status, body)
+        if self.tag_commit(manifest["tag"]) != commit:
+            raise AuthorityError("published_tag_does_not_point_at_the_approved_commit")
+        info = self.verify_assets(release_id, manifest, signature, data)
+        if info.get("draft") or info.get("tag_name") != manifest["tag"]:
+            raise AuthorityError("release_not_public_as_expected")
+        return {"tag": manifest["tag"], "release_id": release_id}

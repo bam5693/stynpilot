@@ -213,6 +213,8 @@ class Executor:
             if self.upgrader.is_job(rid):
                 self.upgrader.reconcile(rid)
                 continue
+            if self._release_pending(rid):
+                continue                      # a spent release approval waiting to be resumed: not damage, never "attention"
             self._attention(rid, None, "interrupted_by_restart_or_crash", None)
             self.runs.finish(rid, "needs_owner_intervention", {"ok": False, "stopped": "interrupted_by_restart_or_crash",
                                                                "needs_owner_intervention": True})
@@ -223,6 +225,10 @@ class Executor:
         if record["state"] == "running" and self.upgrader.is_job(request_id):
             self.upgrader.reconcile(request_id)
             record = self.runs.status(request_id)
+        tx = self._tx_load(request_id) if re.fullmatch(r"[0-9a-f]{64}", request_id or "") else None
+        if tx:
+            record = dict(record, release={"state": tx["state"], "approval_spent": tx["state"] != "authorized",
+                                           "resumable": self._tx_resumable(tx) and record["state"] == "running"})
         return record
 
     def _settle_upgrades(self):
@@ -706,6 +712,9 @@ class Executor:
     def _need_authority(self):
         if self.authority is None:
             raise ExecutionDenied("release_publishing_not_configured")
+        if self.authority.inspect is None:                # the package must pass exactly the checks the upgrade itself will make
+            self.authority.inspect = lambda path, version: self.upgrader.inspect(
+                path, {"version": version}, self.upgrader.installed_version())
         return self.authority
 
     def release_prepare(self, commit, version):
@@ -786,65 +795,186 @@ class Executor:
             raise ExecutionDenied("already_decided_or_used")
         return have
 
+    # The approval is RESERVED (challenge used, run recorded) before anything external happens. From then on the release is a
+    # recorded transaction: authorized -> reserved -> signed -> drafted -> uploaded -> published -> started. An interruption at any
+    # step leaves the transaction on disk and the approval spent; ``release_resume`` continues only that exact operation.
+    TX_STATES = ("authorized", "reserved", "signed", "drafted", "uploaded", "published", "started")
+    TX_LIFETIME = 24 * 3600
+
+    def _tx_path(self, rid):
+        if type(rid) is not str or not re.fullmatch(r"[0-9a-f]{64}", rid):
+            raise ExecutionDenied("request_id_invalid")
+        return self.dir / "release-tx" / (rid + ".json")
+
+    def _tx_load(self, rid):
+        try:
+            tx = json.loads(self._tx_path(rid).read_text())
+        except (OSError, ValueError):
+            return None
+        return tx if type(tx) is dict and tx.get("state") in self.TX_STATES + ("abandoned",) else None
+
+    def _tx_save(self, tx):
+        path = self._tx_path(tx["rid"])
+        path.parent.mkdir(exist_ok=True, mode=0o700)
+        tmp = path.with_name(path.name + ".tmp")
+        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, json.dumps(tx, sort_keys=True).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+    def _tx_resumable(self, tx):
+        return bool(tx and tx["state"] in self.TX_STATES[1:-1] and self.clock_now() - tx["created"] <= self.TX_LIFETIME)
+
+    def clock_now(self):
+        return time.time()
+
+    def _release_pending(self, rid):
+        """True for a spent release approval whose transaction is not finished (it stays 'running' and is not 'attention')."""
+        tx = self._tx_load(rid)
+        if tx is None or tx["state"] in ("started", "abandoned"):
+            return False
+        if self.clock_now() - tx["created"] > self.TX_LIFETIME:
+            tx["state"] = "abandoned"
+            self._tx_save(tx)
+            self.runs.finish(rid, "failed", {"ok": False, "approval_spent": True, "release_state": "abandoned_after_%s" % tx.get("last", "?"),
+                                             "resumable": False})
+            return False
+        return True
+
     def release(self, payload, proof_token, challenge):
-        """ONE approval: verify it, sign the manifest, publish to the project's release, then run the normal protected upgrade.
-        Everything that can fail runs BEFORE the owner's challenge is used up; the approval covers exactly the approved intent."""
+        """ONE approval. Order: validate everything that can be validated; check the owner's proof and that the challenge is fresh,
+        unused and for this decision; do the checks that need no external effect; THEN reserve the approval durably; only then
+        sign, publish (draft -> verified -> public) and start the protected upgrade. Never half-spends silently."""
         authority = self._need_authority()
         intent = self._check_release_payload(payload)
         rid, _ = payload_hash(payload)
         if type(challenge) is not str or len(challenge) != 64:
             raise ExecutionDenied("challenge_unknown")
         fingerprint, passkey = self._prove(rid, proof_token, challenge, "approve")
+        self.runs.peek(challenge=challenge, request_id=rid, decision="approve")
         try:
+            authority.preflight(intent)
             self._backup_records(rid)
-            note = ["Release approved on the owner's phone; built from commit %s." % intent["commit"][:12],
-                    "Tests: %d passed, %d failed; the package built identically twice." % (intent["tests_passed"], intent["tests_failed"])]
-            manifest = authority.manifest_for(intent, note)
-            signature = authority.sign(manifest)
-            authority.publish(manifest, signature, intent["commit"])
-            expires = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            upgrade_payload = {"kind": "upgrade", "software": "stynpilot-self", "owner": self.owner, "device": self.device,
-                               "manifest": manifest, "signature": signature, "expires_at": expires}
-            content, _, installed = self.upgrader.check(upgrade_payload)
             with statelock.operation(self.dir):
-                job = None
-                for attempt in range(6):                      # GitHub can take a few seconds to serve a new release
-                    try:
-                        job = self.upgrader.prepare(rid, content, installed)
-                        break
-                    except ReleaseErrorTypes:
-                        if attempt == 5:
-                            raise
-                        self._sleep(5)
-                    except UpgradeRefused as refused:
-                        if refused.code != "download_does_not_match_signed_manifest" or attempt == 5:
-                            raise
-                        self._sleep(5)
+                tx = {"rid": rid, "intent": intent, "state": "authorized", "created": self.clock_now(), "last": "authorized"}
+                self._tx_save(tx)
                 try:
                     self._used_passkey(passkey, rid, "approve")
                     self.runs.consume(challenge=challenge, request_id=rid, decision="approve", proof=fingerprint, kind="release")
-                    unit = self.upgrader.start(rid, job)
                 except BaseException:
                     if self.runs.status(rid)["state"] == "not_started":
-                        shutil.rmtree(job, ignore_errors=True)
+                        self._tx_path(rid).unlink(missing_ok=True)       # nothing was spent: nothing to resume
                     raise
+                tx.update(state="reserved", last="reserved")
+                try:
+                    self._tx_save(tx)
+                except OSError:
+                    pass                                              # the run record itself still says approval was spent
+                return self._release_continue(tx)
         except statelock.Busy:
             raise ExecutionDenied("a_backup_or_restore_is_running_try_again") from None
         except AuthorityError as failed:
             raise ExecutionDenied("release_" + failed.code) from None
-        except UpgradeRefused as refused:
-            raise ExecutionDenied(refused.code) from None
         except backup.BackupError as failed:
             raise ExecutionDenied("records_backup_failed_%s" % str(failed)[:40]) from None
-        except ReleaseErrorTypes:
-            raise ExecutionDenied("release_download_failed") from None
-        except ExecutionDenied:
-            raise
         except OSError as error:
             raise ExecutionDenied("could_not_prepare_%s" % type(error).__name__) from None
+
+    def release_resume(self, rid):
+        """Continue a release whose approval was already spent and which stopped part-way. Needs no new approval and can do nothing
+        but finish the exact operation the owner approved (the intent is re-derived and must still match)."""
+        self._need_authority()
+        tx = self._tx_load(rid)
+        if tx is None or tx["state"] in ("started", "abandoned") or self.runs.status(rid)["state"] != "running":
+            raise ExecutionDenied("nothing_to_resume")
+        if not self._release_pending(rid):
+            raise ExecutionDenied("release_approval_expired_start_again_with_a_new_approval")
+        try:
+            with statelock.operation(self.dir):
+                return self._release_continue(tx)
+        except statelock.Busy:
+            raise ExecutionDenied("a_backup_or_restore_is_running_try_again") from None
+
+    def _release_continue(self, tx):
+        """Run the remaining steps of a RESERVED release. Any failure is reported as 'approval spent, here is where it stopped'."""
+        authority, rid, intent = self.authority, tx["rid"], tx["intent"]
+
+        def at(state):
+            tx.update(state=state, last=state)
+            self._tx_save(tx)
+        try:
+            have = authority.intent(intent["commit"], intent["version"], intent.get("review_note", ""), intent["from_min"])
+            if have != intent:
+                raise ExecutionDenied("release_intent_does_not_match_the_verified_build")
+            if intent["key_id"] not in self.upgrader.keys:
+                raise ExecutionDenied("release_key_not_trusted_by_this_machine")
+            installed = self.upgrader.installed_version()
+            if not self.upgrader.version_gt(intent["version"], installed):
+                raise ExecutionDenied("not_newer_than_installed")
+            data = authority.package_bytes(intent["commit"])
+            if tx["state"] == "reserved":
+                note = ["Release approved on the owner's phone; built from commit %s." % intent["commit"][:12],
+                        "Tests: %d passed, %d failed; the package built identically twice." % (intent["tests_passed"], intent["tests_failed"])]
+                manifest = authority.manifest_for(intent, note)
+                tx.update(manifest=manifest, signature=authority.sign(manifest))
+                at("signed")
+            manifest, signature = tx["manifest"], tx["signature"]
+            if tx["state"] == "signed":
+                tx["release_id"] = authority.draft(manifest, intent["commit"])
+                at("drafted")
+            if tx["state"] == "drafted":
+                authority._inspect(self.authority._dir(intent["commit"]) / ("stynpilot_%s_all.deb" % intent["version"]), intent["version"])
+                authority.upload_and_verify(tx["release_id"], manifest, signature, data)
+                at("uploaded")
+            if tx["state"] == "uploaded":
+                authority.make_public(tx["release_id"], manifest, signature, data, intent["commit"])
+                at("published")
+            unit, installed = self._release_start_upgrade(tx, manifest, signature)
+            at("started")
+        except BaseException as failed:
+            if isinstance(failed, (KeyboardInterrupt, SystemExit)):
+                raise
+            code = (failed.code if isinstance(failed, (AuthorityError, ExecutionDenied, UpgradeRefused)) else
+                    "download_failed" if isinstance(failed, ReleaseErrorTypes) else type(failed).__name__)
+            raise ExecutionDenied("release_approval_spent_stopped_after_%s_resumable_%s_%s" % (
+                tx["state"], "yes" if self._tx_resumable(tx) else "no", str(code)[:60])) from None
         return {"ok": None, "pending": True, "started": True, "request_id": rid, "unit": unit,
                 "from_version": installed, "to_version": manifest["version"],
                 "backup_scope": "installer_records_and_a_full_copy_of_the_current_version"}
+
+    def _release_start_upgrade(self, tx, manifest, signature):
+        rid = tx["rid"]
+        expires = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        upgrade_payload = {"kind": "upgrade", "software": "stynpilot-self", "owner": self.owner, "device": self.device,
+                           "manifest": manifest, "signature": signature, "expires_at": expires}
+        content, _, installed = self.upgrader.check(upgrade_payload)
+        job = self.upgrader.job_dir(rid)
+        if job.exists() and not (job / "job.json").exists():
+            shutil.rmtree(job, ignore_errors=True)               # an interrupted preparation: start that part over
+        if not job.exists():
+            for attempt in range(6):                              # GitHub can take a few seconds to serve a new release
+                try:
+                    job = self.upgrader.prepare(rid, content, installed)
+                    break
+                except ReleaseErrorTypes:
+                    if attempt == 5:
+                        raise
+                    self._sleep(5)
+                except UpgradeRefused as refused:
+                    if refused.code != "download_does_not_match_signed_manifest" or attempt == 5:
+                        raise
+                    self._sleep(5)
+        unit_file = job / "unit"
+        unit = unit_file.read_text() if unit_file.exists() else self.upgrader.start(rid, job)
+        return unit, installed
 
     def _backup_records(self, rid):
         """The installer's own records (ledgers, snapshots) saved before an upgrade, hash-verified on the way."""

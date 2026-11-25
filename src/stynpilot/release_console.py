@@ -31,7 +31,7 @@ def _write_addendum(path, data):
     os.replace(tmp, path)
 
 
-def init(authority, addendum, *, out=print):
+def init(authority, addendum, *, keys_file=release.KEYS_FILE, out=print):
     """Create the signing key here (if none) and make THIS computer trust its public half. Idempotent."""
     entry = authority.init_key()
     current = {"keys": [], "revoked": []}
@@ -45,8 +45,18 @@ def init(authority, addendum, *, out=print):
     if entry["key_id"] not in [k["key_id"] for k in current["keys"]]:
         current["keys"].append(entry)
     if entry["key_id"] in current["revoked"]:
-        current["revoked"].remove(entry["key_id"])
+        # A revocation is a decision someone made. Never undo it silently: a revoked key stays revoked.
+        out("This signing key's ID is on the revoked list. Not changing that. Nothing was changed.")
+        return 1
     _write_addendum(addendum, current)
+    try:                                                      # prove the machine really trusts it now (fresh read, same loader as upgrades)
+        trusted = release.load_trusted_keys(keys_file, addendum)
+    except release.ReleaseError as bad:
+        out("Written, but the trusted keys could not be re-read (%s). Run the status action." % bad.code)
+        return 1
+    if entry["key_id"] not in trusted:
+        out("The key was written but this computer does not trust it. Run the status action.")
+        return 1
     out("Release signing key ready. Key ID: %s" % entry["key_id"])
     out("This computer now trusts releases signed by that key. The private half never leaves the installer's private folder.")
     return 0

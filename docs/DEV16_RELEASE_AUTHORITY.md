@@ -4,26 +4,39 @@ Goal: no more Work mode or hand-published releases. An assistant proposes a comm
 approval (passkey); the Ryzen signs, publishes to GitHub and upgrades itself with health checks and automatic rollback.
 
 ## Flow
-1. `commander_prepare_stynpilot_release(device, commit, version)` (GREEN, changes nothing): the installer fetches that exact 40-char commit
-   of the public repo and, as an unprivileged account (`setpriv`, no new privileges), builds the .deb TWICE (umask 022 and 077, different
-   folders) and requires identical SHA-256, runs the whole test suite and requires zero failures. Root re-reads and re-hashes the result.
-2. `stynpilot_release_status(device, commit)` (read-only): building / ready / failed (+why), hash, size, test counts.
-3. `commander_request_stynpilot_release(device, commit, version, review_note)`: files a YELLOW `release` request. The payload's `intent`
-   is derived by the installer from its own record; a payload that differs in any field is refused. The owner sees commit, hash, test
-   counts, key id, what happens on approval, and the review note labelled as an unverified assistant note.
-4. Owner approves once (passkey or Auth0). Only then the installer: verifies the proof, backs up its records, builds the manifest,
-   signs it with its own key, uploads package+manifest+signature to the GitHub release for that tag (created at that exact commit; a tag on
-   a different commit is refused; re-running is safe), re-downloads it through the normal signed-release path, runs the existing protected
-   upgrade (package inspection, rollback copy, worker, health check, automatic rollback). Everything that can fail runs BEFORE the
-   approval is consumed; a failure leaves the approval unspent.
+1. `commander_prepare_stynpilot_release(device, commit, version)` (GREEN, changes nothing). One build at a time machine-wide (lock), the newest
+   3 builds kept. Every step runs as the unprivileged build account inside the same systemd-run sandbox the owner's project jobs use
+   (no privileges, read-only system, installer folders hidden, memory/process/CPU/time limits, own /tmp), in a size-limited memory-backed
+   work area. Network exists ONLY for two steps: `git fetch` of that exact commit (hooks off) and `pip download` of exactly the wheels the
+   commit's `vendor.lock` names (the build re-checks each SHA-256). Building and testing have no network. A step that times out is stopped
+   with everything it started. The package is built TWICE (umask 022 and 077); root reads BOTH outputs itself (directory handles, no links,
+   exactly one file, size limit enforced while reading), hashes each, and requires them equal. The test suite runs directly and BOTH its exit
+   status and summary must be clean. The package must pass the upgrade path's own inspection before it can ever be offered.
+2. `stynpilot_release_status(device, commit)` (read-only).
+3. `commander_request_stynpilot_release(...)`: YELLOW `release` request; `intent` is derived by the installer, any difference is refused. The
+   reviewer note is shown labelled as an unverified assistant note.
+4. Owner approves once. The installer then, in this order: checks the proof; checks the challenge is issued, fresh, unused and for this
+   decision; does the checks that need no external effect (GitHub token works, the tag is free or already at the approved commit, package intact
+   and acceptable, records backed up); **reserves the approval durably** (challenge used, run recorded, passkey counter/audit written); and only
+   then runs a recorded transaction: signed -> drafted -> uploaded (each file read back and compared by content) -> published (draft made
+   public, the real Git tag resolved and required to equal the approved commit) -> upgrade started. Every state is written to disk before the
+   next step.
+5. If anything stops after the reservation, the reply says so: `release_approval_spent_stopped_after_<state>_resumable_yes|no_<reason>`. It never
+   says "unchanged" or "unspent". `commander_resume_stynpilot_release(device, request_id)` continues only that exact transaction (the intent is
+   re-derived and must still match the verified build; no new authority; within 24 hours, then it is closed as abandoned and a new approval is
+   needed). A restart of the installer leaves a pending release alone (it is not damage); status shows `release: {state, approval_spent, resumable}`.
 
 ## Who holds what
 - Signing key: generated on the Ryzen at the console (`release/signing-ed25519.pem`, root, 0600). Never exported; no assistant sees it.
 - GitHub token: entered once at the console with hidden input, root 0600, used only against api/uploads.github.com (no redirects followed).
-- Trust: the machine trusts package keys plus a console-written addendum `/var/lib/stynpilot/trusted-release-keys.json` (keys + revoked).
+- Trust: read fresh on every use (a console-added or revoked key counts immediately); the machine trusts package keys plus a console-written addendum `/var/lib/stynpilot/trusted-release-keys.json` (keys + revoked).
+- `service release --action init` never un-revokes a key (it refuses) and re-reads trust after writing to prove it took effect.
 - Nothing is signed or published before approval; a wrong/replayed/other-request proof publishes nothing (tested).
 
 ## Honest limits
+- The sandbox and memory-backed work area (`mount -t tmpfs`) are only exercised for real on the Ryzen: if the machine refuses either, the build FAILS CLOSED
+  (`work_area_unavailable` or a failed step). Expect to find and fix any such environment detail in the dev17 test release.
+- The fetch/wheel steps have open internet (systemd cannot restrict to GitHub/PyPI names); they run no code from the commit with network and hold no secrets.
 - Root on the Ryzen can do anything a root-owned key allows; this protects against assistants and the owner-side service, not a root compromise.
 - "Independent review" is NOT enforced by code: the reviewer note is a labelled, unverified assistant statement. What IS enforced: exact
   commit, reproducible build, green tests (run by the machine), one owner proof.

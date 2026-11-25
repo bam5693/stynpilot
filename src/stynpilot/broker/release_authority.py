@@ -328,7 +328,7 @@ class Authority:
         result = self._phase_run(commit, name, argv, work, seconds, network, memory_mb, tasks, env)
         # What the owner (and the assistants) need to find a failure on a real machine: which step, its exit code, the end of its output.
         # The builder's output is untrusted DATA: printable ASCII only, short, and no secrets exist in the sandbox to leak.
-        tail = re.sub(r"[^ -~\n]", "?", result[1][-1500:])
+        tail = re.sub(r"[^ -~\n]", "?", result[1][-3000:])
         self.last_phase = {"phase": name, "code": result[0], "tail": tail}
         return result
 

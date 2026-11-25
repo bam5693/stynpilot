@@ -116,9 +116,36 @@ def build(out_dir=None, cache=None):
         for path in (control, control / "control", control / "md5sums"):
             os.utime(path, (epoch, epoch))
         target = out_dir / ("stynpilot_%s_all.deb" % deb_version())
-        subprocess.run(["dpkg-deb", "--root-owner-group", "-Zxz", "--build", str(pkg), str(target)], check=True,
-                       capture_output=True, env=dict(os.environ, SOURCE_DATE_EPOCH=str(epoch)))
+        env = dict(os.environ, SOURCE_DATE_EPOCH=str(epoch))
+        done = subprocess.run(["dpkg-deb", "--root-owner-group", "-Zxz", "--build", str(pkg), str(target)], capture_output=True,
+                              text=True, env=env)
+        if done.returncode != 0:
+            _explain_failure(pkg, done, env)
     return target
+
+
+def _short(text, limit=220):
+    text = "".join(c if " " <= c <= "~" else " " for c in (text or "")).strip()
+    return text[-limit:]
+
+
+def _explain_failure(pkg, done, env):
+    """dpkg-deb failed: say WHY (its own message), and probe the usual suspects so one failed run is enough to find the cause. This only
+    reports; it never produces a package, and the build still fails."""
+    probes = (("threads-max=1", ["dpkg-deb", "--root-owner-group", "-Zxz", "--threads-max=1", "--build"]),
+              ("gzip", ["dpkg-deb", "--root-owner-group", "-Zgzip", "--build"]),
+              ("no compression", ["dpkg-deb", "--root-owner-group", "-Znone", "--build"]))
+    for name, argv in probes:
+        scratch = pkg.parent / ("probe-" + name.split()[0].split("=")[0] + ".deb")
+        got = subprocess.run(argv + [str(pkg), str(scratch)], capture_output=True, text=True, env=env)
+        print("probe %s: exit %d %s" % (name, got.returncode, _short(got.stderr)), file=sys.stderr)
+    for argv in (["dpkg-deb", "--version"], ["tar", "--version"], ["xz", "--version"], ["id"], ["ls", "-ld", str(pkg), str(pkg / "DEBIAN")]):
+        try:
+            got = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+            print("%s: %s" % (argv[0], _short(got.stdout.splitlines()[0] if got.stdout else got.stderr, 120)), file=sys.stderr)
+        except (OSError, subprocess.SubprocessError) as error:
+            print("%s: %s" % (argv[0], type(error).__name__), file=sys.stderr)
+    raise SystemExit("dpkg-deb failed with exit %d: %s" % (done.returncode, _short(done.stderr or done.stdout, 400)))
 
 
 if __name__ == "__main__":

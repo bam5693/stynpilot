@@ -24,6 +24,11 @@ MAX_DEB = 64 * 1024 * 1024               # the whole package as stored
 MAX_MEMBER_UNPACKED = 256 * 1024 * 1024  # one tar after decompression
 MAX_ENTRIES = 20000
 MAX_NAME = 1024
+MAX_FILE = 128 * 1024 * 1024             # one file's content
+MAX_CONTENT = 192 * 1024 * 1024          # all files' content in one tar, counted from the headers BEFORE anything is read
+LZMA_MEMLIMIT = 128 * 1024 * 1024        # the xz decoder's own working memory
+# The only PAX keys a plain archive may carry (our writer emits none; dpkg-deb may emit path/linkpath/size/mtime for long values).
+_PAX_OK = {"path", "size", "mtime", "atime", "ctime", "uid", "gid", "uname", "gname"}
 
 
 class DebError(ValueError):
@@ -114,6 +119,9 @@ def _members(blob):
         if size < 0 or start + size > len(blob):
             raise DebError("damaged_deb_archive")
         found.append((name, blob[start:start + size]))
+        if size % 2:
+            if blob[start + size:start + size + 1] != b"\n":           # ar pads odd members with exactly one newline
+                raise DebError("damaged_deb_archive")
         at = start + size + (size % 2)
         if len(found) > 3:
             raise DebError("unexpected_deb_member")
@@ -124,7 +132,7 @@ def _unpack(name, data):
     if name.endswith(".tar.xz"):
         if not data.startswith(b"\xfd7zXZ\x00"):
             raise DebError("damaged_compression")
-        engine = lzma.LZMADecompressor(format=lzma.FORMAT_XZ)
+        engine = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=LZMA_MEMLIMIT)
         try:
             out = engine.decompress(data, max_length=MAX_MEMBER_UNPACKED + 1)
         except lzma.LZMAError:
@@ -161,7 +169,7 @@ def _read_tar(raw):
     except tarfile.TarError:
         raise DebError("damaged_tar") from None
     with archive:
-        count = 0
+        count, total = 0, 0
         while True:
             try:
                 info = archive.next()
@@ -184,15 +192,27 @@ def _read_tar(raw):
                 raise DebError("entry_not_owned_by_root")
             if info.mode & 0o7022:
                 raise DebError("dangerous_permissions")
+            # Sparse files (old GNU sparse or PAX GNU.sparse.*) can look like plain files yet expand when read: refuse them, and any
+            # PAX metadata beyond the plain keys.
+            if info.sparse is not None or set(info.pax_headers) - _PAX_OK:
+                raise DebError("unsupported_tar_metadata")
             if info.isdir():
+                if info.size:
+                    raise DebError("unsupported_tar_metadata")
                 dirs[name] = info.mode & 0o777
-            elif info.isreg() and info.type in (tarfile.REGTYPE, tarfile.AREGTYPE):
-                handle = archive.extractfile(info)
-                files[name] = (info.mode & 0o777, handle.read() if handle else b"")
-            elif info.issym() or info.islnk():
-                raise DebError("link_in_package")
             else:
-                raise DebError("special_file_in_package")
+                if info.size < 0 or info.size > MAX_FILE or total + info.size > MAX_CONTENT:
+                    raise DebError("file_too_large")
+                total += info.size
+                handle = archive.extractfile(info)
+                data = handle.read(info.size + 1) if handle else b""
+                if len(data) != info.size:
+                    raise DebError("damaged_tar")
+                files[name] = (info.mode & 0o777, data)
+        # A complete archive ends with zero blocks and nothing else (tarfile alone accepts a missing end or trailing bytes).
+        rest = raw[archive.offset:]
+        if len(rest) < 1024 or rest.count(0) != len(rest):
+            raise DebError("damaged_tar_end")
     for name in list(files) + list(dirs):              # every parent folder must be listed (no implied folders)
         parent = posixpath.dirname(name)
         if parent and parent not in dirs:

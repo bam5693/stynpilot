@@ -300,9 +300,13 @@ class Upgrader:
                        ("./md5sums", 0o644, "".join("%s  %s\n" % (d, r.strip()) for d, r in entries).encode())]
             # Built in-process (stynpilot.debfile): no tar child, so it works the same inside the release sandbox.
             try:
-                blob = debfile.build_deb_bytes(control, debfile.tree_entries(stage), int(time.time()))
+                data_entries = debfile.tree_entries(stage)
+                blob = debfile.build_deb_bytes(control, data_entries, int(time.time()))
             except debfile.DebError:
                 raise UpgradeRefused("rollback_copy_could_not_be_built") from None
+            want_control = {name[2:]: (mode, data) for name, mode, data in control if data is not None}
+            want_modes = {name[2:]: mode & 0o777 for name, mode, data in data_entries if data is not None}
+            want_dirs = {name[2:].rstrip("/") for name, mode, data in data_entries if data is None}
             fd = os.open(str(dest), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             try:
                 os.write(fd, blob)
@@ -318,8 +322,12 @@ class Upgrader:
             fields_back = debfile.control_fields(got["control"].get("control", (0, b""))[1].decode("utf-8", "replace"))
             if set(got["files"]) != set(wanted) or fields_back.get("Package") != PACKAGE or fields_back.get("Version") != installed:
                 raise UpgradeRefused("rollback_copy_differs_from_installed_files")
+            # control metadata byte-for-byte, the exact folders, and every file's mode as well as its content
+            if got["control"] != want_control or set(got["dirs"]) != want_dirs:
+                raise UpgradeRefused("rollback_copy_differs_from_installed_files")
             for rel, digest in wanted.items():
-                if hashlib.md5(got["files"][rel][1]).hexdigest() != digest:
+                mode, content = got["files"][rel]
+                if hashlib.md5(content).hexdigest() != digest or mode != want_modes.get(rel):
                     raise UpgradeRefused("rollback_copy_differs_from_installed_files")
 
     # -- 4. the job -------------------------------------------------------------------------------------

@@ -18,10 +18,10 @@ DATA = [("./", 0o755, None), ("./usr/", 0o755, None), ("./usr/bin/", 0o755, None
         ("./usr/share/", 0o755, None), ("./usr/share/odd", 0o644, b"odd length!")]
 
 
-def raw_tar(members):
+def raw_tar(members, fmt=tarfile.GNU_FORMAT):
     """A tar with arbitrary (possibly hostile) headers."""
     out = io.BytesIO()
-    with tarfile.open(fileobj=out, mode="w", format=tarfile.GNU_FORMAT) as t:
+    with tarfile.open(fileobj=out, mode="w", format=fmt) as t:
         for info, data in members:
             t.addfile(info, io.BytesIO(data) if data is not None else None)
     return out.getvalue()
@@ -33,8 +33,8 @@ def info(name, kind=tarfile.REGTYPE, mode=0o644, size=0, uid=0, gid=0, link=""):
     return i
 
 
-def deb_with_data(members, *, control=None, compress=True):
-    data = raw_tar(members)
+def deb_with_data(members, *, control=None, compress=True, fmt=tarfile.GNU_FORMAT, raw=None):
+    data = raw if raw is not None else raw_tar(members, fmt)
     return ar([("debian-binary", b"2.0\n"), ("control.tar.xz", tar_xz(control or CONTROL, 0)),
                ("data.tar.xz" if compress else "data.tar", lzma.compress(data, format=lzma.FORMAT_XZ) if compress else data)], 0)
 
@@ -136,6 +136,62 @@ class Refusals(unittest.TestCase):
         bad_control = tar_xz([("./", 0o755, None), ("./sub/", 0o755, None)], 0)
         self.refused(ar([members[0], ("control.tar.xz", bad_control), members[2]], 0), "unexpected_control_folder")
 
+
+
+class BoundedReading(unittest.TestCase):
+    """Dev21 review BLOCKER: nothing may expand beyond the limits while reading, sparse or not."""
+    root = (info("./", tarfile.DIRTYPE, 0o755), None)
+
+    def refused(self, blob, code):
+        with self.assertRaises(DebError) as e:
+            read_deb(blob)
+        self.assertEqual(e.exception.code, code)
+
+    def limit(self, name, value):
+        real = getattr(debfile, name)
+        setattr(debfile, name, value)
+        self.addCleanup(setattr, debfile, name, real)
+
+    def test_sparse_entries_and_unknown_pax_metadata_are_refused(self):
+        sparse = info("./s", size=10)
+        sparse.pax_headers = {"GNU.sparse.major": "1", "GNU.sparse.minor": "0", "GNU.sparse.name": "./s",
+                              "GNU.sparse.realsize": str(1 << 40)}
+        self.refused(deb_with_data([self.root, (sparse, b"0\n" + b"\0" * 8)], fmt=tarfile.PAX_FORMAT), "unsupported_tar_metadata")
+        odd = info("./o", size=1)
+        odd.pax_headers = {"SCHILY.xattr.security.capability": "x"}
+        self.refused(deb_with_data([self.root, (odd, b"x")], fmt=tarfile.PAX_FORMAT), "unsupported_tar_metadata")
+        self.refused(deb_with_data([self.root, (info("./g", tarfile.GNUTYPE_SPARSE), None)]), "special_file_in_package")
+        plain = info("./p", size=1)                                  # plain PAX keys from long values are fine
+        plain.pax_headers = {"mtime": "1.5"}
+        self.assertIn("p", read_deb(deb_with_data([self.root, (plain, b"x")], fmt=tarfile.PAX_FORMAT))["files"])
+
+    def test_file_and_total_sizes_are_checked_before_reading(self):
+        two = [self.root, (info("./a", size=600), b"a" * 600), (info("./b", size=600), b"b" * 600)]
+        self.limit("MAX_FILE", 500)
+        self.refused(deb_with_data(two), "file_too_large")
+        self.limit("MAX_FILE", 1000)
+        self.limit("MAX_CONTENT", 1000)                               # each file fits, the two together do not
+        self.refused(deb_with_data(two), "file_too_large")
+
+    def test_the_xz_decoder_memory_is_limited(self):
+        self.limit("LZMA_MEMLIMIT", 4096)
+        self.refused(build_deb_bytes(CONTROL, DATA, 0), "damaged_compression")
+
+    def test_the_tar_must_end_with_zero_blocks_and_nothing_else(self):
+        good = raw_tar([self.root, (info("./f", size=1), b"x")])
+        body = good.rstrip(b"\0")
+        body += b"\0" * (-len(body) % 512)
+        self.refused(deb_with_data(None, raw=body), "damaged_tar_end")                          # end marker missing
+        self.refused(deb_with_data(None, raw=good + b"junk" + b"\0" * 508), "damaged_tar_end")  # data after the end
+        self.assertIn("f", read_deb(deb_with_data(None, raw=good))["files"])
+
+    def test_ar_padding_must_be_a_newline(self):
+        blob = ar([("debian-binary", b"2.0\n"), ("odd", b"abc")], 0)
+        self.assertEqual(blob[-1:], b"\n")
+        self.assertEqual(len(debfile._members(blob)), 2)
+        with self.assertRaises(DebError) as e:
+            debfile._members(blob[:-1] + b"X")
+        self.assertEqual(e.exception.code, "damaged_deb_archive")
 
 if __name__ == "__main__":
     unittest.main()

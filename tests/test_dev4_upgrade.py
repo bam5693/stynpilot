@@ -345,7 +345,10 @@ class UpgradeTests(unittest.TestCase):
                 ("changed", lambda data: [(n, m, b"tampered" if n.endswith("README.md") else d) for n, m, d in data],
                  "rollback_copy_differs_from_installed_files"),
                 ("setuid", lambda data: [(n, 0o4755 if n.endswith("bin/stynpilot") else m, d) for n, m, d in data],
-                 "rollback_copy_could_not_be_verified")):
+                 "rollback_copy_could_not_be_verified"),
+                ("mode", lambda data: [(n, 0o644 if n.endswith("bin/stynpilot") else m, d) for n, m, d in data],
+                 "rollback_copy_differs_from_installed_files"),
+                ("folder", lambda data: data + [("./usr/extra/", 0o755, None)], "rollback_copy_differs_from_installed_files")):
             with self.subTest(name):
                 up.debfile.build_deb_bytes = lambda control, data, epoch, f=mutate: real(control, f(data), epoch)
                 try:
@@ -354,6 +357,16 @@ class UpgradeTests(unittest.TestCase):
                     self.assertEqual(refused.exception.code, code)
                 finally:
                     up.debfile.build_deb_bytes = real
+
+    def test_a_rollback_copy_with_altered_control_metadata_is_refused(self):
+        from stynpilot.broker import upgrade as up
+        real = up.debfile.build_deb_bytes
+        changed = lambda control: [(n, m, d.replace(b"Architecture: all", b"Architecture: amd64") if d else d) for n, m, d in control]
+        up.debfile.build_deb_bytes = lambda control, data, epoch: real(changed(control), data, epoch)
+        self.addCleanup(setattr, up.debfile, "build_deb_bytes", real)
+        with self.assertRaises(up.UpgradeRefused) as refused:
+            self.executor.upgrader.repack("0.1.0~dev3", self.tmp / "copy-control.deb")
+        self.assertEqual(refused.exception.code, "rollback_copy_differs_from_installed_files")
 
     def test_the_rollback_copy_is_built_under_a_private_umask(self):
         # The release sandbox runs with umask 0077: the rollback copy's control folder came out 0700 and dpkg-deb refused it.

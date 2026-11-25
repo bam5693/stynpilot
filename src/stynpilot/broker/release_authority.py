@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import selectors
+import secrets
 import shutil
 import signal
 import stat
@@ -65,6 +66,13 @@ class AuthorityError(Exception):
     def __init__(self, code):
         super().__init__(code)
         self.code = code
+
+
+# The installer service runs in its OWN mount namespace (PrivateTmp, ProtectHome). A mount it makes there is invisible to the sandbox
+# units systemd starts in the host namespace: on Dev19 try #4 the builds wrote into the plain folder under the tmpfs, and root, looking
+# at its empty tmpfs, found no package (package_missing). The work area is therefore mounted and unmounted in the HOST namespace
+# (it propagates into the installer's namespace), and before any build step root proves both sides see the same file system.
+HOST_NS = ["/usr/bin/nsenter", "--mount=/proc/1/ns/mnt", "--"]
 
 
 def default_run(argv, timeout, cwd=None, env=None, keep=20000):
@@ -169,7 +177,9 @@ def _write_private(path, data, *, replace=False):
 class Authority:
     def __init__(self, state_dir, *, run=default_run, http=default_http, clock=time.time, build_prefix=None, build_uid=None,
                  clone_url=CLONE_URL, repository=release.REPOSITORY, work_root=None, sandbox=None, mount_work=False,
-                 tmpfs_mb=2048, inspect=None, fetch=None):
+                 tmpfs_mb=2048, inspect=None, fetch=None, host_ns=None):
+        self.host_ns = list(HOST_NS if host_ns is None else host_ns)
+        self.mountinfo = "/proc/self/mountinfo"
         self.root = Path(state_dir) / "release"
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
@@ -365,7 +375,7 @@ class Authority:
         """A size-limited, memory-backed work area owned by the build account: whatever the build writes can never fill the disk."""
         if not self.mount_work:
             return False
-        code, _ = self.run(["mount", "-t", "tmpfs", "-o", "size=%dm,uid=%d,gid=%d,mode=0700,nosuid,nodev" % (
+        code, _ = self.run(self.host_ns + ["/usr/bin/mount", "-t", "tmpfs", "-o", "size=%dm,uid=%d,gid=%d,mode=0700,nosuid,nodev" % (
             self.tmpfs_mb, self.build_uid or 0, self.build_uid or 0), "tmpfs", str(work)], 30)
         if code != 0:
             raise AuthorityError("work_area_unavailable")
@@ -374,7 +384,7 @@ class Authority:
     def _build(self, commit, version, d):
         work = (self.work_root / commit) if self.work_root else d / "work"
         if self.mount_work:
-            self.run(["umount", "-l", str(work)], 30)             # a work area left mounted by a crashed build is released first
+            self.run(self.host_ns + ["/usr/bin/umount", "-l", str(work)], 30)   # a work area left by a crashed build is released first
         shutil.rmtree(work, ignore_errors=True)
         work.mkdir(parents=True, mode=0o700)
         if self.build_uid is not None and os.stat(work).st_uid != self.build_uid:
@@ -385,11 +395,36 @@ class Authority:
             mounted = self._mount_work(work)
             if mounted:
                 os.chmod(work, 0o700)
+                self._prove_shared_work(commit, work)
             return self._build_in(commit, version, d, work)
         finally:
             if mounted:
-                self.run(["umount", "-l", str(work)], 30)
+                self.run(self.host_ns + ["/usr/bin/umount", "-l", str(work)], 30)
             shutil.rmtree(work, ignore_errors=True)
+
+    def _prove_shared_work(self, commit, work):
+        """Fail closed unless root's view of the work area is the tmpfs AND the sandbox sees the very same one: root writes a fresh
+        random token there (exclusive, never through a link) and a sandbox step must read it back."""
+        mine = [line.split() for line in open(self.mountinfo, encoding="utf-8", errors="replace")]
+        here = [m for m in mine if len(m) > 4 and m[4] == str(work)]
+        kinds = [m[m.index("-") + 1] for m in here if "-" in m]
+        if not kinds or kinds[-1] != "tmpfs":
+            raise AuthorityError("work_area_not_visible_to_root")
+        token = secrets.token_hex(16)
+        name = ".shared-" + token[:8]
+        top = os.open(str(work), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=top)
+            try:
+                os.write(fd, token.encode())
+                os.fchmod(fd, 0o644)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(top)
+        code, out = self._phase(commit, "shared", ["/usr/bin/cat", name], work, seconds=60)
+        if code != 0 or out.strip() != token:
+            raise AuthorityError("work_area_not_shared_with_the_sandbox")
 
     def _build_in(self, commit, version, d, work):
         git = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never",

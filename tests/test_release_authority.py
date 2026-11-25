@@ -38,8 +38,14 @@ class FakeMachine:
         self.calls, self.fetched, self.stopped, self.mounts, self.unit_state = [], None, [], [], "inactive"
 
     def __call__(self, argv, timeout, cwd=None, env=None):
+        if argv[:3] == ["/usr/bin/nsenter", "--mount=/proc/1/ns/mnt", "--"]:           # host mount namespace
+            self.host_calls = getattr(self, "host_calls", 0) + 1
+            argv = [argv[3].rsplit("/", 1)[-1]] + argv[4:]
         if argv[0] in ("systemctl", "mount", "umount"):
             (self.stopped if argv[0] == "systemctl" else self.mounts).append(argv)
+            if argv[0] == "mount" and getattr(self, "mountinfo", None):
+                with open(self.mountinfo, "a") as handle:
+                    handle.write("99 1 0:99 / %s rw - %s tmpfs rw\n" % (argv[-1], getattr(self, "fstype", "tmpfs")))
             return 0, (self.unit_state if "is-active" in argv else "")
         assert argv[0] == "env", argv                  # always run through the unprivileged-account prefix
         args, work = list(argv[1:]), cwd
@@ -57,6 +63,10 @@ class FakeMachine:
             return 0, ""
         if args[:3] == ["/usr/bin/python3", "-I", "-c"]:
             return 0, self.version + "\n"
+        if args[0] == "/usr/bin/cat" and args[1].startswith(".shared-"):
+            if getattr(self, "private_namespace", False):                   # the Dev19 bug: the sandbox sees a different folder
+                return 1, "cat: No such file or directory"
+            return 0, (work / args[1]).read_text()
         if args[0] == "/usr/bin/cat":
             return 0, self.LOCK
         if args[:4] == ["/usr/bin/python3", "-m", "pip", "download"]:
@@ -281,12 +291,36 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(len(tests), 1)
         self.assertFalse(tests[0][1])                                          # the test run has no network
 
+    def mounting(self, where, **kw):
+        self.machine.mountinfo = str(self.tmp / ("mountinfo-" + where))
+        Path(self.machine.mountinfo).write_text("")
+        auth = self.make(self.tmp / where, self.machine, mount_work=True, build_uid=os.getuid(), **kw)
+        auth.mountinfo = self.machine.mountinfo
+        return auth
+
     def test_the_work_area_is_a_size_limited_memory_file_system_when_enabled(self):
-        auth = self.make(self.tmp / "mt", self.machine, mount_work=True, build_uid=os.getuid(), tmpfs_mb=64)
+        auth = self.mounting("mt", tmpfs_mb=64)
         auth.prepare(COMMIT, VERSION, "x")
         mount = [m for m in self.machine.mounts if m[0] == "mount"][0]
         self.assertIn("size=64m", mount[4])
         self.assertTrue(any(m[0] == "umount" for m in self.machine.mounts))
+        # mounted and released in the HOST mount namespace, not the installer's private one
+        self.assertEqual(self.machine.host_calls, len(self.machine.mounts))
+
+    def test_a_work_area_the_sandbox_cannot_see_fails_closed_before_any_build_step(self):
+        # Dev19 try #4: the installer's private mount namespace hid its tmpfs from the sandbox units -> package_missing after tests.
+        auth = self.mounting("pn")
+        self.machine.private_namespace = True
+        record = auth.prepare(COMMIT, VERSION, "x")
+        self.assertEqual((record["state"], record["why"]), ("failed", "work_area_not_shared_with_the_sandbox"))
+        self.assertFalse([c for c in self.machine.calls if c[0] == "/usr/bin/git"])        # nothing was fetched or built
+        self.assertTrue(any(m[0] == "umount" for m in self.machine.mounts))
+
+    def test_a_work_area_that_is_not_a_tmpfs_in_roots_view_fails_closed(self):
+        auth = self.mounting("nt")
+        self.machine.fstype = "ext4"
+        record = auth.prepare(COMMIT, VERSION, "x")
+        self.assertEqual((record["state"], record["why"]), ("failed", "work_area_not_visible_to_root"))
 
     def test_unusable_requests_are_refused_up_front(self):
         for commit, version in (("abc", VERSION), (COMMIT.upper(), VERSION), (COMMIT, "bad version")):
@@ -532,7 +566,7 @@ class AuthorityTests(unittest.TestCase):
         self.assertFalse(Authority(self.tmp / "rd2", run=self.machine, http=self.http).ready()["builder"])
 
     def test_a_work_area_left_mounted_by_a_crashed_build_is_released_first(self):
-        auth = self.make(self.tmp / "sm", self.machine, mount_work=True, build_uid=os.getuid())
+        auth = self.mounting("sm")
         auth.prepare(COMMIT, VERSION, "x")
         kinds = [m[0] for m in self.machine.mounts]
         self.assertEqual(kinds[0], "umount")                       # before the new mount

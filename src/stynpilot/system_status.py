@@ -28,7 +28,7 @@ FIRMWARE_NOTE = ("Restore-after-power-loss ('Restore on AC Power Loss' / 'AC Bac
                  "or change it on most PCs; check it once in the firmware setup screen.")
 MAX_VERIFY_BYTES = 64 * 1024 * 1024        # owner-state backups are small; a bigger file is reported, never loaded
 _IFACE = re.compile(r"[A-Za-z0-9_.-]{1,15}\Z")
-_SAFE = re.compile(r"[^A-Za-z0-9 _.,:/+@()%=-]")
+_SAFE = re.compile(r"[^A-Za-z0-9 _.,:/+@()%=\[\]-]")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 
 

@@ -224,7 +224,7 @@ class Authority:
         return {"ok": bool((info.get("permissions") or {}).get("push")), "why": "push_permission"}
 
     def ready(self):
-        return {"key": self.keyfile.exists(), "token": self.tokenfile.exists(), "builder": bool(self.build_prefix)}
+        return {"key": self.keyfile.exists(), "token": self.tokenfile.exists(), "builder": bool(self.build_prefix or self.sandbox)}
 
     # -- build + verify, from an exact commit ----------------------------------------------------------------------------
     def _dir(self, commit):
@@ -331,8 +331,8 @@ class Authority:
         """Stop the unit and VERIFY it is gone; a unit that will not stop fails the build rather than being ignored."""
         for _ in range(2):
             self.run(["systemctl", "stop", name], 30)
-            _, state = self.run(["systemctl", "is-active", name], 30)
-            if state.strip() not in ("active", "activating", "deactivating", "reloading"):
+            code, state = self.run(["systemctl", "is-active", name], 30)
+            if state.strip() in ("inactive", "failed") and code in (0, 3, 4):     # only an explicit answer counts; anything else = still unknown
                 return
         raise AuthorityError("sandbox_did_not_stop")
 
@@ -348,6 +348,8 @@ class Authority:
 
     def _build(self, commit, version, d):
         work = (self.work_root / commit) if self.work_root else d / "work"
+        if self.mount_work:
+            self.run(["umount", "-l", str(work)], 30)             # a work area left mounted by a crashed build is released first
         shutil.rmtree(work, ignore_errors=True)
         work.mkdir(parents=True, mode=0o700)
         if self.build_uid is not None:

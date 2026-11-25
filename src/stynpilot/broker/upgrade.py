@@ -23,8 +23,14 @@ import hashlib
 import json
 import os
 import pwd
+import io
 import re
+import resource
+import selectors
 import shutil
+import signal
+import subprocess
+import tarfile
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -46,6 +52,7 @@ _DIRS = {"", "usr", "usr/lib", "usr/libexec", "usr/bin", "usr/share", "usr/lib/s
          "usr/lib/systemd/user", "usr/share/applications", "usr/share/polkit-1", "usr/share/polkit-1/actions",
          "usr/share/doc"}
 _CONTROL_OK = {"control", "md5sums"}
+MAX_CONTROL_BYTES, MAX_LISTING_BYTES, MAX_LISTING_LINES = 1 << 20, 8 << 20, 50000
 _EXPIRY = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 
 
@@ -159,23 +166,34 @@ class Upgrader:
 
     def inspect(self, deb, manifest, installed):
         """The package must be exactly a plain StyNpilot file set. Raises UpgradeRefused."""
-        code, info = self._run(["dpkg-deb", "-f", str(deb)], 60)
-        if code != 0:
+        # The package is untrusted until these checks pass: every inspection command is bounded in output, memory, CPU and file size,
+        # and nothing is extracted to disk (the control data is read from a size-limited stream and checked in memory).
+        code, raw, over = self._bounded(["dpkg-deb", "-f", str(deb)], 65536)
+        info = raw.decode("utf-8", "replace")
+        if code != 0 or over:
             raise UpgradeRefused("package_unreadable")
         if (_field(info, "Package") != PACKAGE or _field(info, "Version") != manifest["version"]
                 or _field(info, "Architecture") != "all"):
             raise UpgradeRefused("package_identity_differs_from_manifest")
         if _field(info, "Depends") != self._installed_field("Depends"):
             raise UpgradeRefused("package_changes_dependencies_not_allowed_here")
-        with tempfile.TemporaryDirectory(dir=self.jobs) as tmp:
-            code, _ = self._run(["dpkg-deb", "-e", str(deb), tmp + "/c"], 60)
-            if code != 0:
-                raise UpgradeRefused("package_unreadable")
-            if set(os.listdir(tmp + "/c")) - _CONTROL_OK:
-                raise UpgradeRefused("package_has_install_scripts_or_extra_control_files")
-        code, listing = self._run(["dpkg-deb", "-c", str(deb)], 60)
+        code, raw, over = self._bounded(["dpkg-deb", "--ctrl-tarfile", str(deb)], MAX_CONTROL_BYTES)
+        if code != 0 or over:
+            raise UpgradeRefused("package_unreadable" if not over else "package_control_data_too_large")
+        try:
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as control:
+                members = control.getmembers()
+        except (tarfile.TarError, OSError, EOFError):
+            raise UpgradeRefused("package_unreadable") from None
+        names = {m.name.removeprefix("./").rstrip("/") for m in members} - {"", "."}
+        if len(members) > 16 or names - _CONTROL_OK or any(not (m.isreg() or m.isdir()) for m in members):
+            raise UpgradeRefused("package_has_install_scripts_or_extra_control_files")
+        code, raw, over = self._bounded(["dpkg-deb", "-c", str(deb)], MAX_LISTING_BYTES)
         if code != 0:
             raise UpgradeRefused("package_unreadable")
+        if over or raw.count(b"\n") > MAX_LISTING_LINES:
+            raise UpgradeRefused("package_listing_too_large")
+        listing = raw.decode("utf-8", "replace")
         for line in listing.splitlines():
             parts = line.split(None, 5)
             if len(parts) < 6:
@@ -192,6 +210,48 @@ class Upgrader:
             elif not (rel.startswith(_ALLOWED_PREFIXES)):
                 raise UpgradeRefused("package_path_not_allowed")
         return True
+
+    @staticmethod
+    def _bounded(argv, limit, timeout=60):
+        """(exit code, up to ``limit`` bytes of stdout, whether there was more). Memory, CPU and file size are rlimited, output is
+        bounded while read, and the whole process group is killed on excess or timeout. For commands run on untrusted files."""
+        def confine():
+            resource.setrlimit(resource.RLIMIT_CPU, (timeout, timeout))
+            resource.setrlimit(resource.RLIMIT_AS, (2 << 30, 2 << 30))
+            resource.setrlimit(resource.RLIMIT_FSIZE, (16 << 20, 16 << 20))
+            resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+        try:
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    preexec_fn=confine, start_new_session=True)
+        except OSError:
+            return 127, b"", False
+        chunks, size, over = [], 0, False
+        deadline = time.monotonic() + timeout
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        while time.monotonic() < deadline:
+            if sel.select(0.5):
+                block = os.read(proc.stdout.fileno(), 65536)
+                if not block:
+                    break
+                size += len(block)
+                if size > limit:
+                    over = True
+                    break
+                chunks.append(block)
+        else:
+            over = True
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        sel.close()
+        proc.stdout.close()
+        try:
+            code = proc.wait(10)
+        except subprocess.TimeoutExpired:
+            code = 124
+        return code, b"".join(chunks), over
 
     # -- 3. the rollback copy ---------------------------------------------------------------------------
     def previous_package(self, installed, dest):

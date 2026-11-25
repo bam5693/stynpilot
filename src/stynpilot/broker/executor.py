@@ -849,6 +849,8 @@ class Executor:
         if self.needs_attention():
             raise ExecutionDenied("owner_intervention_required")
         self._settle_upgrades()
+        if self.needs_attention():                        # settling an outstanding upgrade can itself raise attention
+            raise ExecutionDenied("owner_intervention_required")
         if [r for r in self.runs.running() if r != rid]:
             raise ExecutionDenied("another_change_is_still_running")
 
@@ -885,6 +887,7 @@ class Executor:
         if self.clock_now() - tx["created"] > self.TX_LIFETIME:
             tx["state"] = "abandoned"
             self._tx_save(tx)
+            self._tx_copy_path(rid).unlink(missing_ok=True)
             self.runs.finish(rid, "failed", {"ok": False, "approval_spent": True, "release_state": "abandoned_after_%s" % tx.get("last", "?"),
                                              "resumable": False})
             return False
@@ -992,6 +995,7 @@ class Executor:
                 at("published")
             unit, installed = self._release_start_upgrade(tx, manifest, signature)
             at("started")
+            self._tx_copy_path(rid).unlink(missing_ok=True)        # the pinned copy is only needed until the upgrade has its own
         except BaseException as failed:
             if isinstance(failed, (KeyboardInterrupt, SystemExit)):
                 raise

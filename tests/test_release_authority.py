@@ -420,6 +420,47 @@ class AuthorityTests(unittest.TestCase):
         got = auth.prepare(COMMIT, VERSION, "x")
         self.assertEqual((got["state"], got["why"]), ("failed", "sandbox_did_not_stop"))
 
+    def test_a_unit_whose_state_is_unknown_empty_or_unreadable_is_never_assumed_stopped(self):
+        for state in ("", "unknown\n", "garbage", "deactivating"):
+            machine = FakeMachine(self.deb_bytes)
+            machine.unit_state = state
+            auth = self.make(self.tmp / ("u" + str(abs(hash(state)))), machine,
+                             sandbox=lambda job, argv, ws, **k: ["env", "WORKSPACE=" + ws] + argv, work_root=self.tmp / ("r" + str(abs(hash(state)))))
+            self.assertEqual(auth.prepare(COMMIT, VERSION, "x")["why"], "sandbox_did_not_stop", state)
+
+        class TimesOut(FakeMachine):
+            def __call__(self, argv, timeout, cwd=None, env=None):
+                if argv[:2] == ["systemctl", "is-active"]:
+                    return 124, ""
+                return super().__call__(argv, timeout, cwd=cwd, env=env)
+        auth = self.make(self.tmp / "to", TimesOut(self.deb_bytes), sandbox=lambda job, argv, ws, **k: ["env", "WORKSPACE=" + ws] + argv,
+                         work_root=self.tmp / "toroot")
+        self.assertEqual(auth.prepare(COMMIT, VERSION, "x")["why"], "sandbox_did_not_stop")
+
+    def test_inspection_commands_on_untrusted_packages_are_bounded(self):
+        from stynpilot.broker.upgrade import Upgrader
+        code, data, over = Upgrader._bounded(["sh", "-c", "yes"], 1000)
+        self.assertTrue(over)
+        self.assertLessEqual(len(data), 1000)
+        code, data, over = Upgrader._bounded(["sh", "-c", "echo hi"], 1000)
+        self.assertEqual((code, data, over), (0, b"hi\n", False))
+        import time as _t
+        start = _t.monotonic()
+        code, data, over = Upgrader._bounded(["sleep", "30"], 1000, timeout=1)
+        self.assertTrue(over)
+        self.assertLess(_t.monotonic() - start, 10)
+
+    def test_readiness_recognises_the_production_sandbox_builder(self):
+        sandboxed = Authority(self.tmp / "rd", run=self.machine, http=self.http, sandbox=lambda *a, **k: [])
+        self.assertTrue(sandboxed.ready()["builder"])
+        self.assertFalse(Authority(self.tmp / "rd2", run=self.machine, http=self.http).ready()["builder"])
+
+    def test_a_work_area_left_mounted_by_a_crashed_build_is_released_first(self):
+        auth = self.make(self.tmp / "sm", self.machine, mount_work=True, build_uid=0)
+        auth.prepare(COMMIT, VERSION, "x")
+        kinds = [m[0] for m in self.machine.mounts]
+        self.assertEqual(kinds[0], "umount")                       # before the new mount
+
     def test_an_unrelated_draft_with_the_same_tag_is_never_adopted_or_touched(self):
         manifest, sig, data = self.staged()
         self.http.next_id += 1
@@ -645,6 +686,23 @@ class OneApprovalTests(tu.UpgradeTests):
         result = self.executor.release_resume(self.rid)
         self.assertTrue(result["pending"])
         self.assertEqual(self.http.assets()["stynpilot-v0.1.0-dev4.deb"], self.deb.read_bytes())
+
+    def test_the_pinned_copy_is_dropped_once_the_upgrade_has_its_own(self):
+        payload, challenge, proof = self.go()
+        self.executor.release(payload, proof, challenge)
+        self.assertFalse(self.executor._tx_copy_path(self.rid).exists())
+
+    def test_settling_an_upgrade_that_raises_attention_stops_the_release_gate(self):
+        payload, challenge, proof = self.interrupted()
+        calls = []
+
+        def settle():
+            calls.append(1)
+            self.executor._attention("d" * 64, None, "upgrade_worker_vanished_without_a_result", None)
+        self.executor._settle_upgrades = settle
+        self.assertIn("owner_intervention_required", self.expect_denied(self.executor.release_resume, self.rid))
+        self.assertEqual(calls, [1])
+        self.assertEqual(self.http.assets(), {})
 
     def test_a_pinned_package_that_changes_is_caught_right_before_upload(self):
         payload, challenge, proof = self.interrupted()

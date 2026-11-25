@@ -304,10 +304,17 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         except Exception:
             return JSONResponse({"ok": False, "uncertain": True, "message": "The outcome is uncertain. Ask the assistant to run "
                                  "passkey_status and check before trying again."}, status_code=500)
-        text = ("Passkey created: %s (%s). It cannot approve anything yet. Next: confirm it with your Auth0 sign-in (opening that now)."
-                % (done["label"], "synced through your Google account" if done["synced"] else "stays on this device"))
-        response = JSONResponse({"ok": True, "message": text, "next": "/approve/" + done["activation_request_id"]},
-                                headers={"Cache-Control": "no-store"})
+        kind = "synced through your Google account" if done["synced"] else "stays on this device"
+        if done.get("activation_request_id"):
+            text = ("Passkey created: %s (%s). It cannot approve anything yet. Next: confirm it with your Auth0 sign-in (opening that now)."
+                    % (done["label"], kind))
+            body = {"ok": True, "message": text, "next": "/approve/" + done["activation_request_id"]}
+        else:
+            text = ("Passkey created: %s (%s), short ID %s. It cannot approve anything yet. To finish, at your computer run: "
+                    "sudo stynpilot service passkeys --config /etc/stynpilot/installer.json --action activate --kid %s"
+                    % (done["label"], kind, done["kid"], done["kid"]))
+            body = {"ok": True, "message": text}
+        response = JSONResponse(body, headers={"Cache-Control": "no-store"})
         response.delete_cookie(COOKIE, path="/approve")
         return response
 

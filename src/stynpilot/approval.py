@@ -291,7 +291,12 @@ class ApprovalFlow:
             item["used"] = True
         # The key now exists but is POWERLESS. Activation is a separate request that names this exact key; the owner approves it
         # with the Auth0 sign-in, whose nonce commits to the key's hash.
-        done["activation_request_id"] = self._file_activation(item["request_id"], done)
+        try:
+            remote = bool(self.broker.passkey_list().get("remote_activation"))
+        except Exception:
+            remote = False
+        # By default the owner finishes at the computer's console (independent of this service); see passkey_console.py.
+        done["activation_request_id"] = self._file_activation(item["request_id"], done) if remote else None
         return done
 
     def _file_activation(self, enroll_rid, done):

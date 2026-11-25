@@ -67,6 +67,7 @@ class InstallWithPasskey(unittest.TestCase, Enrolling):
         ta.ApprovalTests.setUp(self)
         self.store_pk = self.new_store(self.tmp / "broker")
         self.executor.passkeys = self.store_pk
+        self.executor.allow_remote_activation = True
         self.phone = self.enroll(self.store_pk)
         self.flow = self.make_flow()
         self.client = TestClient(build_app(flow=self.flow, public_host=HOST), base_url="https://" + HOST, follow_redirects=False)
@@ -373,6 +374,7 @@ class PasskeyAdministration(unittest.TestCase, Enrolling):
         trd.Door.setUp(self)
         self.pk = self.new_store(self.tmp / "broker")
         self.executor.passkeys = self.pk
+        self.executor.allow_remote_activation = True
 
     def request(self, action, label="", kid="", pub="", **kw):
         return {"kind": "passkey", "action": action, "label": label, "kid": kid, "pub": pub, "owner": OWNER, "device": DEVICE,
@@ -622,6 +624,7 @@ class EnrollmentThroughTheBrowser(unittest.TestCase, Enrolling):
         trd.Door.setUp(self)
         self.pk = self.new_store(self.tmp / "broker")
         self.executor.passkeys = self.pk
+        self.executor.allow_remote_activation = True
         self.store = RequestStore(self.tmp / "state" / "requests.sqlite3")
         self.tokens = []
         self.flow = ApprovalFlow(store=self.store, broker=self.executor, exchange=lambda code, verifier: self.tokens.pop(),
@@ -891,6 +894,7 @@ class UpgradeWithPasskey(unittest.TestCase, Enrolling):
         tu.UpgradeTests.setUp(self)
         self.pk = self.new_store(self.tmp / "broker")
         self.executor.passkeys = self.pk
+        self.executor.allow_remote_activation = True
         self.phone = self.enroll(self.pk)
 
     def test_a_passkey_starts_exactly_one_upgrade_and_cannot_be_replayed(self):

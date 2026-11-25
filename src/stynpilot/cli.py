@@ -16,8 +16,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="stynpilot")
     sub = parser.add_subparsers(dest="command", required=True)
     svc = sub.add_parser("service")
-    svc.add_argument("role", choices=("owner", "installer", "provision"))
+    svc.add_argument("role", choices=("owner", "installer", "provision", "passkeys"))
     svc.add_argument("--config", required=True)
+    svc.add_argument("--action", choices=("list", "activate", "confirm-restored"), default="list")
+    svc.add_argument("--kid", default="")
     sub.add_parser("setup")
     sub.add_parser("auth-check", help="read-only: why might a password step fail from this login?")
     sub.add_parser("setup-system", help="finish setup's one password step in this terminal (works over SSH)")
@@ -46,7 +48,7 @@ def main(argv=None):
             print(__version__)
         elif args.command == "service":
             from . import service
-            return service.main([args.role, "--config", args.config])
+            return service.main([args.role, "--config", args.config, "--action", args.action, "--kid", args.kid])
         elif args.command == "setup":
             from . import setup_wizard
             setup_wizard.serve()

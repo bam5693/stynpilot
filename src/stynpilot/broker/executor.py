@@ -172,7 +172,8 @@ def _sha256(path):
 class Executor:
     def __init__(self, *, state_dir, owner, device, verifier, run=apt.real_run, require_root=True,
                  sources_root="/etc/apt", file_root="/", owner_uid=None, release_keys=None, fetch_release=None,
-                 launch_worker=None, upgrade_options=None, jobs=None, passkeys=None):
+                 launch_worker=None, upgrade_options=None, jobs=None, passkeys=None,
+                 allow_remote_activation=False):
         self.dir = Path(state_dir)
         if require_root and not apt.is_root():
             raise ExecutionDenied("installer_must_run_as_root")
@@ -194,6 +195,9 @@ class Executor:
         self.upgrader = Upgrader(self, keys=release_keys, fetch=fetch_release, launch=launch_worker,
                                  options=upgrade_options)
         self.jobs = jobs
+        # Activating a passkey through the owner-side service is OFF unless explicitly allowed: by default the owner confirms a new
+        # passkey at the computer's console (passkey_console.py), which does not depend on that service.
+        self.allow_remote_activation = allow_remote_activation
         self.passkeys = passkeys                  # PasskeyStore or None (passkeys not configured)
         if jobs is not None:
             jobs.reconcile()
@@ -444,6 +448,8 @@ class Executor:
         labeled = type(label) is str and bool(LABEL.fullmatch(label))
         named = type(kid) is str and bool(KID.fullmatch(kid))
         hashed = type(pub) is str and bool(PUBHASH.fullmatch(pub))
+        if action == "activate" and not self.allow_remote_activation:
+            raise ExecutionDenied("activation_needs_the_console")
         shape = {"enroll": labeled and kid == "" and pub == "", "activate": labeled and named and hashed,
                  "revoke": label == "" and named and pub == ""}[action]
         if not shape:
@@ -489,7 +495,9 @@ class Executor:
         active = self.passkeys.active()
         return {"configured": True, "rp_id": self.passkeys.rp_id, "origin": self.passkeys.origin, "passkeys": active,
                 "pending": [{"kid": k["kid"], "label": k["label"]} for k in self.passkeys.pending()],
-                "retirement_ready": len(active) >= 2, "audit_chain_ok": self.passkeys.audit_ok()}
+                "retirement_ready": len(active) >= 2, "audit_chain_ok": self.passkeys.audit_ok(),
+                "remote_activation": bool(self.allow_remote_activation),
+                "quarantined": [{"kid": k["kid"], "label": k["label"]} for k in self.passkeys.quarantined()]}
 
     def passkey_begin(self, request_id):
         if self.passkeys is None:

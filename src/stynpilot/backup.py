@@ -6,6 +6,9 @@
 2. SOFTWARE-INSTALL ROLLBACK RECORDS (kind "root", needs the owner's password through polkit): the root installer's
    ledgers and the per-install package snapshots that let an installed program be rolled back later. This is NOT a
    system snapshot and NOT owner state.
+   When passkeys are enabled their database (public keys, revocations, audit chain) is included. A RESTORE puts every
+   restored passkey in QUARANTINE: it cannot approve anything until the owner re-confirms it at the computer's console, so an
+   older backup can never silently resurrect a passkey that was revoked later.
 3. PRESERVE26 ROLLBACK: nothing here touches it. It is a separate package that G8 keeps in place.
 
 A backup is one tar of regular files plus a manifest with an exact schema, a kind and a SHA-256 for every file.
@@ -40,6 +43,7 @@ from . import statelock
 SCHEMA = 1
 OWNER_FILES = ("requests.sqlite3", "revoked-clients.json", "token-revocations.sqlite3", "provisioned.json")
 ROOT_DBS = ("runs.sqlite3", "installs.sqlite3")
+ROOT_OPTIONAL_DBS = ("passkeys.sqlite3",)          # present only when passkeys are enabled; never required
 ROOT_TREES = ("snapshots", "attention")
 MANIFEST = "manifest.json"
 _MAX_FILE = 1024 * 1024 * 1024
@@ -63,6 +67,8 @@ def _snapshot(path):
             dest = sqlite3.connect(target)
             try:
                 source.backup(dest)
+            except sqlite3.Error:
+                raise BackupError("state_database_unreadable_%s" % path.name) from None
             finally:
                 dest.close()
                 source.close()
@@ -116,6 +122,13 @@ def _gather(state_dir, kind):
         total += _sized(path, total)
         members[name] = _snapshot(path)
     if kind == "root":
+        for name in ROOT_OPTIONAL_DBS:
+            path = state_dir / name
+            if path.is_symlink():
+                raise BackupError("state_file_missing_%s" % name)
+            if path.exists():
+                total += _sized(path, total)
+                members[name] = _snapshot(path)
         for tree in ROOT_TREES:
             base = state_dir / tree
             if not base.is_dir() or base.is_symlink():
@@ -175,6 +188,10 @@ def _validate_complete(kind, files):
     for name in files:
         parts = name.split("/")
         if name in ROOT_DBS:
+            continue
+        if name in ROOT_OPTIONAL_DBS:
+            _sqlite_rows(files[name], "SELECT COUNT(*) FROM passkeys")          # must be a readable passkey database
+            _sqlite_rows(files[name], "SELECT COUNT(*) FROM audit")
             continue
         if parts[0] == "attention" and len(parts) == 2 and parts[1].endswith(".json"):
             continue
@@ -252,6 +269,9 @@ def restore_backup(archive, state_dir, *, kind="owner"):
         except statelock.Busy as busy:
             raise BackupError(busy.code) from None
         (state_dir / "downloads").mkdir(mode=0o700, exist_ok=True)
+        if "passkeys.sqlite3" in files:                    # a restore can never silently bring back approval power
+            from .broker import passkeys as _passkeys
+            manifest["passkeys_quarantined"] = _passkeys.quarantine_after_restore(state_dir / "passkeys.sqlite3")
     else:
         _write_all(state_dir, files, ignore=())
     return manifest

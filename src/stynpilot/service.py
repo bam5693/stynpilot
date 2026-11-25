@@ -410,13 +410,34 @@ def build_installer(config, *, jwks, jwks_loader=None, run_command=apt.real_run,
     return BrokerService(socket_path=config.socket_path, executor=executor, allowed_uid=config.owner_uid)
 
 
+def passkeys_console(config_path, action, kid, *, input_fn=input, is_tty=None, out=print):
+    """Root, at the computer: look at or activate passkeys directly in the installer's own database (see passkey_console.py)."""
+    from . import passkey_console
+    from .broker.passkeys import PasskeyStore
+    config = InstallerConfig.from_file(config_path)
+    if config.passkey_rp_id is None:
+        out("Passkeys are not enabled in this installer's config. Nothing was changed.")
+        return 1
+    if os.geteuid() != 0:
+        out("Run this with sudo: it opens the installer's private records.")
+        return 1
+    store = PasskeyStore(config.state_dir / "passkeys.sqlite3", rp_id=config.passkey_rp_id, origin=config.passkey_origin)
+    if action == "activate":
+        return passkey_console.activate(store, kid, input_fn=input_fn, is_tty=is_tty, out=out)
+    if action == "confirm-restored":
+        return passkey_console.confirm_restored(store, kid, input_fn=input_fn, is_tty=is_tty, out=out)
+    return passkey_console.show(store, out=out)
+
+
 def main(argv=None):                                       # pragma: no cover - thin process wrapper
     import argparse
     import signal
     import threading
     parser = argparse.ArgumentParser(prog="stynpilot-service")
-    parser.add_argument("role", choices=("owner", "installer", "provision"))
+    parser.add_argument("role", choices=("owner", "installer", "provision", "passkeys"))
     parser.add_argument("--config", required=True)
+    parser.add_argument("--action", choices=("list", "activate", "confirm-restored"), default="list")
+    parser.add_argument("--kid", default="")
     args = parser.parse_args(argv)
     if args.role == "installer":
         config = InstallerConfig.from_file(args.config)
@@ -424,6 +445,8 @@ def main(argv=None):                                       # pragma: no cover - 
                                   jwks_loader=lambda: fetch_jwks(config.issuer))     # rotation: only on an unknown key ID
         service.serve_forever()
         return 0
+    if args.role == "passkeys":
+        return passkeys_console(args.config, args.action, args.kid)
     config = OwnerConfig.from_file(args.config)
     if args.role == "provision":
         print("created:", ", ".join(provision_owner_state(config)))

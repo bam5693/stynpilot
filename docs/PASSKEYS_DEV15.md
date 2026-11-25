@@ -52,3 +52,19 @@ work while the installer needs attention); audit chain; `read_private_json` opti
 WebAuthn lets the site REQUIRE that the authenticator verified the user (fingerprint, face, PIN or screen lock) and report it in the
 signed data. The site cannot choose the method, cannot force a fresh fingerprint scan every time, and the phone may accept a very
 recent unlock. StyNpilot refuses any approval where the phone did not report user verification.
+
+
+## Before live enrollment: the two closing items
+
+**Activation is console-only by default.** The owner-side service can still ask for a new passkey (Auth0-approved window) and the
+phone still creates it, but the new key stays powerless ("pending", 15 minutes). Turning it on needs
+`sudo stynpilot service passkeys --config /etc/stynpilot/installer.json --action activate --kid <ID>` on the computer itself: root reads the
+installer's own database, shows label, kind (synced or device-bound) and key fingerprint, warns if more than one key is pending, requires a
+real terminal, and requires typing the first 8 characters of the fingerprint. Nothing in that path goes through the owner-side service,
+so a compromised service cannot get its own key activated. The Auth0-approved remote activation still exists in code but is off
+(`Executor.allow_remote_activation=False`); no config key turns it on in dev15.
+
+**Backups include passkeys.sqlite3** (optional file in root backups, validated as a readable database). On restore every active
+passkey is marked quarantined and cannot approve anything until `--action confirm-restored --kid <ID>` is run at the console with the
+same fingerprint check. A key revoked after the backup was taken therefore cannot silently return, and a key revoked before the
+backup stays revoked. Restore is written to the hash-chained audit log. A corrupt passkey database makes the backup fail loudly.

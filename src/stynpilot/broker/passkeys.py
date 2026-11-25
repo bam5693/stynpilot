@@ -43,6 +43,33 @@ RETIREMENT_MINIMUM = 2
 GENESIS = "0" * 64
 
 
+def _append_audit(db, ts, event, data):
+    row = db.execute("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1").fetchone()
+    prev = row["hash"] if row else GENESIS
+    body = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(("%s|%r|%s|%s" % (prev, ts, event, body)).encode()).hexdigest()
+    db.execute("INSERT INTO audit (ts, event, data, prev, hash) VALUES (?,?,?,?,?)", (ts, event, body, prev, digest))
+
+
+def quarantine_after_restore(path, *, clock=time.time):
+    """After a backup restore: every restored passkey is QUARANTINED (cannot approve anything) until the owner re-confirms it at
+    the computer's console. A backup is older than the present, so it may contain a passkey revoked later; this way a restore can
+    never silently bring back approval power. Returns how many were quarantined."""
+    db = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        count = db.execute("UPDATE passkeys SET quarantined=1 WHERE revoked IS NULL AND activated IS NOT NULL").rowcount
+        _append_audit(db, clock(), "restored_from_backup", {"quarantined": count})
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+    finally:
+        db.close()
+    return count
+
+
 class PasskeyError(Exception):
     def __init__(self, code):
         super().__init__(code)
@@ -78,7 +105,7 @@ class PasskeyStore:
                 credential_id TEXT PRIMARY KEY, kid TEXT UNIQUE NOT NULL, public_key TEXT NOT NULL, label TEXT NOT NULL,
                 backup_eligible INTEGER NOT NULL, backup_state INTEGER NOT NULL, aaguid TEXT NOT NULL,
                 sign_count INTEGER NOT NULL, created REAL NOT NULL, last_used REAL, revoked REAL, enrolled_by TEXT NOT NULL,
-                pubhash TEXT NOT NULL, activated REAL)""")
+                pubhash TEXT NOT NULL, activated REAL, quarantined INTEGER NOT NULL DEFAULT 0)""")
             db.execute("""CREATE TABLE IF NOT EXISTS windows (
                 request_id TEXT PRIMARY KEY, challenge TEXT NOT NULL, label TEXT NOT NULL, expires REAL NOT NULL,
                 attempts INTEGER NOT NULL, closed REAL, enrolled_by TEXT NOT NULL)""")
@@ -104,12 +131,7 @@ class PasskeyStore:
 
     # -- audit chain -------------------------------------------------------------------------------------------
     def _audit(self, db, event, data):
-        row = db.execute("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1").fetchone()
-        prev = row["hash"] if row else GENESIS
-        body = json.dumps(data, sort_keys=True, separators=(",", ":"))
-        ts = self.clock()
-        digest = hashlib.sha256(("%s|%r|%s|%s" % (prev, ts, event, body)).encode()).hexdigest()
-        db.execute("INSERT INTO audit (ts, event, data, prev, hash) VALUES (?,?,?,?,?)", (ts, event, body, prev, digest))
+        _append_audit(db, self.clock(), event, data)
 
     def audit(self, event, data):
         with self._tx() as db:
@@ -137,12 +159,27 @@ class PasskeyStore:
         return {"kid": row["kid"], "credential_id": row["credential_id"], "label": row["label"],
                 "synced": bool(row["backup_state"]), "sync_capable": bool(row["backup_eligible"]),
                 "created": int(row["created"]), "last_used": None if row["last_used"] is None else int(row["last_used"]),
-                "revoked": row["revoked"] is not None, "pending": row["activated"] is None, "pub": row["pubhash"]}
+                "revoked": row["revoked"] is not None, "pending": row["activated"] is None, "pub": row["pubhash"],
+                "quarantined": bool(row["quarantined"])}
 
     def active(self):
         with self._tx() as db:
             return [self._public(r) for r in db.execute(
-                "SELECT * FROM passkeys WHERE revoked IS NULL AND activated IS NOT NULL ORDER BY created")]
+                "SELECT * FROM passkeys WHERE revoked IS NULL AND activated IS NOT NULL AND quarantined=0 ORDER BY created")]
+
+    def quarantined(self):
+        with self._tx() as db:
+            return [self._public(r) for r in db.execute(
+                "SELECT * FROM passkeys WHERE revoked IS NULL AND quarantined=1 ORDER BY created")]
+
+    def reconfirm(self, kid, authorized_by):
+        """Console only: the owner looked at a restored passkey and wants it back."""
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM passkeys WHERE kid=? AND revoked IS NULL AND quarantined=1", (kid,)).fetchone()
+            if row is None:
+                raise PasskeyError("passkey_unknown")
+            db.execute("UPDATE passkeys SET quarantined=0 WHERE kid=?", (kid,))
+            self._audit(db, "reconfirmed_after_restore", {"kid": kid, "authorized_by": authorized_by})
 
     def pending(self):
         with self._tx() as db:
@@ -159,7 +196,8 @@ class PasskeyStore:
         if type(credential_id) is not str or len(credential_id) > 200:
             return None
         with self._tx() as db:
-            row = db.execute("SELECT * FROM passkeys WHERE credential_id=? AND revoked IS NULL AND activated IS NOT NULL",
+            row = db.execute("SELECT * FROM passkeys WHERE credential_id=? AND revoked IS NULL AND activated IS NOT NULL "
+                "AND quarantined=0",
                 (credential_id,)).fetchone()
         return None if row is None else dict(row)
 

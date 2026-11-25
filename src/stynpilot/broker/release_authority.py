@@ -377,8 +377,8 @@ class Authority:
             self.run(["umount", "-l", str(work)], 30)             # a work area left mounted by a crashed build is released first
         shutil.rmtree(work, ignore_errors=True)
         work.mkdir(parents=True, mode=0o700)
-        if self.build_uid is not None:
-            os.chown(work, self.build_uid, -1)
+        if self.build_uid is not None and os.stat(work).st_uid != self.build_uid:
+            os.chown(work, self.build_uid, -1)                    # only when it changes something (a no-op chown is refused in a sandbox)
             os.chmod(work, 0o700)
         mounted = False
         try:

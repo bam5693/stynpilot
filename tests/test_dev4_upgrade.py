@@ -34,8 +34,37 @@ DEVICE = "dtdev_TESTONLYliveDevice"
 DEPENDS = "python3 (>= 3.11), python3-cryptography, ca-certificates"
 
 
+def _probe_dpkg():
+    """Not just 'is dpkg-deb installed' but 'does it WORK here': build, list and unpack a one-file package. Inside the release
+    builder's sandbox on the Ryzen, dpkg-deb's tar child fails (ENOSYS), so these real-dpkg tests cannot run there; they are
+    reported as skipped WITH the reason, and still run everywhere dpkg works (developer machines, reviews)."""
+    import shutil
+    import tempfile
+    if not shutil.which("dpkg-deb"):
+        return "dpkg-deb not installed"
+    with tempfile.TemporaryDirectory() as d:
+        pkg = Path(d) / "p"
+        (pkg / "DEBIAN").mkdir(parents=True)
+        (pkg / "usr").mkdir()
+        (pkg / "usr/f").write_text("x")
+        (pkg / "DEBIAN/control").write_text("Package: probe\nVersion: 1\nArchitecture: all\nMaintainer: a <a@b>\nDescription: p\n")
+        for path in (pkg, pkg / "DEBIAN", pkg / "usr"):
+            path.chmod(0o755)
+        for path in (pkg / "DEBIAN/control", pkg / "usr/f"):
+            path.chmod(0o644)
+        for argv in (["dpkg-deb", "--root-owner-group", "-Znone", "--build", str(pkg), d + "/p.deb"], ["dpkg-deb", "-c", d + "/p.deb"],
+                     ["dpkg-deb", "-x", d + "/p.deb", d + "/x"]):
+            got = subprocess.run(argv, capture_output=True, text=True)
+            if got.returncode != 0:
+                return "dpkg-deb %s fails here: %s" % (argv[1], " ".join((got.stderr or got.stdout).split())[:160])
+    return None
+
+
+DPKG_PROBLEM = _probe_dpkg()
+
+
 def have_dpkg():
-    return subprocess.run(["which", "dpkg-deb"], capture_output=True).returncode == 0
+    return DPKG_PROBLEM is None
 
 
 class Pkg:
@@ -100,7 +129,7 @@ class Pkg:
         return content
 
 
-@unittest.skipIf(jwt is None or not have_dpkg(), "needs PyJWT, cryptography and dpkg-deb")
+@unittest.skipIf(jwt is None or not have_dpkg(), "needs PyJWT, cryptography and a working dpkg-deb: %s" % (DPKG_PROBLEM or "ok"))
 class UpgradeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -293,6 +322,14 @@ class UpgradeTests(unittest.TestCase):
         self.denied("already_decided_or_used", self.executor.challenge, payload, "approve")
 
     # -- the approved upgrade ---------------------------------------------------------------------
+    def test_the_rollback_copy_is_built_under_a_private_umask(self):
+        # The release sandbox runs with umask 0077: the rollback copy's control folder came out 0700 and dpkg-deb refused it.
+        old = os.umask(0o077)
+        try:
+            self.test_approved_upgrade_makes_backups_a_proven_rollback_copy_and_starts_one_worker()
+        finally:
+            os.umask(old)
+
     def test_approved_upgrade_makes_backups_a_proven_rollback_copy_and_starts_one_worker(self):
         payload, go = self.attempt()
         rid = request_id(payload)[0]

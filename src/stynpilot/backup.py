@@ -169,8 +169,8 @@ def make_backup(state_dir, out_file, *, kind="owner", clock=time.time, chown_to=
                 tar.addfile(info, io.BytesIO(data))
         handle.flush()
         os.fsync(handle.fileno())
-    if chown_to is not None:
-        os.chown(out_file, chown_to, -1)
+    if chown_to is not None and os.stat(out_file).st_uid != chown_to:      # only when it changes something (a no-op chown is still a
+        os.chown(out_file, chown_to, -1)                                    # privileged call, and sandboxes refuse it)
     return manifest
 
 

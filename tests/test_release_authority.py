@@ -282,7 +282,7 @@ class AuthorityTests(unittest.TestCase):
         self.assertFalse(tests[0][1])                                          # the test run has no network
 
     def test_the_work_area_is_a_size_limited_memory_file_system_when_enabled(self):
-        auth = self.make(self.tmp / "mt", self.machine, mount_work=True, build_uid=0, tmpfs_mb=64)
+        auth = self.make(self.tmp / "mt", self.machine, mount_work=True, build_uid=os.getuid(), tmpfs_mb=64)
         auth.prepare(COMMIT, VERSION, "x")
         mount = [m for m in self.machine.mounts if m[0] == "mount"][0]
         self.assertIn("size=64m", mount[4])
@@ -516,7 +516,7 @@ class AuthorityTests(unittest.TestCase):
             build_deb.write_deb(pkg, two, 1763769600)
             self.assertEqual(one.read_bytes(), two.read_bytes())
             self.assertTrue(one.read_bytes().startswith(b"!<arch>\ndebian-binary   1763769600  0     0     100644  4         `\n2.0\n"))
-            if shutil.which("dpkg-deb"):
+            if tu is not None and tu.have_dpkg():
                 build_deb.subprocess.run = real
                 out = sp.run(["dpkg-deb", "-c", str(one)], capture_output=True, text=True, check=True).stdout
                 self.assertIn("-rwxr-xr-x root/root", out)
@@ -532,7 +532,7 @@ class AuthorityTests(unittest.TestCase):
         self.assertFalse(Authority(self.tmp / "rd2", run=self.machine, http=self.http).ready()["builder"])
 
     def test_a_work_area_left_mounted_by_a_crashed_build_is_released_first(self):
-        auth = self.make(self.tmp / "sm", self.machine, mount_work=True, build_uid=0)
+        auth = self.make(self.tmp / "sm", self.machine, mount_work=True, build_uid=os.getuid())
         auth.prepare(COMMIT, VERSION, "x")
         kinds = [m[0] for m in self.machine.mounts]
         self.assertEqual(kinds[0], "umount")                       # before the new mount

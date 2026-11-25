@@ -38,7 +38,8 @@ class ConsoleActivation(unittest.TestCase):
         return passkey_console.activate(self.store, kid, input_fn=lambda _p: typed, is_tty=tty, out=self.out.append)
 
     def test_remote_activation_is_off_by_default(self):
-        executor = Executor(state_dir=self.tmp / "b", owner="o", device="d", verifier=None, passkeys=self.store) \
+        executor = Executor(state_dir=self.tmp / "b", owner="o", device="d", verifier=None, passkeys=self.store,
+                            require_root=False) \
             if (self.tmp / "b").mkdir(mode=0o700) is None else None
         self.assertFalse(executor.allow_remote_activation)
         with self.assertRaises(ExecutionDenied) as refused:

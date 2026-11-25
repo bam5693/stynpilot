@@ -293,6 +293,7 @@ class Upgrader:
                     path.chmod(0o755)
             control = stage / "DEBIAN"
             control.mkdir(mode=0o755)
+            control.chmod(0o755)                     # mkdir's mode is cut by the umask: under 0077 dpkg-deb refused the 0700 folder
             lines = ["Package: %s" % PACKAGE, "Version: %s" % installed, "Architecture: all"]
             lines += ["%s: %s" % (k, fields[k]) for k in ("Section", "Priority", "Maintainer", "Depends") if fields[k]]
             lines += ["Description: StyNpilot (rollback copy re-packed from the installed files before an upgrade)"]

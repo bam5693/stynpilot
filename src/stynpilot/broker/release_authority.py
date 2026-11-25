@@ -92,16 +92,25 @@ def default_run(argv, timeout, cwd=None, env=None, keep=20000):
             size += len(chunk)
             while size > keep and len(tail) > 1:
                 size -= len(tail.popleft())
+    code = None
+    if not timed_out:
+        # EOF on the pipe means every writer closed it, not that the command has reported its exit status: let it finish (bounded) BEFORE
+        # the group is killed, or a command that succeeded could be recorded as killed.
+        try:
+            code = proc.wait(max(1.0, min(30.0, deadline - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            code = None
     try:
         os.killpg(proc.pid, signal.SIGKILL)                   # nothing the command started may outlive it
     except OSError:
         pass
     sel.close()
     proc.stdout.close()
-    try:
-        code = proc.wait(10)
-    except subprocess.TimeoutExpired:
-        code = 124
+    if code is None:
+        try:
+            code = proc.wait(10)
+        except subprocess.TimeoutExpired:
+            code = 124
     return (124 if timed_out else code), b"".join(tail)[-keep:].decode("utf-8", "replace")
 
 

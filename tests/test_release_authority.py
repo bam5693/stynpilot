@@ -413,6 +413,17 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(code, 124)
         self.assertLess(_t.monotonic() - start, 10)
 
+    def test_the_real_exit_status_is_kept_when_output_closes_before_the_command_exits(self):
+        # EOF on the pipe is not the end of the command: the status it then reports must be the one recorded, not a kill.
+        from stynpilot.broker.release_authority import default_run
+        code, out = default_run(["sh", "-c", "echo hi; exec >/dev/null 2>&1; sleep 0.5; exit 3"], 30)
+        self.assertEqual((code, out.strip()), (3, "hi"))
+        import time as _t
+        start = _t.monotonic()
+        code, _ = default_run(["sh", "-c", "exec >/dev/null 2>&1; sleep 60"], 3)       # silent and slow: still bounded by the deadline
+        self.assertLess(_t.monotonic() - start, 15)
+        self.assertNotEqual(code, 0)
+
     def test_a_sandbox_unit_that_will_not_stop_fails_the_build(self):
         self.machine.unit_state = "active"
         auth = self.make(self.tmp / "stuck", self.machine, sandbox=lambda job, argv, ws, **k: ["env", "WORKSPACE=" + ws] + argv,

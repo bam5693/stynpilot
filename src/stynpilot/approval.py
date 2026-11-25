@@ -226,7 +226,7 @@ class ApprovalFlow:
         if payload.get("kind") == "passkey" and payload.get("action") == "enroll" and view:
             with self._lock:                 # only the browser that approved may then create the passkey
                 self._enroll_sessions[rid] = {"view": view, "expires": self.clock() + VIEW_LIFETIME}
-        wanted = {"rollback": "rollback", "upgrade": "upgrade", "runner": "runner_admin",
+        wanted = {"rollback": "rollback", "upgrade": "upgrade", "release": "release", "runner": "runner_admin",
                   "passkey": "passkey_admin"}.get(payload.get("kind"), "install")
         method = getattr(self.broker, wanted, None)
         if method is None:
@@ -371,7 +371,7 @@ class ApprovalFlow:
         no run recorded -> verified nothing ran; a finished record -> its real result; anything else
         (still 'running', unreachable, unknown) -> the owner must verify."""
         code = getattr(error, "code", None)
-        if kind == "upgrade":
+        if kind in ("upgrade", "release"):
             seen, record = self._root_record(rid)
             if seen == "record" and (record or {}).get("state") == "running":
                 return {"ok": None, "pending": True}       # the upgrade worker is running; its result settles this

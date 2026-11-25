@@ -142,6 +142,54 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
     def request_workspace_removal(device_id: str, name: str) -> dict:
         return request("commander_request_workspace_removal", device_id, "unenroll", name)
 
+
+    # -- releases (dev16): prepare a verified build (GREEN), then ask for ONE approval that signs, publishes and installs ------------
+    _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+
+    @server.tool(name="commander_prepare_stynpilot_release", title="Build and verify a StyNpilot release", annotations=FILES_A_REQUEST,
+                 description=("Start building a StyNpilot release from an exact 40-character commit of the project's repository, on the owner's "
+                              "computer: it is built twice (the packages must be identical) and the whole test suite must pass. NOTHING is "
+                              "signed or published and nothing changes on the computer. version like 0.1.0~dev17. Poll "
+                              "stynpilot_release_status; when ready, call commander_request_stynpilot_release."))
+    def prepare_release(device_id: str, commit: str, version: str) -> dict:
+        def work(owner):
+            if type(commit) is not str or not _COMMIT.fullmatch(commit):
+                raise WorkspaceError("commit_invalid")
+            return broker.release_prepare(commit, version)
+        return run("commander_prepare_stynpilot_release", device_id, work, write=True)
+
+    @server.tool(name="stynpilot_release_status", title="Progress of a release build", annotations=READ_ONLY,
+                 description=("state (not_started, building, ready, failed), and when finished: package SHA-256, size, test counts, whether "
+                              "the two builds matched, or why it failed."))
+    def release_status(device_id: str, commit: str) -> dict:
+        def work(owner):
+            if type(commit) is not str or not _COMMIT.fullmatch(commit):
+                raise WorkspaceError("commit_invalid")
+            return broker.release_status(commit)
+        return run("stynpilot_release_status", device_id, work, write=False)
+
+    @server.tool(name="commander_request_stynpilot_release", title="Ask the owner to approve publishing and installing a release",
+                 annotations=FILES_A_REQUEST,
+                 description=("After a successful build: ask the owner for ONE approval on his phone that signs the release with the computer's "
+                              "own key, publishes it to the project's GitHub release, upgrades StyNpilot, checks it and rolls back "
+                              "automatically on failure. Everything he sees (commit, hash, test result) comes from the installer's own record; "
+                              "review_note (optional, max 200 plain characters) is shown labelled as an unverified assistant note. You cannot "
+                              "approve, sign, or touch the signing key or GitHub access."))
+    def request_release(device_id: str, commit: str, version: str, review_note: str = "") -> dict:
+        def work(owner):
+            if type(commit) is not str or not _COMMIT.fullmatch(commit):
+                raise WorkspaceError("commit_invalid")
+            intent = broker.release_intent(commit, version, review_note)
+            proposer = ctx.proposer
+            expires = now() + timedelta(minutes=50)
+            payload = {"kind": "release", "owner": owner, "device": device_id, "intent": intent,
+                       "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            result, _ = store.submit(kind="release", software="stynpilot-release-" + version.replace("~", "-").replace(".", "-"),
+                                     device=device_id, owner=owner, proposer=proposer, payload=payload,
+                                     summary=render_summary(payload), expires=expires.timestamp())
+            return receipt(result)
+        return run("commander_request_stynpilot_release", device_id, work, write=True)
+
     # -- passkeys (dev15): ask to add or remove one; the owner approves on his phone ---------------------------------
     def passkey_request(owner, device_id, *, action, label, kid):
         info = broker.passkey_list()

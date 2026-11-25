@@ -104,14 +104,22 @@ class BrokerService:
             if op == "passkey_precheck":
                 return {"ok": True, "result": self.executor.passkey_precheck(message.get("payload"), message.get("proof"),
                                                                               message.get("challenge"), message.get("decision"))}
+            if op == "release_prepare":
+                return {"ok": True, "result": self.executor.release_prepare(message.get("commit"), message.get("version"))}
+            if op == "release_status":
+                return {"ok": True, "result": self.executor.release_status(message.get("commit"))}
+            if op == "release_intent":
+                return {"ok": True, "result": self.executor.release_intent(message.get("commit"), message.get("version"),
+                                                                           message.get("review_note", ""))}
             if op == "runner":
                 return {"ok": True, "result": self.executor.runner_call(message.get("call"), message.get("args"))}
-            if op in ("install", "rollback", "upgrade", "deny", "runner_admin", "passkey_admin"):
+            if op in ("install", "rollback", "upgrade", "release", "deny", "runner_admin", "passkey_admin"):
                 if not self._busy.acquire(blocking=False):
                     return {"ok": False, "error": "busy"}          # one change at a time
                 try:
                     method = {"install": self.executor.install, "rollback": self.executor.rollback,
-                              "upgrade": self.executor.upgrade, "deny": self.executor.deny,
+                              "upgrade": self.executor.upgrade, "release": self.executor.release,
+                              "deny": self.executor.deny,
                               "runner_admin": self.executor.runner_admin,
                               "passkey_admin": self.executor.passkey_admin}[op]
                     result = method(message.get("payload"), message.get("proof"), message.get("challenge"))
@@ -247,6 +255,18 @@ class BrokerClient:
 
     def upgrade(self, payload, proof, challenge):
         return self._ask({"op": "upgrade", "payload": payload, "proof": proof, "challenge": challenge}, 600)["result"]
+
+    def release(self, payload, proof, challenge):
+        return self._ask({"op": "release", "payload": payload, "proof": proof, "challenge": challenge}, 900)["result"]
+
+    def release_prepare(self, commit, version):
+        return self._ask({"op": "release_prepare", "commit": commit, "version": version}, 30)["result"]
+
+    def release_status(self, commit):
+        return self._ask({"op": "release_status", "commit": commit}, 30)["result"]
+
+    def release_intent(self, commit, version, review_note=""):
+        return self._ask({"op": "release_intent", "commit": commit, "version": version, "review_note": review_note}, 30)["result"]
 
     def runner_admin(self, payload, proof, challenge):
         return self._ask({"op": "runner_admin", "payload": payload, "proof": proof, "challenge": challenge}, 300)["result"]

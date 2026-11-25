@@ -66,6 +66,22 @@ def proof_fingerprint(id_token):
 
 def render_summary(payload):
     """Plain-English text of an install or rollback payload, produced by the root installer itself."""
+    if payload.get("kind") == "release":
+        i = payload.get("intent") or {}
+        lines = ["Publish and install a new StyNpilot release, version %s, in ONE approval." % str(i.get("version")),
+                 "Built from source commit %s. StyNpilot built it twice on this computer and got the identical package (SHA-256 %s, %s bytes)."
+                 % (str(i.get("commit"))[:12], str(i.get("sha256")), str(i.get("size"))),
+                 "Test suite on that commit: %s passed, %s failed, %s skipped."
+                 % (i.get("tests_passed"), i.get("tests_failed"), i.get("tests_skipped")),
+                 "If you approve: this computer signs the release with its own release key (%s), publishes it to the StyNpilot project's "
+                 "GitHub releases, then upgrades itself, restarts, checks it works, and automatically puts the current version back if it does not."
+                 % str(i.get("key_id")),
+                 "Nothing is signed or published before you approve. The signing key and the GitHub access never leave this computer.",
+                 "This replaces only StyNpilot's own program files. Your settings, approvals and sign-in setup are not touched."]
+        if i.get("review_note"):
+            lines.append("Reviewer note (written by an assistant, not verified by StyNpilot): %s" % str(i["review_note"]))
+        lines.append("Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z"))
+        return lines
     if payload.get("kind") == "passkey":
         expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
         if payload.get("action") == "enroll":

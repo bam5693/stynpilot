@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
@@ -32,6 +33,10 @@ RELEASE_HOST = "github.com"
 # GitHub serves release assets through its own CDN hosts after a redirect; nothing else is followed.
 REDIRECT_HOSTS = frozenset({"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"})
 KEYS_FILE = Path("/usr/share/stynpilot/release-keys.json")
+# Root-owned local additions, written only at the computer's console (never by a package, an assistant or the owner-side service):
+# {"keys": [{"key_id","public"}...], "revoked": ["<key id>"...]}. Lets the machine trust a release key it generated itself and
+# stop trusting an old one, without a package having to carry either.
+ADDENDUM_FILE = Path("/var/lib/stynpilot/trusted-release-keys.json")
 DOMAIN = b"stynpilot-release-v1\n"
 MAX_SIZE = 200 * 1024 * 1024
 MAX_MANIFEST_BYTES = 8192
@@ -114,18 +119,36 @@ def key_id(public_raw):
     return hashlib.sha256(public_raw).hexdigest()[:16]
 
 
-def load_trusted_keys(path=KEYS_FILE):
-    """{key_id: Ed25519PublicKey}. Each listed id must equal the hash of its key, or the file is refused whole."""
+def _read_keys(path):
+    data = json.loads(Path(path).read_text("utf-8"))
+    keys = {}
+    for item in data["keys"]:
+        raw = base64.b64decode(item["public"], validate=True)
+        if len(raw) != 32 or item["key_id"] != key_id(raw):
+            raise ValueError("key id mismatch")
+        keys[item["key_id"]] = Ed25519PublicKey.from_public_bytes(raw)
+    return keys, data
+
+
+def load_trusted_keys(path=KEYS_FILE, addendum=None):
+    """{key_id: Ed25519PublicKey}: the package's keys plus the machine's own console-added keys, minus revoked ids. Each listed id
+    must equal the hash of its key, or the file is refused whole. A damaged addendum is an error, never silently ignored."""
     try:
-        data = json.loads(Path(path).read_text("utf-8"))
-        keys = {}
-        for item in data["keys"]:
-            raw = base64.b64decode(item["public"], validate=True)
-            if len(raw) != 32 or item["key_id"] != key_id(raw):
-                raise ValueError("key id mismatch")
-            keys[item["key_id"]] = Ed25519PublicKey.from_public_bytes(raw)
+        keys, _ = _read_keys(path)
     except (OSError, ValueError, KeyError, TypeError):
         raise ReleaseError("trusted_keys_unreadable") from None
+    extra = ADDENDUM_FILE if addendum is None else addendum
+    if extra and os.path.lexists(extra):
+        try:
+            more, data = _read_keys(extra)
+            revoked = data.get("revoked", [])
+            if type(revoked) is not list or not all(type(r) is str for r in revoked) or set(data) - {"keys", "revoked"}:
+                raise ValueError("bad addendum")
+        except (OSError, ValueError, KeyError, TypeError):
+            raise ReleaseError("trusted_keys_addendum_unreadable") from None
+        keys.update(more)
+        for gone in revoked:
+            keys.pop(gone, None)
     if not keys:
         raise ReleaseError("no_trusted_keys")
     return keys

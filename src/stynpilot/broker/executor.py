@@ -48,7 +48,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .. import catalog, impact, statelock
@@ -61,6 +61,7 @@ from .. import runner as runner_policy
 from .jobs import JobError
 from .selftest import clean_diagnostics
 from .passkeys import PasskeyError
+from .release_authority import AuthorityError
 from .. import webauthn
 from .proof import ProofDenied, decision_nonce, render_summary, summary_hash
 from .upgrade import UpgradeRefused, Upgrader
@@ -173,7 +174,7 @@ class Executor:
     def __init__(self, *, state_dir, owner, device, verifier, run=apt.real_run, require_root=True,
                  sources_root="/etc/apt", file_root="/", owner_uid=None, release_keys=None, fetch_release=None,
                  launch_worker=None, upgrade_options=None, jobs=None, passkeys=None,
-                 allow_remote_activation=False):
+                 allow_remote_activation=False, authority=None, sleep=time.sleep):
         self.dir = Path(state_dir)
         if require_root and not apt.is_root():
             raise ExecutionDenied("installer_must_run_as_root")
@@ -199,6 +200,9 @@ class Executor:
         # passkey at the computer's console (passkey_console.py), which does not depend on that service.
         self.allow_remote_activation = allow_remote_activation
         self.passkeys = passkeys                  # PasskeyStore or None (passkeys not configured)
+        self.authority = authority                # release_authority.Authority or None (release publishing not configured)
+        self._sleep = sleep
+        self._builds = {}
         if jobs is not None:
             jobs.reconcile()
         # A run still marked "running" means the installer died mid-change. We can't know what state
@@ -309,7 +313,7 @@ class Executor:
                     "nonce": decision_nonce(decision, rid, rid, challenge),
                     "summary": summary, "summary_sha256": summary_hash(summary), "expires_in": CHALLENGE_LIFETIME}
         summary = render_summary(payload)
-        if payload.get("kind") in ("runner", "passkey"):
+        if payload.get("kind") in ("runner", "passkey", "release"):
             return {"request_id": rid, "decision": decision, "challenge": challenge,
                     "nonce": decision_nonce(decision, rid, rid, challenge),
                     "summary": summary, "summary_sha256": summary_hash(summary), "expires_in": CHALLENGE_LIFETIME}
@@ -336,6 +340,8 @@ class Executor:
             raise ExecutionDenied("an_upgrade_is_still_running")
         if payload.get("kind") == "upgrade":
             return self._check_upgrade_payload(payload)
+        if payload.get("kind") == "release":
+            return self._check_release_payload(payload)
         if payload.get("kind") == "runner":
             return self._check_runner_payload(payload)
         if payload.get("kind") == "rollback":
@@ -691,6 +697,153 @@ class Executor:
             raise ExecutionDenied("could_not_prepare_%s" % type(error).__name__) from None
         return {"ok": None, "pending": True, "started": True, "request_id": rid, "unit": unit,
                 "from_version": installed, "to_version": content["manifest"]["version"],
+                "backup_scope": "installer_records_and_a_full_copy_of_the_current_version"}
+
+
+    # -- release authority: build from an exact commit, then ONE approval signs, publishes and installs --------------------
+    RELEASE_FIELDS = {"kind", "owner", "device", "intent", "expires_at"}
+
+    def _need_authority(self):
+        if self.authority is None:
+            raise ExecutionDenied("release_publishing_not_configured")
+        return self.authority
+
+    def release_prepare(self, commit, version):
+        """GREEN: start building and verifying a release from an exact commit (background). Nothing is signed or published."""
+        authority = self._need_authority()
+        try:
+            installed = self.upgrader.installed_version()
+            if not self.upgrader.version_gt(version, installed):
+                raise ExecutionDenied("not_newer_than_installed")
+            state = authority.status(commit)
+            if state.get("state") == "building":
+                return state
+            authority.prepare_check(commit, version)          # refuse an unusable request before going to the background
+            thread = threading.Thread(target=self._build_in_background, args=(commit, version, installed), daemon=True)
+            self._builds[commit] = thread
+            thread.start()
+        except UpgradeRefused as refused:
+            raise ExecutionDenied(refused.code) from None
+        except AuthorityError as refused:
+            raise ExecutionDenied(refused.code) from None
+        return {"state": "building"}
+
+    def _build_in_background(self, commit, version, installed):
+        try:
+            self.authority.prepare(commit, version, installed)
+        except Exception:
+            pass                                               # the record (written by prepare) says what happened
+
+    def release_status(self, commit):
+        try:
+            return self._need_authority().status(commit)
+        except AuthorityError as refused:
+            raise ExecutionDenied(refused.code) from None
+
+    def release_intent(self, commit, version, review_note=""):
+        """What the owner would be asked to approve, derived ONLY from the installer's own verified build record."""
+        authority = self._need_authority()
+        try:
+            return authority.intent(commit, version, review_note)
+        except AuthorityError as refused:
+            raise ExecutionDenied(refused.code) from None
+
+    def _check_release_payload(self, payload):
+        authority = self._need_authority()
+        if set(payload) != self.RELEASE_FIELDS or payload["owner"] != self.owner or payload["device"] != self.device:
+            raise ExecutionDenied("plan_invalid_or_expired")
+        expiry = payload["expires_at"]
+        if type(expiry) is not str or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", expiry):
+            raise ExecutionDenied("plan_invalid_or_expired")
+        when = datetime.strptime(expiry, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        if not 0 < (when - datetime.now(timezone.utc)).total_seconds() <= 3600:
+            raise ExecutionDenied("plan_invalid_or_expired")
+        want = payload["intent"]
+        if type(want) is not dict:
+            raise ExecutionDenied("plan_invalid_or_expired")
+        try:
+            have = authority.intent(want.get("commit"), want.get("version"), want.get("review_note", ""))
+        except AuthorityError as refused:
+            raise ExecutionDenied(refused.code) from None
+        if have != want:
+            raise ExecutionDenied("release_intent_does_not_match_the_verified_build")
+        try:
+            trusted = self.upgrader.keys
+            if have["key_id"] not in trusted:
+                raise ExecutionDenied("release_key_not_trusted_by_this_machine")
+            installed = self.upgrader.installed_version()
+        except ReleaseErrorTypes:
+            raise ExecutionDenied("trusted_keys_unreadable") from None
+        except UpgradeRefused as refused:
+            raise ExecutionDenied(refused.code) from None
+        if not self.upgrader.version_gt(have["version"], installed):
+            raise ExecutionDenied("not_newer_than_installed")
+        if have["from_min"] and not self.upgrader.version_ge(installed, have["from_min"]):
+            raise ExecutionDenied("installed_version_too_old_for_this_release")
+        if self.needs_attention():
+            raise ExecutionDenied("owner_intervention_required")
+        if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
+            raise ExecutionDenied("already_decided_or_used")
+        return have
+
+    def release(self, payload, proof_token, challenge):
+        """ONE approval: verify it, sign the manifest, publish to the project's release, then run the normal protected upgrade.
+        Everything that can fail runs BEFORE the owner's challenge is used up; the approval covers exactly the approved intent."""
+        authority = self._need_authority()
+        intent = self._check_release_payload(payload)
+        rid, _ = payload_hash(payload)
+        if type(challenge) is not str or len(challenge) != 64:
+            raise ExecutionDenied("challenge_unknown")
+        fingerprint, passkey = self._prove(rid, proof_token, challenge, "approve")
+        try:
+            self._backup_records(rid)
+            note = ["Release approved on the owner's phone; built from commit %s." % intent["commit"][:12],
+                    "Tests: %d passed, %d failed; the package built identically twice." % (intent["tests_passed"], intent["tests_failed"])]
+            manifest = authority.manifest_for(intent, note)
+            signature = authority.sign(manifest)
+            authority.publish(manifest, signature, intent["commit"])
+            expires = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            upgrade_payload = {"kind": "upgrade", "software": "stynpilot-self", "owner": self.owner, "device": self.device,
+                               "manifest": manifest, "signature": signature, "expires_at": expires}
+            content, _, installed = self.upgrader.check(upgrade_payload)
+            with statelock.operation(self.dir):
+                job = None
+                for attempt in range(6):                      # GitHub can take a few seconds to serve a new release
+                    try:
+                        job = self.upgrader.prepare(rid, content, installed)
+                        break
+                    except ReleaseErrorTypes:
+                        if attempt == 5:
+                            raise
+                        self._sleep(5)
+                    except UpgradeRefused as refused:
+                        if refused.code != "download_does_not_match_signed_manifest" or attempt == 5:
+                            raise
+                        self._sleep(5)
+                try:
+                    self._used_passkey(passkey, rid, "approve")
+                    self.runs.consume(challenge=challenge, request_id=rid, decision="approve", proof=fingerprint, kind="release")
+                    unit = self.upgrader.start(rid, job)
+                except BaseException:
+                    if self.runs.status(rid)["state"] == "not_started":
+                        shutil.rmtree(job, ignore_errors=True)
+                    raise
+        except statelock.Busy:
+            raise ExecutionDenied("a_backup_or_restore_is_running_try_again") from None
+        except AuthorityError as failed:
+            raise ExecutionDenied("release_" + failed.code) from None
+        except UpgradeRefused as refused:
+            raise ExecutionDenied(refused.code) from None
+        except backup.BackupError as failed:
+            raise ExecutionDenied("records_backup_failed_%s" % str(failed)[:40]) from None
+        except ReleaseErrorTypes:
+            raise ExecutionDenied("release_download_failed") from None
+        except ExecutionDenied:
+            raise
+        except OSError as error:
+            raise ExecutionDenied("could_not_prepare_%s" % type(error).__name__) from None
+        return {"ok": None, "pending": True, "started": True, "request_id": rid, "unit": unit,
+                "from_version": installed, "to_version": manifest["version"],
                 "backup_scope": "installer_records_and_a_full_copy_of_the_current_version"}
 
     def _backup_records(self, rid):

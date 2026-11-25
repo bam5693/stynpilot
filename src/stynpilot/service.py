@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import time
 from dataclasses import dataclass
@@ -41,6 +42,8 @@ PROVISIONED = ("requests.sqlite3", "revoked-clients.json", "token-revocations.sq
 PROJECT_ROOTS_FILE = "read-roots.json"        # optional, owner-private; absent = no project folders readable
 INSTALLER_KEYS = {"issuer", "approval_client_id", "owner", "device", "owner_uid", "state_dir", "socket_path"}
 PASSKEY_KEYS = {"passkey_rp_id", "passkey_origin"}
+RELEASE_KEYS = {"build_user"}
+RELEASE_SETTINGS_NAME = "release.json"      # beside installer.json; absent = release publishing not configured
 PASSKEY_SETTINGS_NAME = "passkeys.json"      # beside installer.json; installer.json itself keeps exactly dev14's keys, so rolling back
                                              # to dev14 never meets a field it rejects (dev14 simply never reads this file)
 
@@ -339,6 +342,7 @@ class InstallerConfig:
     socket_path: Path
     passkey_rp_id: str = None
     passkey_origin: str = None
+    release_build_user: str = None
 
     @classmethod
     def from_file(cls, path):
@@ -346,6 +350,9 @@ class InstallerConfig:
         sibling = Path(path).with_name(PASSKEY_SETTINGS_NAME)
         if os.path.lexists(sibling):
             data.update(read_private_json(sibling, PASSKEY_KEYS))
+        extra = Path(path).with_name(RELEASE_SETTINGS_NAME)
+        if os.path.lexists(extra):
+            data["release_build_user"] = read_private_json(extra, RELEASE_KEYS)["build_user"]
         return cls.from_dict(data)
 
     @classmethod
@@ -370,7 +377,37 @@ class InstallerConfig:
             except ValueError:
                 raise ConfigError("passkey_identity_invalid") from None
         return cls(data["issuer"], data["approval_client_id"], data["owner"], data["device"], uid,
-                   _abs(data["state_dir"], "state_dir"), _abs(data["socket_path"], "socket_path"), rp_id, origin)
+                   _abs(data["state_dir"], "state_dir"), _abs(data["socket_path"], "socket_path"), rp_id, origin,
+                   _build_user(data.get("release_build_user")))
+
+
+BUILD_ROOT = Path("/var/lib/stynpilot-build")        # root-owned 0755; each build gets a 0700 folder owned by the build account
+_ACCOUNT = re.compile(r"[a-z_][a-z0-9_-]{0,30}\Z")
+
+
+def _build_user(name):
+    if name is None:
+        return None
+    if type(name) is not str or not _ACCOUNT.fullmatch(name) or name == "root":
+        raise ConfigError("release_build_user_invalid")
+    return name
+
+
+def build_authority(config, state_dir=None, **options):
+    """The release authority for this installer, or None when release publishing is not configured (the default)."""
+    if config.release_build_user is None:
+        return None
+    import pwd
+    from .broker.release_authority import Authority
+    try:
+        account = pwd.getpwnam(config.release_build_user)
+    except KeyError:
+        raise ConfigError("release_build_user_does_not_exist") from None
+    if account.pw_uid == 0:
+        raise ConfigError("release_build_user_invalid")
+    prefix = ["setpriv", "--reuid=%d" % account.pw_uid, "--regid=%d" % account.pw_gid, "--clear-groups", "--no-new-privs", "--"]
+    options.setdefault("work_root", BUILD_ROOT)
+    return Authority(state_dir or config.state_dir, build_prefix=prefix, build_uid=account.pw_uid, **options)
 
 
 def fetch_jwks(issuer, fetch=None):
@@ -411,6 +448,8 @@ def build_installer(config, *, jwks, jwks_loader=None, run_command=apt.real_run,
         config.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         executor_options["passkeys"] = PasskeyStore(config.state_dir / "passkeys.sqlite3", rp_id=config.passkey_rp_id,
                                                     origin=config.passkey_origin)
+    if "authority" not in executor_options and require_root:
+        executor_options["authority"] = build_authority(config)
     executor = Executor(state_dir=config.state_dir, owner=config.owner, device=config.device, verifier=verifier,
                         run=run_command, require_root=require_root, **executor_options)
     return BrokerService(socket_path=config.socket_path, executor=executor, allowed_uid=config.owner_uid)
@@ -435,14 +474,33 @@ def passkeys_console(config_path, action, kid, *, input_fn=input, is_tty=None, o
     return passkey_console.show(store, out=out)
 
 
+def release_console_main(config_path, action, *, out=print):
+    """Root, at the computer: create the release key, enter the GitHub token, check status (see release_console.py)."""
+    from . import release, release_console
+    config = InstallerConfig.from_file(config_path)
+    if os.geteuid() != 0:
+        out("Run this with sudo: it opens the installer's private records.")
+        return 1
+    authority = build_authority(config)
+    if authority is None:
+        out("Release publishing is not configured: create /etc/stynpilot/release.json with {\"build_user\": \"stynpilot-build\"} "
+            "(root, mode 0600) and that account first. Nothing was changed.")
+        return 1
+    if action == "init":
+        return release_console.init(authority, release.ADDENDUM_FILE, out=out)
+    if action == "set-token":
+        return release_console.set_token(authority, out=out)
+    return release_console.status(authority, release.ADDENDUM_FILE, out=out)
+
+
 def main(argv=None):                                       # pragma: no cover - thin process wrapper
     import argparse
     import signal
     import threading
     parser = argparse.ArgumentParser(prog="stynpilot-service")
-    parser.add_argument("role", choices=("owner", "installer", "provision", "passkeys"))
+    parser.add_argument("role", choices=("owner", "installer", "provision", "passkeys", "release"))
     parser.add_argument("--config", required=True)
-    parser.add_argument("--action", choices=("list", "activate", "confirm-restored"), default="list")
+    parser.add_argument("--action", choices=("list", "activate", "confirm-restored", "init", "set-token", "status"), default="list")
     parser.add_argument("--kid", default="")
     args = parser.parse_args(argv)
     if args.role == "installer":
@@ -453,6 +511,8 @@ def main(argv=None):                                       # pragma: no cover - 
         return 0
     if args.role == "passkeys":
         return passkeys_console(args.config, args.action, args.kid)
+    if args.role == "release":
+        return release_console_main(args.config, args.action)
     config = OwnerConfig.from_file(args.config)
     if args.role == "provision":
         print("created:", ", ".join(provision_owner_state(config)))

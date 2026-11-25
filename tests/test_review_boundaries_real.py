@@ -214,9 +214,12 @@ class Boundary(unittest.TestCase):
         self.assertTrue(os.listdir(self.app / "d"))
 
     def test_the_selftest_requires_limits_to_be_seen_where_the_backend_enforces_them(self):
-        from stynpilot.broker.selftest import OPTIONAL, REQUIRED, _judge
+        from stynpilot.broker.selftest import OPTIONAL, REQUIRED, STRICT_REQUIRED, _judge
         lines = ["PASS " + n for n in REQUIRED if n != "owner_edits_runner_files"]
-        every = ["PASS " + n for n in OPTIONAL]
+        every = ["PASS " + n for n in OPTIONAL + STRICT_REQUIRED]
+        self.assertFalse(_judge(lines + ["PASS " + n for n in OPTIONAL], True, strict_limits=True)["ok"])   # setid_calls_denied unseen
+        self.assertFalse(_judge(lines + ["PASS " + n for n in OPTIONAL] + ["FAIL setid_calls_denied"], True, strict_limits=True)["ok"])
+        self.assertFalse(_judge([l for l in lines if "fs_identity_fixed" not in l] + every, True, strict_limits=True)["ok"])
         self.assertTrue(_judge(lines, True)["ok"])
         self.assertTrue(_judge(lines + ["SKIP limits"], True)["ok"])
         self.assertFalse(_judge(lines + ["SKIP limits"], True, strict_limits=True)["ok"])
@@ -230,7 +233,7 @@ class Boundary(unittest.TestCase):
     def test_each_limit_is_its_own_check_with_safe_diagnostic_values_and_no_duplicates(self):
         from stynpilot.broker.selftest import REQUIRED, OPTIONAL, _judge
         lines = ["PASS " + n for n in REQUIRED if n != "owner_edits_runner_files"] + ["PASS " + n for n in OPTIONAL if n != "limit_io"]
-        lines += ["FAIL limit_io", "DIAG limit_io 259:0:wbps=67108864 259:0:wbps=max", "DIAG limit_pids 64 64", "DIAG evil /etc/shadow x",
+        lines += ["PASS setid_calls_denied", "FAIL limit_io", "DIAG limit_io 259:0:wbps=67108864 259:0:wbps=max", "DIAG limit_pids 64 64", "DIAG evil /etc/shadow x",
                   "DIAG limit_tmp 268439552 " + "9" * 300]
         verdict = _judge(lines, True, strict_limits=True)
         self.assertEqual(verdict["failed"], ["limit_io"])                       # named once, and only the check that failed

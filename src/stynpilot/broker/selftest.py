@@ -23,7 +23,12 @@ from pathlib import Path
 from .. import runner
 
 REQUIRED = ("identity", "no_capabilities", "no_new_privs", "hidden_paths", "home_invisible", "network_isolated",
-            "writes_confined", "workspace_writable", "owner_edits_runner_files", "credentials_masked", "host_sockets_hidden", "new_files_isolated", "other_jobs_isolated")
+            "writes_confined", "workspace_writable", "owner_edits_runner_files", "credentials_masked", "host_sockets_hidden", "new_files_isolated", "other_jobs_isolated",
+            "ids_all_equal", "fs_identity_fixed")
+# Only where the backend applies the systemd syscall filter (the Ryzen): the identity-changing calls the filter still denies must KILL a
+# process that tries them. setfsuid is the one exception the filter allows (Python 3.14 on Ubuntu 26.04 calls it while loading native
+# extensions); fs_identity_fixed proves it can never select another identity.
+STRICT_REQUIRED = ("setid_calls_denied",)
 OPTIONAL = ("limit_pids", "limit_memory", "limit_fsize", "limit_tmp", "limit_io")              # must match when readable; REQUIRED (fails if unseen) on a backend that enforces limits
 SOCKET_GLOBS = ("/run/*.sock", "/run/*/*.sock", "/run/dbus/system_bus_socket", "/run/systemd/private", "/run/systemd/*/private",
                 "/run/user/*/bus", "/run/user/*/*/bus", "/var/run/docker.sock", "/run/containerd/containerd.sock")
@@ -48,7 +53,42 @@ except KeyError:
     me = "?"
 say(os.getuid() == os.geteuid() == c["run_uid"] and me == c["run_user"] and os.getgid() == c["run_gid"]
     and os.getuid() not in (0, c["owner_uid"]) and set(os.getgroups()) <= {c["run_gid"]}, "identity")
-say(all(int(st.get(k, "1"), 16) == 0 for k in ("CapEff", "CapPrm", "CapBnd", "CapAmb")), "no_capabilities")
+say(all(int(st.get(k, "1"), 16) == 0 for k in ("CapEff", "CapPrm", "CapBnd", "CapAmb", "CapInh")), "no_capabilities")
+uids, gids = st.get("Uid", "").split(), st.get("Gid", "").split()
+say(uids == [str(c["run_uid"])] * 4 and gids == [str(c["run_gid"])] * 4, "ids_all_equal")       # real, effective, saved and file-system ids
+import subprocess
+FSID = r"""
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+for target in (0, int(sys.argv[2])):
+    libc.syscall(122, target)                                       # setfsuid(target): without CAP_SETUID this must change nothing
+    fs = libc.syscall(122, -1)                                      # setfsuid(-1) only reports the current file-system uid
+    status = [l.split()[4] for l in open("/proc/self/status") if l.startswith("Uid:")][0]
+    try:
+        open(sys.argv[1], "rb").read(1)
+        readable = 1
+    except OSError:
+        readable = 0
+    print("FSID", fs, status, readable, flush=True)
+"""
+def fsid():
+    try:
+        got = subprocess.run([sys.executable, "-I", "-c", FSID, c["root_only"], str(c["owner_uid"])], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    rows = [l.split() for l in got.stdout.splitlines() if l.startswith("FSID ")]
+    me = str(c["run_uid"])
+    return got.returncode == 0 and len(rows) == 2 and all(r[1:] == [me, me, "0"] for r in rows)
+say(fsid(), "fs_identity_fixed")
+def denied(number, arg):
+    try:
+        got = subprocess.run([sys.executable, "-I", "-c", "import ctypes;ctypes.CDLL(None).syscall(%d, %d);print('ALIVE')" % (number, arg)],
+                             capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return got.returncode == -31 and "ALIVE" not in got.stdout       # killed by the filter (SIGSYS), not merely refused
+say(all(denied(n, a) for n, a in ((123, 0), (105, 0), (117, 0), (116, 0))), "setid_calls_denied")   # setfsgid, setuid, setresuid, setgroups
 say(st.get("NoNewPrivs") == "1", "no_new_privs")
 def reads(path):
     try:
@@ -202,14 +242,14 @@ def _judge(lines, owner_ok, strict_limits=False):
         if word == "SKIP" and name == "limits":                     # the cgroup files were not readable at all
             for n in OPTIONAL:
                 seen.setdefault(n, "SKIP")
-        if word in ("PASS", "FAIL", "SKIP") and name in REQUIRED + OPTIONAL:
+        if word in ("PASS", "FAIL", "SKIP") and name in REQUIRED + OPTIONAL + STRICT_REQUIRED:
             seen[name] = word
         got = _DIAG.fullmatch(line)
         if got and got.group(1) in DIAG_NAMES and len(diagnostics) < 24:
             diagnostics[got.group(1)] = {"expected": got.group(2), "actual": got.group(3)}          # numbers and short tokens only
     seen["owner_edits_runner_files"] = "PASS" if owner_ok else "FAIL"
     passed = sorted(n for n, w in seen.items() if w == "PASS")
-    need = REQUIRED + (OPTIONAL if strict_limits else ())
+    need = REQUIRED + ((OPTIONAL + STRICT_REQUIRED) if strict_limits else ())
     failed = sorted({n for n in need if seen.get(n) != "PASS"} | {n for n in OPTIONAL if seen.get(n) == "FAIL"})
     # A limit that could not be SEEN is "unverified" in every mode; under systemd (strict) it ALSO fails the gate.
     unverified = sorted(n for n in OPTIONAL if seen.get(n) in (None, "SKIP"))
@@ -270,6 +310,12 @@ def run_selftest(jr, *, timeout=60):
     except projects_helper.Refuse as refused:
         raise JobError("selftest_scan_incomplete_" + str(refused)) from None
     canaries = [ws + "/.env", ws + "/.ssh/id_ed25519", ws + "/.stynpilot-trash/old.txt"]
+    # A root-only file the probe can SEE: even after asking for file-system uid 0 (setfsuid) it must stay unreadable.
+    root_only = os.path.join(ws, "root-only.bin")
+    with open(root_only, "w") as handle:
+        handle.write("root")
+    os.chown(root_only, 0, 0)
+    os.chmod(root_only, 0o600)                                      # also masks any inherited ACL entry
     sockets = sorted({p for g in SOCKET_GLOBS for p in glob.glob(g)} | set(getattr(jr.backend, "extra_sockets", ())))
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
@@ -287,7 +333,7 @@ def run_selftest(jr, *, timeout=60):
                   "home": jr.home, "home_names": home_names, "port": listener.getsockname()[1],
                   "no_write": ["/etc", "/usr", "/var/lib", "/opt", "/srv", jr.home, str(jr.dir), "/root"], "tasks": TASKS, "memory_mb": MEMORY_MB,
                   "canaries": canaries, "sockets": sockets, "fsize": runner.FSIZE_MB * 1024 * 1024, "tmp_bytes": runner.TMP_MB * 1024 * 1024 + 4096,
-                  "decoy_ws": decoy, "decoy_name": "decoy.txt", "late": ["late.txt", "late.env"],
+                  "decoy_ws": decoy, "decoy_name": "decoy.txt", "root_only": root_only, "late": ["late.txt", "late.env"],
                   "io_devs": io_devs, "wbps": runner.IO_WRITE_BPS}
         lines, job_status, started, start_error = [], None, time.time(), None
         try:

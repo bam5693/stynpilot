@@ -183,6 +183,7 @@ HIDDEN_PATHS = ("/etc/stynpilot", "/var/lib/stynpilot", "/var/lib/stynpilot-inst
                 "/var/lib/tailscale", "/run/user", "/run/dbus", "/run/systemd/private")
 
 
+ALLOWED_EXTRA_SYSCALLS = ("setfsuid",)   # the complete list of exceptions to ~@privileged @resources; each must be demonstrated necessary
 FSIZE_MB = 512          # largest single file a job may write (RLIMIT_FSIZE)
 TMP_MB = 256            # size of the private /tmp (a memory-backed file system, so it can never fill the disk)
 RUN_MB = 8
@@ -225,6 +226,9 @@ def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=T
         "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "RestrictSUIDSGID=yes",
         "RestrictNamespaces=yes", "LockPersonality=yes", "RestrictRealtime=yes",
         "SystemCallArchitectures=native", "SystemCallFilter=@system-service", "SystemCallFilter=~@privileged @resources",
+        # Re-allow ONLY setfsuid: Python 3.14 on Ubuntu 26.04 calls it while loading native extensions and was killed (audit: syscall 122).
+        # Without CAP_SETUID it can only re-select the account's own uid; the self-test proves that. Every other id call stays denied.
+        "SystemCallFilter=" + " ".join(ALLOWED_EXTRA_SYSCALLS),
         "UMask=0077", "LimitCORE=0", "LimitNOFILE=1024", "LimitFSIZE=%dM" % FSIZE_MB, "KeyringMode=private",
         # network: none by default (a separate YELLOW grant would be needed)
         "PrivateNetwork=yes" if not network else "PrivateNetwork=no",

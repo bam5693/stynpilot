@@ -45,7 +45,7 @@ class StubJobs:
 def live_like_verdict(extra_state=None):
     """What the Ryzen would produce: every limit read, one of them wrong."""
     lines = ["PASS " + n for n in REQUIRED if n != "owner_edits_runner_files"] + ["PASS " + n for n in OPTIONAL if n != "limit_io"]
-    lines += ["FAIL limit_io", "DIAG cgroup_path - :system.slice:stynpilot-job-x.service", "DIAG limit_pids 64 64",
+    lines += ["PASS setid_calls_denied", "FAIL limit_io", "DIAG cgroup_path - :system.slice:stynpilot-job-x.service", "DIAG limit_pids 64 64",
               "DIAG limit_io 259:0:wbps=67108864 259:0:wbps=max", "DIAG limit_tmp 268439552 268435456", "DIAG evil /etc/shadow x"]
     verdict = _judge(lines, True, strict_limits=True)
     verdict.update({"ran": True, "version": "0.1.0.dev12", "at": 1})
@@ -113,7 +113,7 @@ class DiagnosticsReachTheAssistant(unittest.TestCase):
         verdict = _judge(lines, True, strict_limits=True)
         self.assertFalse(verdict["ok"])                                          # gate closed
         self.assertEqual(verdict["unverified"], sorted(OPTIONAL))                # and honestly reported as not seen
-        self.assertEqual(verdict["failed"], sorted(OPTIONAL))
+        self.assertEqual(verdict["failed"], sorted(OPTIONAL + ("setid_calls_denied",)))
         relaxed = _judge(lines, True, strict_limits=False)                       # without systemd the old rule still holds
         self.assertTrue(relaxed["ok"])
         self.assertEqual(relaxed["unverified"], sorted(OPTIONAL))

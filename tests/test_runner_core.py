@@ -192,6 +192,16 @@ class SandboxUnit(unittest.TestCase):
         for path in ("/etc/stynpilot", "/var/lib/stynpilot", "/run/stynpilot", "/run/user", "/root", "/etc/shadow"):
             self.assertIn("-" + path, hidden.split("=", 1)[1].split(" "))   # "-": a missing path is not an error
 
+    def test_the_syscall_filter_reallows_only_setfsuid_and_only_after_the_deny(self):
+        props = self.props(self.cmd())
+        filters = [p for p in props if p.startswith("SystemCallFilter=")]
+        # Order matters to systemd: allow-list, then the deny, then the ONE demonstrated exception (Python 3.14 / Ubuntu 26.04, syscall 122).
+        self.assertEqual(filters, ["SystemCallFilter=@system-service", "SystemCallFilter=~@privileged @resources", "SystemCallFilter=setfsuid"])
+        from stynpilot import runner as r
+        self.assertEqual(r.ALLOWED_EXTRA_SYSCALLS, ("setfsuid",))
+        for still_denied in ("setfsgid", "setuid", "setresuid", "setgroups", "setreuid", "capset", "chown"):
+            self.assertNotIn(still_denied, filters[-1].split("=", 1)[1].split())
+
     def test_it_never_runs_as_root_or_the_owner_and_the_environment_is_fixed(self):
         cmd = self.cmd()
         users = [p for p in self.props(cmd) if p.startswith(("User=", "Group="))]

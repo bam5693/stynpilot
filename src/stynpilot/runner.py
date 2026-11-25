@@ -190,7 +190,10 @@ IO_WRITE_BPS = 64 * 1024 * 1024    # EXACT bytes per second ceiling per disk (sy
                                    # unit, self-test and disk reserve). Bounds how far the disk can fill between two watchdog checks
 
 
-def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=True, network=False, run_user=RUN_USER, masked=(), io_devices=()):
+RESOLVER_FILE = "/run/systemd/resolve/stub-resolv.conf"
+
+
+def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=True, network=False, run_user=RUN_USER, masked=(), io_devices=(), resolver=False):
     """The ``systemd-run`` argv list that runs ``argv`` in ``workspace`` as ``run_user`` with the sandbox below. A LIST, so
     nothing is ever parsed by a shell; every value that varies is validated here, and property values never contain
     separators that systemd would interpret."""
@@ -230,6 +233,10 @@ def unit_command(job_id, argv, workspace, *, seconds, memory_mb, tasks, writes=T
         "RuntimeMaxSec=%d" % seconds, "MemoryMax=%dM" % memory_mb, "MemorySwapMax=0", "TasksMax=%d" % tasks, "CPUQuota=200%",
         "KillMode=control-group", "TimeoutStopSec=5",
     ] + ["IOWriteBandwidthMax=/dev/block/%s %d" % (dev, IO_WRITE_BPS) for dev in io_devices]
+    if network and resolver:
+        # /etc/resolv.conf is a link into /run, which this sandbox replaces with an empty tmpfs; without this the unit has network but
+        # cannot resolve a name. Expose ONLY that one read-only file (never the /run/systemd/resolve folder, which holds sockets).
+        props.append("BindReadOnlyPaths=-" + RESOLVER_FILE)
     cmd = ["systemd-run", "--quiet", "--collect", "--wait", "--pipe", "--unit", "stynpilot-job-" + job_id]
     for p in props:
         cmd += ["-p", p]

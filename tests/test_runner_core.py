@@ -167,6 +167,12 @@ class SandboxUnit(unittest.TestCase):
     def props(self, cmd):
         return [cmd[i + 1] for i, a in enumerate(cmd) if a == "-p"]
 
+    def test_name_resolution_is_off_unless_asked_and_then_exposes_exactly_one_read_only_file(self):
+        for kw in ({}, {"network": True}, {"resolver": True}):
+            self.assertFalse([p for p in self.props(self.cmd(**kw)) if p.startswith("BindReadOnlyPaths=-")], kw)
+        on = self.props(self.cmd(network=True, resolver=True))
+        self.assertEqual([p for p in on if "resolve" in p], ["BindReadOnlyPaths=-/run/systemd/resolve/stub-resolv.conf"])
+
     def test_the_command_is_a_list_with_the_workload_after_a_double_dash(self):
         cmd = self.cmd()
         self.assertEqual(cmd[0], "systemd-run")

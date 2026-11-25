@@ -998,6 +998,32 @@ class ConfigTests(unittest.TestCase):
                 build_authority(InstallerConfig.from_file(main), state_dir=Path(folder))
             self.assertEqual(str(e.exception), "release_build_user_does_not_exist")
 
+    def test_only_the_network_steps_of_the_real_builder_sandbox_can_resolve_names_and_only_through_one_file(self):
+        import pwd
+        from stynpilot.service import InstallerConfig, build_authority
+        try:
+            pwd.getpwnam("nobody")
+        except KeyError:
+            self.skipTest("no 'nobody' account here")
+        with tempfile.TemporaryDirectory() as folder:
+            main, side = Path(folder) / "installer.json", Path(folder) / "release.json"
+            self.put(main, self.BASE)
+            self.put(side, {"build_user": "nobody"})
+            auth = build_authority(InstallerConfig.from_file(main), state_dir=Path(folder))
+            job, argv, ws = "a" * 24, ["/usr/bin/git", "fetch"], "/var/lib/stynpilot-build/" + "c" * 40
+            limits = dict(seconds=60, memory_mb=512, tasks=64)
+            props = lambda c: [c[i + 1] for i, a in enumerate(c) if a == "-p"]
+            online = props(auth.sandbox(job, argv, ws, network=True, **limits))
+            offline = props(auth.sandbox(job, argv, ws, network=False, **limits))
+            self.assertIn("BindReadOnlyPaths=-/run/systemd/resolve/stub-resolv.conf", online)
+            self.assertIn("PrivateNetwork=no", online)
+            self.assertIn("TemporaryFileSystem=/run:mode=0755,nosuid,nodev,size=%dM" % __import__("stynpilot.runner", fromlist=["x"]).RUN_MB, online)
+            self.assertFalse([p for p in offline if p.startswith("BindReadOnlyPaths") or p.startswith("BindPaths=/run")])
+            self.assertIn("PrivateNetwork=yes", offline)
+            # never the whole /run or the resolver folder (it holds sockets), on any step
+            for each in (online, offline):
+                self.assertFalse([p for p in each if re.fullmatch(r"Bind(ReadOnly)?Paths=-?/run(/systemd(/resolve)?)?/?", p)])
+
 
 if __name__ == "__main__":
     unittest.main()

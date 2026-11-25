@@ -411,7 +411,7 @@ def build_authority(config, state_dir=None, **options):
         # The same sandbox the owner's project jobs use (systemd-run unit: no privileges, read-only system, hidden installer folders,
         # memory/process/CPU/time limits, own /tmp), run as the build account. Network only where a step is allowed it.
         return runner.unit_command(job, argv, workspace, seconds=seconds, memory_mb=memory_mb, tasks=tasks, writes=True,
-                                   network=network, run_user=account.pw_name)
+                                   network=network, run_user=account.pw_name, resolver=network)
 
     options.setdefault("work_root", BUILD_ROOT)
     return Authority(state_dir or config.state_dir, sandbox=sandbox, mount_work=True, build_uid=account.pw_uid, **options)

@@ -3,7 +3,8 @@
 (Dev17 became a fix release, published by hand one last time: the first live build on the Ryzen found that the build sandbox hid
 the system name resolver. Dev17 adds exactly one read-only file, /run/systemd/resolve/stub-resolv.conf, to the two network steps
 (git fetch, wheel download) and records the failing step, exit code and output tail in the build record. Builds and tests stay
-fully offline. Everything below applies to the first run that the Ryzen does by itself, now dev18.)
+fully offline. Everything below applies to the first run that the Ryzen does by itself, now dev18. Dev17 was installed and verified live: 18/18
+sandbox tests, passkey audit chain intact, services active.)
 
 Dev18 is deliberately harmless: the only change from dev17 is the version number and this note. Its purpose is to prove, live on the
 Ryzen, the whole path that dev16 built: build in the sandbox, review, ONE fingerprint approval, sign, publish, install, health check.
@@ -22,3 +23,10 @@ Nothing about dev18 is built, signed, staged or published by hand. The Ryzen doe
 ## Not covered by dev18 (tracked)
 Interrupted-release resume on the real machine, signing-key loss/rotation/revocation drills, stricter fetch-destination filtering,
 manifest v2 multi-signature, signed revocation list. Reproducibility and the commit's own tests do not replace independent source review.
+
+## Order of the live run
+1. ChatGPT: `commander_prepare_stynpilot_release` with this commit and version `0.1.0~dev18` (read-only until approval).
+2. Poll `stynpilot_release_status` until `ready`; on `failed`, the record names the step, exit code and output tail.
+3. ChatGPT: `commander_request_stynpilot_release` (its review note is shown to the owner as unverified).
+4. Owner: one fingerprint approval. The Ryzen signs, publishes (draft, verify, public) and upgrades itself.
+5. If it stops after the approval, `commander_resume_stynpilot_release` finishes that exact operation.

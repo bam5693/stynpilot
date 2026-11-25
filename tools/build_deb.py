@@ -138,14 +138,14 @@ def _explain_failure(pkg, done, env):
     for name, argv in probes:
         scratch = pkg.parent / ("probe-" + name.split()[0].split("=")[0] + ".deb")
         got = subprocess.run(argv + [str(pkg), str(scratch)], capture_output=True, text=True, env=env)
-        print("probe %s: exit %d %s" % (name, got.returncode, _short(got.stderr)), file=sys.stderr)
+        print("probe %s: exit %d %s" % (name, got.returncode, _short(got.stderr, 150)), file=sys.stderr)
     for argv in (["dpkg-deb", "--version"], ["tar", "--version"], ["xz", "--version"], ["id"], ["ls", "-ld", str(pkg), str(pkg / "DEBIAN")]):
         try:
             got = subprocess.run(argv, capture_output=True, text=True, timeout=20)
-            print("%s: %s" % (argv[0], _short(got.stdout.splitlines()[0] if got.stdout else got.stderr, 120)), file=sys.stderr)
+            print("%s: %s" % (argv[0], _short(got.stdout.splitlines()[0] if got.stdout else got.stderr, 70)), file=sys.stderr)
         except (OSError, subprocess.SubprocessError) as error:
             print("%s: %s" % (argv[0], type(error).__name__), file=sys.stderr)
-    raise SystemExit("dpkg-deb failed with exit %d: %s" % (done.returncode, _short(done.stderr or done.stdout, 400)))
+    raise SystemExit("dpkg-deb failed with exit %d: %s" % (done.returncode, _short(done.stderr or done.stdout, 300)))
 
 
 if __name__ == "__main__":

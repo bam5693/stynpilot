@@ -171,6 +171,7 @@ class Authority:
         # account inside the S3 sandbox; inspect(path, version) raises unless the upgrade path would accept the package.
         self.sandbox, self.mount_work, self.tmpfs_mb, self.inspect = sandbox, mount_work, tmpfs_mb, inspect
         self.fetch = fetch or default_fetch
+        self.last_phase = None
         self.keyfile, self.tokenfile = self.root / "signing-ed25519.pem", self.root / "github-token"
 
     # -- console-provisioned secrets ------------------------------------------------------------------------------------
@@ -248,7 +249,7 @@ class Authority:
         if rec is None:
             return {"state": "not_started"}
         return {k: rec[k] for k in ("state", "version", "why", "sha256", "size", "tests_passed", "tests_failed", "tests_skipped",
-                                    "reproducible", "commit", "started", "finished") if k in rec}
+                                    "reproducible", "commit", "started", "finished", "detail") if k in rec}
 
     def prepare_check(self, commit, version):
         """Refuse an unusable request up front (before any background work)."""
@@ -290,11 +291,14 @@ class Authority:
         d.mkdir(parents=True, mode=0o700)
         record = {"state": "building", "commit": commit, "version": version, "started": self.clock()}
         self._save(commit, record)
+        self.last_phase = None
         try:
             record.update(self._build(commit, version, d))
             record["state"] = "ready"
         except AuthorityError as failed:
             record.update(state="failed", why=failed.code)
+            if self.last_phase and self.last_phase.get("code") != 0:
+                record["detail"] = self.last_phase                  # the step that failed, its exit code and output tail
         except Exception as error:                       # a bug must never look like a good build
             record.update(state="failed", why="unexpected_%s" % type(error).__name__)
         record["finished"] = self.clock()
@@ -317,6 +321,14 @@ class Authority:
     def _phase(self, commit, name, argv, work, *, seconds, network=False, memory_mb=2048, tasks=256, env=None):
         """Run one step as the unprivileged build account inside the sandbox. Returns (exit code, output). A step that runs out
         of time is stopped together with everything it started; nothing it spawned survives."""
+        result = self._phase_run(commit, name, argv, work, seconds, network, memory_mb, tasks, env)
+        # What the owner (and the assistants) need to find a failure on a real machine: which step, its exit code, the end of its output.
+        # The builder's output is untrusted DATA: printable ASCII only, short, and no secrets exist in the sandbox to leak.
+        tail = re.sub(r"[^ -~\n]", "?", result[1][-400:])
+        self.last_phase = {"phase": name, "code": result[0], "tail": tail}
+        return result
+
+    def _phase_run(self, commit, name, argv, work, seconds, network, memory_mb, tasks, env):
         if self.sandbox:
             job = hashlib.sha256(("%s|%s|%r" % (commit, name, self.clock())).encode()).hexdigest()[:24]
             cmd = self.sandbox(job, argv, str(work), seconds=seconds, memory_mb=memory_mb, tasks=tasks, network=network)

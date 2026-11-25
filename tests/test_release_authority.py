@@ -450,6 +450,19 @@ class AuthorityTests(unittest.TestCase):
         self.assertTrue(over)
         self.assertLess(_t.monotonic() - start, 10)
 
+    def test_a_failed_step_is_reported_with_its_name_exit_code_and_a_clean_output_tail(self):
+        class GitBroken(FakeMachine):
+            def __call__(self, argv, timeout, cwd=None, env=None):
+                if "init" in argv:
+                    return 1, "fatal: boom \x1b[31m\x00 end"
+                return super().__call__(argv, timeout, cwd=cwd, env=env)
+        auth = self.make(self.tmp / "dg", GitBroken(self.deb_bytes))
+        got = auth.prepare(COMMIT, VERSION, "x")
+        self.assertEqual(got["why"], "could_not_fetch_that_exact_commit")
+        self.assertEqual((got["detail"]["phase"], got["detail"]["code"]), ("git0", 1))
+        self.assertIn("fatal: boom", got["detail"]["tail"])
+        self.assertNotRegex(got["detail"]["tail"], r"[\x00-\x09\x0b-\x1f]")
+
     def test_readiness_recognises_the_production_sandbox_builder(self):
         sandboxed = Authority(self.tmp / "rd", run=self.machine, http=self.http, sandbox=lambda *a, **k: [])
         self.assertTrue(sandboxed.ready()["builder"])

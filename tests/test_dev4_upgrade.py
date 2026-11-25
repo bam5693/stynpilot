@@ -88,7 +88,9 @@ class Pkg:
             path = stage / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
-            path.chmod((modes or {}).get(rel, 0o755 if rel == "usr/bin/stynpilot" else 0o644))
+            # The real file only gets ordinary bits (the release sandbox refuses setuid/setgid chmod: RestrictSUIDSGID); the mode the
+            # test asks for, dangerous or not, is written straight into the archive entry by the in-process writer below.
+            path.chmod(0o755 if rel == "usr/bin/stynpilot" else 0o644)
             sums.append("%s  %s" % (hashlib.md5(text.encode()).hexdigest(), rel))
         for d in [stage, *stage.rglob("*")]:
             if d.is_dir():
@@ -104,7 +106,9 @@ class Pkg:
             (control / name).write_text("#!/bin/sh\nexit 0\n")
             (control / name).chmod(0o755)
         out = self.tmp / ("stynpilot_%s_%d.deb" % (version.replace("~", "-"), self.count))
-        debfile.write_tree(stage, out, 1700000000)          # in-process: no tar child (it fails inside the release sandbox)
+        wanted = {str(stage / rel): mode for rel, mode in (modes or {}).items()}
+        debfile.write_tree(stage, out, 1700000000,           # in-process: no tar child (it fails inside the release sandbox)
+                           mode_of=lambda path: wanted.get(str(path), 0o755 if path.is_dir() else path.stat().st_mode & 0o7777))
         return out
 
     def install_fake(self, root, version, depends=DEPENDS, files=None):

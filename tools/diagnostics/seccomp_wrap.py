@@ -20,6 +20,16 @@ allowed.discard("socket")
 # RestrictSUIDSGID=yes: systemd answers openat2 with ENOSYS (it cannot inspect openat2's mode) -- the live Ryzen probe confirmed 38
 f.add_rule(seccomp.ERRNO(errno.ENOSYS), "openat2")
 allowed.discard("openat2")
+# RestrictSUIDSGID=yes also refuses (EPERM) setting setuid/setgid bits: chmod-family mode argument, and creating files with them
+for name, arg in (("chmod", 1), ("fchmod", 1), ("fchmodat", 2), ("fchmodat2", 2), ("creat", 1), ("mkdir", 1), ("mkdirat", 2),
+                  ("mknod", 1), ("mknodat", 2), ("open", 2), ("openat", 3)):
+    try:
+        f.add_rule(seccomp.ALLOW, name, seccomp.Arg(arg, seccomp.MASKED_EQ, 0o6000, 0))
+        for bit in (0o4000, 0o2000):
+            f.add_rule(seccomp.ERRNO(errno.EPERM), name, seccomp.Arg(arg, seccomp.MASKED_EQ, bit, bit))
+        allowed.discard(name)
+    except Exception:
+        pass
 for name in sorted(allowed):
     try:
         f.add_rule(seccomp.ALLOW, name); n += 1

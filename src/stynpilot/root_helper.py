@@ -16,7 +16,7 @@ import stat
 import sys
 from pathlib import Path
 
-from . import backup
+from . import backup, service
 from .service import ConfigError
 from .setup_wizard import root_setup
 
@@ -33,7 +33,7 @@ def _caller(environ=os.environ, geteuid=os.geteuid):
         uid = int(environ["PKEXEC_UID"])
     except (KeyError, ValueError):
         raise ConfigError("not_started_by_polkit") from None
-    if uid < 1000:
+    if uid < service.MIN_OWNER_UID:
         raise ConfigError("caller_must_be_a_normal_user")
     return uid
 

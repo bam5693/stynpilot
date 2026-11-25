@@ -37,6 +37,30 @@ def tmpdir(test):
 
 
 @unittest.skipIf(jwt is None, "PyJWT/cryptography not installed")
+
+def accept_this_account_as_owner(testcase):
+    """These tests use the account running them as 'the owner' (files must really be owned by it). The release builder runs them as a
+    SYSTEM account (uid < 1000), which production correctly refuses as an owner; lower the line to that one account for this test only.
+    Root is never accepted. Production's own line is tested in OwnerLineTests."""
+    from stynpilot import service as _service
+    uid = os.geteuid()
+    if 0 < uid < _service.MIN_OWNER_UID:
+        real = _service.MIN_OWNER_UID
+        _service.MIN_OWNER_UID = uid
+        testcase.addCleanup(setattr, _service, "MIN_OWNER_UID", real)
+
+
+class OwnerLineTests(unittest.TestCase):
+    def test_production_refuses_system_accounts_and_root_as_the_owner(self):
+        from stynpilot import root_helper, service as _service
+        self.assertEqual(_service.MIN_OWNER_UID, 1000)
+        for uid in (0, 992, 999):
+            with self.assertRaises(ConfigError) as refused:
+                root_helper._caller(environ={"PKEXEC_UID": str(uid)}, geteuid=lambda: 0)
+            self.assertEqual(str(refused.exception), "caller_must_be_a_normal_user")
+        self.assertEqual(root_helper._caller(environ={"PKEXEC_UID": "1000"}, geteuid=lambda: 0), 1000)
+
+
 class BackupTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tmpdir(self)
@@ -219,8 +243,9 @@ class RootBackupTests(unittest.TestCase):
 
     def test_root_helper_acts_only_for_the_authenticated_caller(self):
         from stynpilot import root_helper
-        if os.geteuid() < 1000:
-            self.skipTest("needs a normal user id")
+        if os.geteuid() == 0:
+            self.skipTest("needs a non-root user id")
+        accept_this_account_as_owner(self)
         env = {"PKEXEC_UID": str(os.geteuid())}
         out = self.tmp / "h.tar"
         root_helper.root_backup(out, state=self.state, environ=env, geteuid=lambda: 0)
@@ -467,6 +492,7 @@ class SetupTests(unittest.TestCase):
         make_pairing_db(self.home / ".local/state/stynpilot-owner", [(ts.DEVICE, ts.OWNER, time.time() + 3600, None, ["workspace.propose"])])
         self.pairing = self.home / ".local/state/stynpilot-owner/pairing.sqlite3"
         self.form = dict(FORM, pairing_db=str(self.pairing))
+        accept_this_account_as_owner(self)
         self.uid = os.geteuid()
         self.root_config = self.home / "etc-installer.json"            # stands in for /etc/stynpilot/installer.json
         self.paths = setup_wizard.default_paths(self.home)
@@ -760,7 +786,8 @@ class SetupTests(unittest.TestCase):
 
     def test_root_step_installs_the_config_for_exactly_the_caller_and_never_replaces_one(self):
         source = self.write_proposal()
-        if os.geteuid() < 1000:
+        from stynpilot import service as _service
+        if os.geteuid() < _service.MIN_OWNER_UID:                      # only root gets here now (system accounts are accepted above)
             with self.assertRaises(ConfigError):
                 self.root(source)
             return
@@ -1284,6 +1311,7 @@ class LifecycleTests(unittest.TestCase):
         from stynpilot import lifecycle, root_helper
         self.lifecycle, self.root_helper = lifecycle, root_helper
         self.tmp = tmpdir(self)
+        accept_this_account_as_owner(self)
         self.uid = os.geteuid()
         self.config = self.tmp / "installer.json"
         data = {"issuer": "https://tenant.example.auth/", "approval_client_id": "app", "owner": ts.OWNER, "device": ts.DEVICE,
@@ -1295,16 +1323,16 @@ class LifecycleTests(unittest.TestCase):
     def test_root_start_and_stop_run_exactly_one_fixed_unit_for_the_configured_owner(self):
         calls = []
         env = {"PKEXEC_UID": str(self.uid)}
-        if self.uid < 1000:
-            self.skipTest("needs a normal user id")
+        if self.uid == 0:
+            self.skipTest("needs a non-root user id")
         self.root_helper.root_start(config_path=self.config, systemctl=calls.append, environ=env, geteuid=lambda: 0)
         self.root_helper.root_stop(config_path=self.config, systemctl=calls.append, environ=env, geteuid=lambda: 0)
         self.assertEqual(calls, [["enable", "--now", "stynpilot-installer.service"],
                                  ["disable", "--now", "stynpilot-installer.service"]])
 
     def test_another_user_a_missing_or_loose_config_and_non_root_are_refused(self):
-        if self.uid < 1000:
-            self.skipTest("needs a normal user id")
+        if self.uid == 0:
+            self.skipTest("needs a non-root user id")
         calls = []
         for env, euid, cfg in (({"PKEXEC_UID": str(self.uid + 1)}, 0, self.config),            # someone else asking
                                ({"PKEXEC_UID": str(self.uid)}, 1000, self.config),            # not root

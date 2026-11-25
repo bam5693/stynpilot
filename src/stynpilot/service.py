@@ -48,6 +48,9 @@ PASSKEY_SETTINGS_NAME = "passkeys.json"      # beside installer.json; installer.
                                              # to dev14 never meets a field it rejects (dev14 simply never reads this file)
 
 
+MIN_OWNER_UID = 1000          # the owner is a normal login account, never a system account (tests running AS one lower it)
+
+
 class ConfigError(ValueError):
     pass
 
@@ -366,7 +369,7 @@ class InstallerConfig:
             if type(data[field]) is not str or not data[field]:
                 raise ConfigError("%s_required" % field)
         uid = data["owner_uid"]
-        if type(uid) is not int or isinstance(uid, bool) or uid < 1000:
+        if type(uid) is not int or isinstance(uid, bool) or uid < MIN_OWNER_UID:
             raise ConfigError("owner_uid_must_be_a_normal_user")
         rp_id, origin = data.get("passkey_rp_id"), data.get("passkey_origin")
         if (rp_id is None) != (origin is None):

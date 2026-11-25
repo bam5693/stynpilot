@@ -17,6 +17,9 @@ import errno
 f.add_rule(seccomp.ALLOW, "socket", seccomp.Arg(0, seccomp.EQ, 1))
 f.add_rule(seccomp.ERRNO(errno.EAFNOSUPPORT), "socket", seccomp.Arg(0, seccomp.NE, 1))
 allowed.discard("socket")
+# RestrictSUIDSGID=yes: systemd answers openat2 with ENOSYS (it cannot inspect openat2's mode) -- the live Ryzen probe confirmed 38
+f.add_rule(seccomp.ERRNO(errno.ENOSYS), "openat2")
+allowed.discard("openat2")
 for name in sorted(allowed):
     try:
         f.add_rule(seccomp.ALLOW, name); n += 1

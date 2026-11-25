@@ -36,7 +36,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .. import release, upgrade_worker
+from .. import debfile, release, upgrade_worker
 from ..release import ReleaseError
 
 PAYLOAD_FIELDS = {"kind", "software", "owner", "device", "manifest", "signature", "expires_at"}
@@ -293,24 +293,33 @@ class Upgrader:
             for path in [stage, *stage.rglob("*")]:
                 if path.is_dir():
                     path.chmod(0o755)
-            control = stage / "DEBIAN"
-            control.mkdir(mode=0o755)
-            control.chmod(0o755)                     # mkdir's mode is cut by the umask: under 0077 dpkg-deb refused the 0700 folder
             lines = ["Package: %s" % PACKAGE, "Version: %s" % installed, "Architecture: all"]
             lines += ["%s: %s" % (k, fields[k]) for k in ("Section", "Priority", "Maintainer", "Depends") if fields[k]]
             lines += ["Description: StyNpilot (rollback copy re-packed from the installed files before an upgrade)"]
-            (control / "control").write_text("\n".join(lines) + "\n")
-            (control / "md5sums").write_text("".join("%s  %s\n" % (d, r.strip()) for d, r in entries))
-            for name in ("control", "md5sums"):
-                (control / name).chmod(0o644)
-            code, out = self._run(["dpkg-deb", "--root-owner-group", "-Zxz", "--build", str(stage), str(dest)], 300)
-            if code != 0:
-                raise UpgradeRefused("rollback_copy_could_not_be_built")
-            check = Path(tmp) / "check"
-            if self._run(["dpkg-deb", "-x", str(dest), str(check)], 120)[0] != 0:
-                raise UpgradeRefused("rollback_copy_could_not_be_verified")
-            for digest, rel in entries:
-                if hashlib.md5((check / rel.strip()).read_bytes()).hexdigest() != digest:
+            control = [("./", 0o755, None), ("./control", 0o644, ("\n".join(lines) + "\n").encode()),
+                       ("./md5sums", 0o644, "".join("%s  %s\n" % (d, r.strip()) for d, r in entries).encode())]
+            # Built in-process (stynpilot.debfile): no tar child, so it works the same inside the release sandbox.
+            try:
+                blob = debfile.build_deb_bytes(control, debfile.tree_entries(stage), int(time.time()))
+            except debfile.DebError:
+                raise UpgradeRefused("rollback_copy_could_not_be_built") from None
+            fd = os.open(str(dest), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                os.write(fd, blob)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            # Proof, read back from the disk and checked in memory (never unpacked): exactly the recorded files, each identical.
+            try:
+                got = debfile.read_deb_file(dest)
+            except debfile.DebError:
+                raise UpgradeRefused("rollback_copy_could_not_be_verified") from None
+            wanted = {rel.strip(): digest for digest, rel in entries}
+            fields_back = debfile.control_fields(got["control"].get("control", (0, b""))[1].decode("utf-8", "replace"))
+            if set(got["files"]) != set(wanted) or fields_back.get("Package") != PACKAGE or fields_back.get("Version") != installed:
+                raise UpgradeRefused("rollback_copy_differs_from_installed_files")
+            for rel, digest in wanted.items():
+                if hashlib.md5(got["files"][rel][1]).hexdigest() != digest:
                     raise UpgradeRefused("rollback_copy_differs_from_installed_files")
 
     # -- 4. the job -------------------------------------------------------------------------------------

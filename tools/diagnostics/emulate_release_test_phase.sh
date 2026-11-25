@@ -1,6 +1,9 @@
 #!/bin/sh
-# Developer tool: emulates the release builder offline test phase (see runner.unit_command). Runs as uid 992 like stynpilot-build
-# on the Ryzen (SB_UID to change); FAKETAR=1 makes tar fail like there (ENOSYS). Needs seccomp_wrap.py, loopback_up.py as in the script.
+# Developer tool (root, throwaway machine): emulates the release builder offline test phase from runner.unit_command: uid 992
+# (SB_UID), no capabilities, no-new-privs, loopback-only netns, AF_UNIX only, systemd's effective seccomp filter with openat2 ->
+# ENOSYS (RestrictSUIDSGID), read-only root, private /tmp /run /home /root, umask 0077, NOFILE 1024, FSIZE 512M. FAKETAR=1 puts
+# faketar.py in front of tar to reproduce the Ryzen tar (no openat2 fallback). Copy seccomp_wrap.py, loopback_up.py, faketar.py to
+# /tmp and /var as the paths below expect.
 # Emulation of the release builder's offline test phase (runner.unit_command, network=False): see the property list in runner.py.
 W=/var/sbw
 rm -rf $W/src && git clone -q /home/claude/stynpilot $W/src && cp -r /home/claude/stynpilot/src /home/claude/stynpilot/tests /home/claude/stynpilot/tools /home/claude/stynpilot/pyproject.toml $W/src/

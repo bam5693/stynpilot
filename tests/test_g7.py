@@ -1246,8 +1246,10 @@ class PackageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        cache = ROOT / ".build-cache"
-        if not shutil.which("dpkg-deb") or not list(cache.glob("mcp-*.whl")):
+        # a developer checkout keeps the pinned wheels in .build-cache; the release builder's work area has them in ../cache
+        found = [c for c in (ROOT / ".build-cache", ROOT.parent / "cache") if list(c.glob("mcp-*.whl"))]
+        cls.cache = cache = found[0] if found else ROOT / ".build-cache"
+        if not shutil.which("dpkg-deb") or not found:
             raise unittest.SkipTest("dpkg-deb or the pinned wheel cache is missing (build once with network)")
         import importlib.util
         spec = importlib.util.spec_from_file_location("build_deb", ROOT / "tools/build_deb.py")
@@ -1281,21 +1283,21 @@ class PackageTests(unittest.TestCase):
         self.assertIn("./usr/lib/systemd/user/stynpilot-owner.service", names)
         self.assertFalse([n for n in names if "/etc/" in n and "systemd" not in n])   # no /etc files, nothing enabled
         self.assertFalse([n for n in names if "wants" in n])
-        with tempfile.TemporaryDirectory() as d:
-            subprocess.run(["dpkg-deb", "-x", str(self.deb), d], check=True)
-            text = (Path(d) / "usr/lib/stynpilot/lib/stynpilot/service.py").read_text()
-            for bad in ("dtdev_", "auth0|", "BEGIN PRIVATE"):
-                self.assertNotIn(bad, text)
-            launcher = (Path(d) / "usr/bin/stynpilot").read_text()
-            self.assertTrue(launcher.startswith("#!/usr/bin/python3 -I"))
-            for unit in ("usr/lib/systemd/system/stynpilot-installer.service", "usr/lib/systemd/user/stynpilot-owner.service"):
-                self.assertTrue((Path(d) / unit).read_bytes() == (ROOT / "deploy/systemd" / Path(unit).name).read_bytes())
+        from stynpilot import debfile
+        files = debfile.read_deb_file(self.deb)["files"]                 # read in memory (also proves the strict reader accepts it)
+        text = files["usr/lib/stynpilot/lib/stynpilot/service.py"][1].decode()
+        for bad in ("dtdev_", "auth0|", "BEGIN PRIVATE"):
+            self.assertNotIn(bad, text)
+        launcher = files["usr/bin/stynpilot"][1].decode()
+        self.assertTrue(launcher.startswith("#!/usr/bin/python3 -I"))
+        for unit in ("usr/lib/systemd/system/stynpilot-installer.service", "usr/lib/systemd/user/stynpilot-owner.service"):
+            self.assertTrue(files[unit][1] == (ROOT / "deploy/systemd" / Path(unit).name).read_bytes())
 
     def test_build_is_reproducible_and_the_vendored_wheel_is_hash_pinned(self):
-        again = self.mod.build(Path(self.tmp.name) / "out2", ROOT / ".build-cache")
+        again = self.mod.build(Path(self.tmp.name) / "out2", self.cache)
         self.assertEqual(hashlib.sha256(self.deb.read_bytes()).hexdigest(), hashlib.sha256(again.read_bytes()).hexdigest())
         name, version, digest = next(self.mod.read_lock())
-        wheel = next((ROOT / ".build-cache").glob("%s-%s-*.whl" % (name, version)))
+        wheel = next(self.cache.glob("%s-%s-*.whl" % (name, version)))
         self.assertEqual(hashlib.sha256(wheel.read_bytes()).hexdigest(), digest)
 
 

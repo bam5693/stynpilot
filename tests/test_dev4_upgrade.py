@@ -34,10 +34,12 @@ DEVICE = "dtdev_TESTONLYliveDevice"
 DEPENDS = "python3 (>= 3.11), python3-cryptography, ca-certificates"
 
 
+from stynpilot import debfile  # noqa: E402
+
+
 def _probe_dpkg():
-    """Not just 'is dpkg-deb installed' but 'does it WORK here': build, list and unpack a one-file package. Inside the release
-    builder's sandbox on the Ryzen, dpkg-deb's tar child fails (ENOSYS), so these real-dpkg tests cannot run there; they are
-    reported as skipped WITH the reason, and still run everywhere dpkg works (developer machines, reviews)."""
+    """Not just 'is dpkg-deb installed' but 'does it WORK here' for the reads the upgrade code uses (-f, --ctrl-tarfile, -c).
+    Packages are built and checked in-process (stynpilot.debfile), so no tar child is needed for that."""
     import shutil
     import tempfile
     if not shutil.which("dpkg-deb"):
@@ -52,8 +54,9 @@ def _probe_dpkg():
             path.chmod(0o755)
         for path in (pkg / "DEBIAN/control", pkg / "usr/f"):
             path.chmod(0o644)
-        for argv in (["dpkg-deb", "--root-owner-group", "-Znone", "--build", str(pkg), d + "/p.deb"], ["dpkg-deb", "-c", d + "/p.deb"],
-                     ["dpkg-deb", "-x", d + "/p.deb", d + "/x"]):
+        debfile.write_tree(pkg, d + "/p.deb", 1700000000)
+        # Exactly the dpkg-deb reads Upgrader.inspect and these tests use (they work inside the release sandbox; build/-x do not).
+        for argv in (["dpkg-deb", "-f", d + "/p.deb", "Package"], ["dpkg-deb", "--ctrl-tarfile", d + "/p.deb"], ["dpkg-deb", "-c", d + "/p.deb"]):
             got = subprocess.run(argv, capture_output=True, text=True)
             if got.returncode != 0:
                 return "dpkg-deb %s fails here: %s" % (argv[1], " ".join((got.stderr or got.stdout).split())[:160])
@@ -101,8 +104,7 @@ class Pkg:
             (control / name).write_text("#!/bin/sh\nexit 0\n")
             (control / name).chmod(0o755)
         out = self.tmp / ("stynpilot_%s_%d.deb" % (version.replace("~", "-"), self.count))
-        subprocess.run(["dpkg-deb", "--root-owner-group", "-Znone", "--build", str(stage), str(out)], check=True,
-                       capture_output=True)
+        debfile.write_tree(stage, out, 1700000000)          # in-process: no tar child (it fails inside the release sandbox)
         return out
 
     def install_fake(self, root, version, depends=DEPENDS, files=None):
@@ -334,6 +336,25 @@ class UpgradeTests(unittest.TestCase):
             u.prepare("r" * 64, {"manifest": {"size": 1}}, "0.1.0~dev1")
         self.assertEqual(refused.exception.code, "not_enough_free_disk_space")
 
+    def test_a_rollback_copy_that_does_not_match_the_installed_files_is_refused(self):
+        # The copy is proven by reading it back IN MEMORY: a missing file, a changed file or an unsafe entry stops the upgrade.
+        from stynpilot.broker import upgrade as up
+        real = up.debfile.build_deb_bytes
+        for name, mutate, code in (
+                ("missing", lambda data: [e for e in data if not e[0].endswith("README.md")], "rollback_copy_differs_from_installed_files"),
+                ("changed", lambda data: [(n, m, b"tampered" if n.endswith("README.md") else d) for n, m, d in data],
+                 "rollback_copy_differs_from_installed_files"),
+                ("setuid", lambda data: [(n, 0o4755 if n.endswith("bin/stynpilot") else m, d) for n, m, d in data],
+                 "rollback_copy_could_not_be_verified")):
+            with self.subTest(name):
+                up.debfile.build_deb_bytes = lambda control, data, epoch, f=mutate: real(control, f(data), epoch)
+                try:
+                    with self.assertRaises(up.UpgradeRefused) as refused:
+                        self.executor.upgrader.repack("0.1.0~dev3", self.tmp / ("copy-%s.deb" % name))
+                    self.assertEqual(refused.exception.code, code)
+                finally:
+                    up.debfile.build_deb_bytes = real
+
     def test_the_rollback_copy_is_built_under_a_private_umask(self):
         # The release sandbox runs with umask 0077: the rollback copy's control folder came out 0700 and dpkg-deb refused it.
         old = os.umask(0o077)
@@ -354,10 +375,10 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(data["from_version"], "0.1.0~dev3")
         self.assertEqual(data["previous_copy"], "repacked_from_installed_files")
         # the rollback copy IS the installed version, byte for byte on every file
-        out = self.tmp / "extract"
-        subprocess.run(["dpkg-deb", "-x", str(job / "previous.deb"), str(out)], check=True)
+        copy = debfile.read_deb_file(job / "previous.deb")                   # checked in memory, never unpacked
+        self.assertEqual(set(copy["files"]), set(self.installed))
         for rel, text in self.installed.items():
-            self.assertEqual((out / rel).read_text(), text)
+            self.assertEqual(copy["files"][rel][1].decode(), text)
         self.assertEqual(subprocess.run(["dpkg-deb", "-f", str(job / "previous.deb"), "Version"], capture_output=True,
                                         text=True).stdout.strip(), "0.1.0~dev3")
         self.assertEqual(data["new_sha256"], payload["manifest"]["sha256"])

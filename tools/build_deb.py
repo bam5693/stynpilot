@@ -4,20 +4,17 @@ packaging/vendor.lock, which are verified against their SHA-256 before use. Repr
 (SOURCE_DATE_EPOCH) and sorted contents. The package has NO maintainer scripts: installing it starts, enables
 and changes nothing; removing it deletes only its own files (state and config are left for the owner)."""
 import hashlib
-import io
-import lzma
 import os
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
-from stynpilot import __version__          # noqa: E402
+from stynpilot import __version__, debfile          # noqa: E402
 
 DEPENDS = ["python3 (>= 3.11)", "python3-cryptography", "python3-jwt", "python3-starlette", "python3-uvicorn",
            "python3-httpx", "python3-pydantic", "python3-pydantic-settings", "python3-sse-starlette",
@@ -123,59 +120,17 @@ def build(out_dir=None, cache=None):
     return target
 
 
-def _entries(root, skip_debian):
-    """(name, mode, data-or-None) for every directory and regular file under root, parents first, in a fixed order. Anything
-    else (a symlink, a device, a fifo) is refused: this package has none, and a surprise there is a build error."""
-    found = [("./", 0o755, None)]
-    for path in sorted(root.rglob("*"), key=lambda p: p.relative_to(root).parts):
-        rel = path.relative_to(root)
-        if skip_debian and rel.parts[0] == "DEBIAN":
-            continue
-        if path.is_symlink():
-            raise SystemExit("symlinks are not allowed in the package: " + str(rel))
-        if path.is_dir():
-            found.append(("./%s/" % rel.as_posix(), 0o755, None))
-        elif path.is_file():
-            found.append(("./" + rel.as_posix(), 0o755 if path.stat().st_mode & 0o111 else 0o644, path.read_bytes()))
-        else:
-            raise SystemExit("unsupported file type in the package: " + str(rel))
-    return found
-
-
-def _tar_xz(entries, epoch):
-    """A deterministic GNU tar, xz-compressed, written entirely in this process: no tar/xz/dpkg-deb child, so the build needs no
-    syscalls beyond Python's own. Every entry is root-owned with the fixed epoch."""
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w", format=tarfile.GNU_FORMAT) as archive:
-        for name, mode, data in entries:
-            info = tarfile.TarInfo(name)
-            info.mtime, info.mode = epoch, mode
-            info.uid = info.gid = 0
-            info.uname = info.gname = "root"
-            if data is None:
-                info.type = tarfile.DIRTYPE
-                archive.addfile(info)
-            else:
-                info.size = len(data)
-                archive.addfile(info, io.BytesIO(data))
-    return lzma.compress(raw.getvalue(), format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC64, preset=6)
-
-
-def _ar(members, epoch):
-    out = [b"!<arch>\n"]
-    for name, data in members:
-        out.append(("%-16s%-12d%-6d%-6d%-8s%-10d`\n" % (name, epoch, 0, 0, "100644", len(data))).encode("ascii"))
-        out.append(data)
-        if len(data) % 2:
-            out.append(b"\n")
-    return b"".join(out)
+def _mode(path):
+    """Fixed modes, independent of the builder's umask: folders 0755, files 0755 if executable else 0644."""
+    return 0o755 if path.is_dir() or path.stat().st_mode & 0o111 else 0o644
 
 
 def write_deb(pkg, target, epoch):
-    """Write the .deb (an ar archive: debian-binary, control.tar.xz, data.tar.xz) byte-for-byte deterministically."""
-    control = _tar_xz(_entries(pkg / "DEBIAN", False), epoch)
-    data = _tar_xz(_entries(pkg, True), epoch)
-    Path(target).write_bytes(_ar([("debian-binary", b"2.0\n"), ("control.tar.xz", control), ("data.tar.xz", data)], epoch))
+    """Write the .deb byte-for-byte deterministically, in-process (stynpilot.debfile: no tar/xz/dpkg-deb child)."""
+    try:
+        debfile.write_tree(pkg, target, epoch, mode_of=_mode)
+    except debfile.DebError as error:
+        raise SystemExit("cannot package this tree: " + error.code) from None
 
 
 if __name__ == "__main__":

@@ -5,14 +5,18 @@ a signature counter, and a tamper-evident audit chain (every record contains the
 A passkey is a *second kind of owner proof*. It never replaces the single-use root challenge: an approval is accepted
 only if the passkey signed the exact challenge the installer issued for that request, plan and decision.
 
-Enrollment is two steps, both owner-side only:
-1. an ordinary YELLOW request ("passkey enroll") is approved with Auth0 (or an existing passkey). The installer then opens a
-   short, single-use enrollment WINDOW tied to that request;
-2. the owner's phone creates the passkey inside that window. The installer verifies it against the challenge it chose.
+Enrollment is THREE steps, and the last one is what keeps it independent of the owner-side service:
+1. an ordinary YELLOW request ("passkey enroll") is approved with AUTH0 ONLY (a passkey can never add another passkey). The
+   installer then opens a short, single-use enrollment WINDOW tied to that request;
+2. the owner's phone creates the passkey inside that window. The installer verifies it and stores it as PENDING: a pending
+   passkey can approve nothing, and it expires after 15 minutes;
+3. a second YELLOW request ("passkey activate") names the EXACT credential (its short ID and the SHA-256 of its public key). It is
+   approved with AUTH0 ONLY, and the owner's sign-in carries a nonce that commits to that public-key hash. Only then does the
+   installer activate that one key. Swapping the key after the owner approved is impossible: the hash is inside the signed proof.
 
-Honest limit: registration uses attestation "none", so the installer cannot tell which device made the key. What protects
-enrollment is that only the owner's own approval opens the window, the window is short, and it holds one challenge that only
-the owner-side page receives.
+Honest limit: registration uses attestation "none", so the installer cannot tell which device made the key, and a compromised
+owner-side service could still show the owner a different summary than the one the installer rendered. What it cannot do is
+activate any key the owner's Auth0 sign-in did not commit to, or enroll through a stolen passkey.
 """
 from __future__ import annotations
 
@@ -29,6 +33,8 @@ from contextlib import contextmanager
 from .. import webauthn
 
 WINDOW_SECONDS = 180
+PENDING_SECONDS = 900
+PUBHASH = re.compile(r"[a-f0-9]{64}\Z")
 MAX_ATTEMPTS = 5
 MAX_ACTIVE = 8
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _-]{0,39}\Z")
@@ -71,7 +77,8 @@ class PasskeyStore:
             db.execute("""CREATE TABLE IF NOT EXISTS passkeys (
                 credential_id TEXT PRIMARY KEY, kid TEXT UNIQUE NOT NULL, public_key TEXT NOT NULL, label TEXT NOT NULL,
                 backup_eligible INTEGER NOT NULL, backup_state INTEGER NOT NULL, aaguid TEXT NOT NULL,
-                sign_count INTEGER NOT NULL, created REAL NOT NULL, last_used REAL, revoked REAL, enrolled_by TEXT NOT NULL)""")
+                sign_count INTEGER NOT NULL, created REAL NOT NULL, last_used REAL, revoked REAL, enrolled_by TEXT NOT NULL,
+                pubhash TEXT NOT NULL, activated REAL)""")
             db.execute("""CREATE TABLE IF NOT EXISTS windows (
                 request_id TEXT PRIMARY KEY, challenge TEXT NOT NULL, label TEXT NOT NULL, expires REAL NOT NULL,
                 attempts INTEGER NOT NULL, closed REAL, enrolled_by TEXT NOT NULL)""")
@@ -130,11 +137,18 @@ class PasskeyStore:
         return {"kid": row["kid"], "credential_id": row["credential_id"], "label": row["label"],
                 "synced": bool(row["backup_state"]), "sync_capable": bool(row["backup_eligible"]),
                 "created": int(row["created"]), "last_used": None if row["last_used"] is None else int(row["last_used"]),
-                "revoked": row["revoked"] is not None}
+                "revoked": row["revoked"] is not None, "pending": row["activated"] is None, "pub": row["pubhash"]}
 
     def active(self):
         with self._tx() as db:
-            return [self._public(r) for r in db.execute("SELECT * FROM passkeys WHERE revoked IS NULL ORDER BY created")]
+            return [self._public(r) for r in db.execute(
+                "SELECT * FROM passkeys WHERE revoked IS NULL AND activated IS NOT NULL ORDER BY created")]
+
+    def pending(self):
+        with self._tx() as db:
+            return [self._public(r) for r in db.execute(
+                "SELECT * FROM passkeys WHERE revoked IS NULL AND activated IS NULL AND created > ? ORDER BY created",
+                (self.clock() - PENDING_SECONDS,))]
 
     def everything(self):
         with self._tx() as db:
@@ -145,7 +159,8 @@ class PasskeyStore:
         if type(credential_id) is not str or len(credential_id) > 200:
             return None
         with self._tx() as db:
-            row = db.execute("SELECT * FROM passkeys WHERE credential_id=? AND revoked IS NULL", (credential_id,)).fetchone()
+            row = db.execute("SELECT * FROM passkeys WHERE credential_id=? AND revoked IS NULL AND activated IS NOT NULL",
+                (credential_id,)).fetchone()
         return None if row is None else dict(row)
 
     def retirement_ready(self):
@@ -164,7 +179,7 @@ class PasskeyStore:
         with self._tx() as db:
             db.execute("UPDATE passkeys SET sign_count=MAX(sign_count, ?), last_used=? WHERE credential_id=?",
                        (auth["sign_count"], self.clock(), credential_id))
-            self._audit(db, "approval", {"kid": kid_of(credential_id), "request_id": request_id, "decision": decision,
+            self._audit(db, "proof_accepted", {"kid": kid_of(credential_id), "request_id": request_id, "decision": decision,
                                          "user_verified": bool(auth["user_verified"]), "synced": bool(auth["backup_state"])})
 
     # -- enrollment ----------------------------------------------------------------------------------------------
@@ -172,7 +187,8 @@ class PasskeyStore:
         if type(label) is not str or not LABEL.fullmatch(label):
             raise PasskeyError("passkey_label_invalid")
         with self._tx() as db:
-            if db.execute("SELECT COUNT(*) FROM passkeys WHERE revoked IS NULL").fetchone()[0] >= MAX_ACTIVE:
+            if db.execute("SELECT COUNT(*) FROM passkeys WHERE revoked IS NULL AND (activated IS NOT NULL OR created > ?)",
+                          (self.clock() - PENDING_SECONDS,)).fetchone()[0] >= MAX_ACTIVE:
                 raise PasskeyError("too_many_passkeys")
             if db.execute("SELECT 1 FROM windows WHERE request_id=?", (request_id,)).fetchone():
                 raise PasskeyError("enrollment_already_opened")
@@ -196,8 +212,11 @@ class PasskeyStore:
         with self._tx() as db:
             row = self._window(db, request_id)
             others = [r["credential_id"] for r in db.execute("SELECT credential_id FROM passkeys WHERE revoked IS NULL")]
+        # A NEW account handle per enrollment: phones replace a saved passkey that has the same site and account handle, so a
+        # fixed handle would let the second passkey overwrite the first. "exclude" also stops the same authenticator re-enrolling.
+        user = hashlib.sha256(b"stynpilot-passkey-user|" + bytes.fromhex(row["challenge"])).digest()[:16]
         return {"challenge": row["challenge"], "label": row["label"], "rp_id": self.rp_id, "origin": self.origin,
-                "exclude": others, "expires_in": max(1, int(row["expires"] - self.clock()))}
+                "user_id": webauthn.b64u_encode(user), "exclude": others, "expires_in": max(1, int(row["expires"] - self.clock()))}
 
     def complete(self, request_id, response):
         with self._tx() as db:
@@ -213,15 +232,34 @@ class PasskeyStore:
             current = self._window(db, request_id)                 # re-checked: closed/expired while we verified?
             if db.execute("SELECT 1 FROM passkeys WHERE credential_id=?", (result["credential_id"],)).fetchone():
                 raise PasskeyError("passkey_already_enrolled")
-            db.execute("INSERT INTO passkeys VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL,?)",
+            db.execute("INSERT INTO passkeys (credential_id, kid, public_key, label, backup_eligible, backup_state, aaguid, sign_count, "
+                       "created, enrolled_by, pubhash) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        (result["credential_id"], kid_of(result["credential_id"]), result["public_key"], current["label"],
                         int(result["backup_eligible"]), int(result["backup_state"]), result["aaguid"], result["sign_count"],
-                        self.clock(), current["enrolled_by"]))
+                        self.clock(), current["enrolled_by"], hashlib.sha256(bytes.fromhex(result["public_key"])).hexdigest()))
             db.execute("UPDATE windows SET closed=? WHERE request_id=?", (self.clock(), request_id))
-            self._audit(db, "enrolled", {"kid": kid_of(result["credential_id"]), "label": current["label"],
-                                         "synced": bool(result["backup_state"]), "request_id": request_id})
+            self._audit(db, "registered_pending", {"kid": kid_of(result["credential_id"]), "label": current["label"],
+                                                   "synced": bool(result["backup_state"]), "request_id": request_id})
         return {"kid": kid_of(result["credential_id"]), "label": row["label"], "synced": bool(result["backup_state"]),
-                "sync_capable": bool(result["backup_eligible"])}
+                "sync_capable": bool(result["backup_eligible"]),
+                "pub": hashlib.sha256(bytes.fromhex(result["public_key"])).hexdigest()}
+
+    def activate(self, kid, label, pub, request_id, authorized_by):
+        """Make ONE pending passkey active: it must be the exact key (ID, label and public-key hash) the owner's proof committed to."""
+        if type(kid) is not str or not KID.fullmatch(kid) or type(pub) is not str or not PUBHASH.fullmatch(pub):
+            raise PasskeyError("passkey_unknown")
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM passkeys WHERE kid=? AND revoked IS NULL", (kid,)).fetchone()
+            if row is None or row["activated"] is not None or row["pubhash"] != pub or row["label"] != label:
+                raise PasskeyError("passkey_unknown")
+            if row["created"] <= self.clock() - PENDING_SECONDS:
+                raise PasskeyError("pending_passkey_expired")
+            if db.execute("SELECT COUNT(*) FROM passkeys WHERE revoked IS NULL AND activated IS NOT NULL").fetchone()[0] >= MAX_ACTIVE:
+                raise PasskeyError("too_many_passkeys")
+            db.execute("UPDATE passkeys SET activated=? WHERE kid=?", (self.clock(), kid))
+            self._audit(db, "enrolled", {"kid": kid, "label": label, "pub": pub, "request_id": request_id,
+                                         "authorized_by": authorized_by, "synced": bool(row["backup_state"])})
+            return db.execute("SELECT COUNT(*) FROM passkeys WHERE revoked IS NULL AND activated IS NOT NULL").fetchone()[0]
 
     def revoke(self, kid, request_id):
         if type(kid) is not str or not KID.fullmatch(kid):
@@ -232,5 +270,5 @@ class PasskeyStore:
                 raise PasskeyError("passkey_unknown")
             db.execute("UPDATE passkeys SET revoked=? WHERE kid=?", (self.clock(), kid))
             self._audit(db, "revoked", {"kid": kid, "request_id": request_id})
-            left = db.execute("SELECT COUNT(*) FROM passkeys WHERE revoked IS NULL").fetchone()[0]
+            left = db.execute("SELECT COUNT(*) FROM passkeys WHERE revoked IS NULL AND activated IS NOT NULL").fetchone()[0]
         return left

@@ -99,14 +99,15 @@ class ApprovalFlow:
         if approve["summary"] != deny["summary"]:
             raise ApprovalError("summary_altered_in_transit")
         view, csrf = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
-        passkey = self._passkey_options(approve, deny)
+        adds = payload.get("kind") == "passkey" and payload.get("action") in ("enroll", "activate")
+        passkey = None if adds else self._passkey_options(approve, deny)      # adding a passkey is Auth0-only
         with self._lock:
             self._sweep()
             if len(self._views) >= MAX_VIEWS:
                 raise ApprovalError("too_many_open_approval_pages")
             self._views[view] = {"request_id": request_id, "csrf": csrf, "challenges": {"approve": approve, "deny": deny},
                                  "used": False, "attempts": 0, "expires": self.clock() + VIEW_LIFETIME}
-        return {"passkey": passkey, "view": view, "csrf": csrf, "request_id": request_id, "kind": payload.get("kind", "install"),
+        return {"passkey": passkey, "status_url": "/approve/status/" + request_id, "view": view, "csrf": csrf, "request_id": request_id, "kind": payload.get("kind", "install"),
                 "summary": list(approve["summary"]), "summary_sha256": approve["summary_sha256"],
                 "fingerprint": request_id[:12], "choices": ["approve", "deny"],
                 "expires_in": VIEW_LIFETIME}
@@ -239,6 +240,13 @@ class ApprovalFlow:
             return self._uncertain(rid)
         return self._execute(rid, method, payload, proof, challenge)
 
+    def request_of(self, view):
+        with self._lock:
+            item = self._views.get(view if type(view) is str else "")
+        if item is None:
+            raise ApprovalError("page_expired")
+        return item["request_id"]
+
     # -- passkey enrollment: after an enrollment request is approved, the phone creates the key -------------------------------
     def enroll_page(self, request_id, session=""):
         """Only for an enrollment request the installer has opened a window for, and only in the browser that approved it
@@ -262,7 +270,7 @@ class ApprovalFlow:
             self._enroll_sessions[request_id] = {"view": view, "expires": self.clock() + VIEW_LIFETIME}
         return {"view": view, "csrf": csrf, "request_id": request_id, "label": info["label"], "rp_id": info["rp_id"],
                 "challenge": b64u(bytes.fromhex(info["challenge"])), "exclude": list(info["exclude"]),
-                "expires_in": info["expires_in"]}
+                "user_id": info["user_id"], "expires_in": info["expires_in"]}
 
     def enroll_finish(self, view, csrf, response):
         with self._lock:
@@ -281,7 +289,29 @@ class ApprovalFlow:
             raise ApprovalError("enrollment_%s" % getattr(error, "code", "unavailable")) from None
         with self._lock:
             item["used"] = True
+        # The key now exists but is POWERLESS. Activation is a separate request that names this exact key; the owner approves it
+        # with the Auth0 sign-in, whose nonce commits to the key's hash.
+        done["activation_request_id"] = self._file_activation(item["request_id"], done)
         return done
+
+    def _file_activation(self, enroll_rid, done):
+        from types import SimpleNamespace
+        from datetime import datetime, timedelta, timezone
+        from .broker.proof import render_summary
+        original = self.store.payload(enroll_rid)
+        if original is None:
+            raise ApprovalError("unknown_request")
+        expires = datetime.fromtimestamp(self.clock(), timezone.utc) + timedelta(minutes=15)
+        payload = {"kind": "passkey", "action": "activate", "label": done["label"], "kid": done["kid"], "pub": done["pub"],
+                   "owner": original["owner"], "device": original["device"], "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        try:
+            receipt, _ = self.store.submit(kind="passkey", software="stynpilot-passkey-activate-" + done["kid"],
+                                           device=original["device"], owner=original["owner"],
+                                           proposer=SimpleNamespace(client="approval-page", name="approval page"),
+                                           payload=payload, summary=render_summary(payload), expires=expires.timestamp())
+        except RequestError:
+            raise ApprovalError("could_not_file_the_activation_request") from None
+        return receipt["request_id"]
 
     def _execute(self, rid, method, payload, id_token, challenge):
         """Run the approved action and settle the request's durable state. Never raises."""

@@ -352,17 +352,19 @@ class Executor:
             raise ExecutionDenied(denied.code) from None
 
     def _used_passkey(self, passkey, rid, decision):
+        """Record the accepted proof (signature counter + audit chain) BEFORE the challenge is used up. If it cannot be
+        recorded the approval is refused (fail closed): counter enforcement and the audit trail never silently lapse."""
         if passkey is not None:
             try:
                 self.passkeys.record_use(passkey[0]["credential_id"], passkey[1], request_id=rid, decision=decision)
             except Exception:
-                pass                                       # the approval is already durable; the audit write failing must not undo it
+                raise ExecutionDenied("passkey_record_failed_nothing_was_approved") from None
 
     def _decide(self, payload, proof_token, challenge, decision, kind):
         rid, _ = payload_hash(payload)
         fingerprint, passkey = self._prove(rid, proof_token, challenge, decision)
-        self.runs.consume(challenge=challenge, request_id=rid, decision=decision, proof=fingerprint, kind=kind)
         self._used_passkey(passkey, rid, decision)
+        self.runs.consume(challenge=challenge, request_id=rid, decision=decision, proof=fingerprint, kind=kind)
         return rid
 
     # -- passkey proofs --------------------------------------------------------------------------------------------
@@ -407,6 +409,7 @@ class Executor:
         if decision not in ("approve", "deny"):
             raise ExecutionDenied("invalid_decision")
         self._check_payload(payload)
+        self._auth0_only(payload)
         rid, _ = payload_hash(payload)
         if type(challenge) is not str or len(challenge) != 64:
             raise ExecutionDenied("challenge_unknown")
@@ -421,20 +424,29 @@ class Executor:
         return {"ok": True}
 
     # -- passkey administration (YELLOW): enroll one, revoke one ---------------------------------------------------------
-    _PASSKEY_KEYS = {"kind", "action", "label", "kid", "owner", "device", "expires_at"}
+    _PASSKEY_KEYS = {"kind", "action", "label", "kid", "pub", "owner", "device", "expires_at"}
+
+    @staticmethod
+    def _auth0_only(payload):
+        """Adding a passkey is never approved by a passkey: a stolen phone must not be able to add its own successors."""
+        if payload.get("kind") == "passkey" and payload.get("action") in ("enroll", "activate"):
+            raise ExecutionDenied("adding_a_passkey_needs_the_auth0_sign_in")
 
     def _check_passkey_payload(self, payload):
         if self.passkeys is None:
             raise ExecutionDenied("passkeys_not_configured")
         action = payload.get("action")
-        if (set(payload) != self._PASSKEY_KEYS or payload.get("kind") != "passkey" or action not in ("enroll", "revoke")
+        if (set(payload) != self._PASSKEY_KEYS or payload.get("kind") != "passkey" or action not in ("enroll", "activate", "revoke")
                 or payload.get("owner") != self.owner or payload.get("device") != self.device):
             raise ExecutionDenied("passkey_request_invalid")
-        from .passkeys import KID, LABEL
-        label, kid = payload.get("label"), payload.get("kid")
-        if action == "enroll" and not (type(label) is str and LABEL.fullmatch(label) and kid == ""):
-            raise ExecutionDenied("passkey_request_invalid")
-        if action == "revoke" and not (label == "" and type(kid) is str and KID.fullmatch(kid)):
+        from .passkeys import KID, LABEL, PUBHASH
+        label, kid, pub = payload.get("label"), payload.get("kid"), payload.get("pub")
+        labeled = type(label) is str and bool(LABEL.fullmatch(label))
+        named = type(kid) is str and bool(KID.fullmatch(kid))
+        hashed = type(pub) is str and bool(PUBHASH.fullmatch(pub))
+        shape = {"enroll": labeled and kid == "" and pub == "", "activate": labeled and named and hashed,
+                 "revoke": label == "" and named and pub == ""}[action]
+        if not shape:
             raise ExecutionDenied("passkey_request_invalid")
         try:
             expires = datetime.strptime(payload["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -447,14 +459,19 @@ class Executor:
         return payload
 
     def passkey_admin(self, payload, proof_token, challenge):
-        """Execute an owner-approved passkey change. Enrolling only OPENS a short window; the phone creates the key inside it."""
+        """Execute an owner-approved passkey change. Enrolling only OPENS a short window; the phone creates the key inside it
+        (pending, powerless); a separate Auth0-approved ACTIVATE that commits to the exact key's hash makes it live."""
         self._check_payload(payload)
+        self._auth0_only(payload) if (type(proof_token) is str and proof_token.startswith("{")) else None
         rid = self._decide(payload, proof_token, challenge, "approve", "passkey")
         by = "passkey" if type(proof_token) is str and proof_token.startswith("{") else "auth0"
         try:
             if payload["action"] == "enroll":
                 self.passkeys.open_window(rid, payload["label"], by)
                 result = {"ok": True, "action": "enroll", "enrollment_open": True, "label": payload["label"]}
+            elif payload["action"] == "activate":
+                left = self.passkeys.activate(payload["kid"], payload["label"], payload["pub"], rid, by)
+                result = {"ok": True, "action": "activate", "kid": payload["kid"], "label": payload["label"], "passkeys_active": left}
             else:
                 left = self.passkeys.revoke(payload["kid"], rid)
                 result = {"ok": True, "action": "revoke", "kid": payload["kid"], "passkeys_active": left}
@@ -471,6 +488,7 @@ class Executor:
             return {"configured": False, "passkeys": [], "retirement_ready": False}
         active = self.passkeys.active()
         return {"configured": True, "rp_id": self.passkeys.rp_id, "origin": self.passkeys.origin, "passkeys": active,
+                "pending": [{"kid": k["kid"], "label": k["label"]} for k in self.passkeys.pending()],
                 "retirement_ready": len(active) >= 2, "audit_chain_ok": self.passkeys.audit_ok()}
 
     def passkey_begin(self, request_id):
@@ -643,9 +661,9 @@ class Executor:
             with statelock.operation(self.dir):
                 job = self.upgrader.prepare(rid, content, installed)
                 try:
+                    self._used_passkey(passkey, rid, "approve")
                     self.runs.consume(challenge=challenge, request_id=rid, decision="approve", proof=fingerprint,
                                       kind="upgrade")
-                    self._used_passkey(passkey, rid, "approve")
                     unit = self.upgrader.start(rid, job)
                 except BaseException:
                     if self.runs.status(rid)["state"] == "not_started":

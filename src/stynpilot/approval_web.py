@@ -47,19 +47,23 @@ const buttons=[...document.querySelectorAll('button[data-d]')];
 function note(t){msg.textContent=t}
 async function go(d){
   if(!window.PublicKeyCredential){note('This browser cannot use passkeys. Use the Auth0 sign-in below.');return}
-  buttons.forEach(b=>b.disabled=true);note('Waiting for your fingerprint or screen lock...');
+  buttons.forEach(b=>b.disabled=true);note('Waiting for your phone to confirm it is you...');
+  let sent=false;
   try{
     const c=await navigator.credentials.get({publicKey:{challenge:u2b(o.challenge[d]),rpId:o.rp_id,timeout:120000,userVerification:'required',
       allowCredentials:o.credentials.map(id=>({type:'public-key',id:u2b(id)}))}});
     const r=c.response;
     const a={credential_id:b2u(c.rawId),client_data_json:b2u(r.clientDataJSON),authenticator_data:b2u(r.authenticatorData),signature:b2u(r.signature)};
-    note('Checking...');
+    note('Checking...');sent=true;
     const reply=await fetch('/approve/passkey',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({view:o.view,csrf:o.csrf,decision:d,assertion:JSON.stringify(a)})});
     const j=await reply.json();
     if(j.ok){location.href=j.next;return}
     note(j.message||'Refused.');if(j.next){location.href=j.next;return}
-  }catch(e){note('Cancelled or not completed. Nothing was changed. You can try again.')}
+  }catch(e){
+    if(sent){note('The answer did not arrive, so the result is uncertain. Opening the request status - check it before trying again.');
+      setTimeout(()=>{location.href=o.status_url},2500);return}
+    note('Cancelled or not completed. Nothing was changed. You can try again.')}
   buttons.forEach(b=>b.disabled=false);
 }
 buttons.forEach(b=>b.addEventListener('click',()=>go(b.dataset.d)));
@@ -72,19 +76,23 @@ const b2u=a=>{a=new Uint8Array(a);let t='';for(const x of a)t+=String.fromCharCo
 const btn=document.getElementById('make');
 btn.addEventListener('click',async()=>{
   if(!window.PublicKeyCredential){msg.textContent='This browser cannot create passkeys.';return}
-  btn.disabled=true;msg.textContent='Waiting for your fingerprint or screen lock...';
+  btn.disabled=true;msg.textContent='Waiting for your phone to confirm it is you...';
+  let sent=false;
   try{
     const c=await navigator.credentials.create({publicKey:{challenge:u2b(o.challenge),rp:{id:o.rp_id,name:'StyNpilot'},
       user:{id:u2b(o.user_id),name:'owner',displayName:'StyNpilot owner'},pubKeyCredParams:[{type:'public-key',alg:-7}],
       authenticatorSelection:{residentKey:'preferred',userVerification:'required'},attestation:'none',timeout:120000,
       excludeCredentials:o.exclude.map(id=>({type:'public-key',id:u2b(id)}))}});
-    const r=c.response;
+    const r=c.response;sent=true;
     const reply=await fetch('/approve/enroll/finish',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({view:o.view,csrf:o.csrf,response:{client_data_json:b2u(r.clientDataJSON),attestation_object:b2u(r.attestationObject)}})});
     const j=await reply.json();
     msg.textContent=j.message||'Done.';
+    if(j.ok&&j.next){setTimeout(()=>{location.href=j.next},2500);return}
     if(j.ok){return}
-  }catch(e){msg.textContent='Cancelled or not completed. You can try again until the time runs out.'}
+  }catch(e){
+    if(sent){msg.textContent='The answer did not arrive, so the result is uncertain. Ask the assistant to run passkey_status and check before trying again.';return}
+    msg.textContent='Cancelled or not completed. You can try again until the time runs out.'}
   btn.disabled=false;
 });
 """
@@ -134,13 +142,6 @@ def _message(error):
     return "The request could not be completed (%s). Check its status before trying again." % html.escape(code[:60]), False
 
 
-def _user_handle():
-    """A fixed, non-secret account handle: one owner, so a new passkey replaces rather than duplicates on the phone."""
-    import base64
-    import hashlib
-    return base64.urlsafe_b64encode(hashlib.sha256(b"stynpilot-owner").digest()[:16]).rstrip(b"=").decode("ascii")
-
-
 def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
     if type(public_host) is not str or not public_host or "/" in public_host:
         raise ValueError("public_host must be a bare host[:port]")
@@ -186,13 +187,15 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         passkey = view.get("passkey")
         if passkey:
             nonce = secrets.token_urlsafe(18)
-            options = dict(passkey, view=view["view"], csrf=view["csrf"])
+            options = dict(passkey, view=view["view"], csrf=view["csrf"], status_url=view["status_url"])
             warning = ("<p><b>Note:</b> at least one enrolled passkey is synced through your Google account, so anyone who can "
                        "sign in to that account could use it. Add a device-only passkey when you can.</p>"
                        if passkey["synced"] else "")
             body = (intro + "<div id=pk data-o='%s'></div>"
                     "<button class=primary data-d=approve>Approve with fingerprint or PIN</button>"
-                    "<button class=deny data-d=deny>Deny</button><p id=msg role=status></p>%s"
+                    "<button class=deny data-d=deny>Deny</button><p id=msg role=status></p>"
+                    "<p><small>Your phone decides how it confirms it is you (fingerprint, face or screen lock) and may accept a "
+                    "recent unlock. StyNpilot requires that the phone reports it did.</small></p>%s"
                     "<details><summary>Use the Auth0 sign-in instead</summary>%s</details>"
                     "<script nonce='%s'>%s</script>"
                     % (html.escape(json.dumps(options, sort_keys=True), quote=True), warning, auth0, nonce, _PASSKEY_JS))
@@ -255,8 +258,13 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         except ApprovalError as error:
             return refused(error)
         except Exception:
-            return JSONResponse({"ok": False, "message": "Something unexpected happened. Check the request's status page "
-                                 "before trying again."}, status_code=500)
+            try:
+                where = "/approve/status/" + flow.request_of(view)
+            except Exception:
+                where = None
+            return JSONResponse({"ok": False, "uncertain": True, "next": where,
+                                 "message": "The outcome is uncertain. Check the request's status before trying again."},
+                                status_code=500)
         response = JSONResponse({"ok": True, "state": outcome["state"], "next": "/approve/status/" + outcome["request_id"]},
                                 headers={"Cache-Control": "no-store"})
         try:
@@ -273,7 +281,7 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
             return _page("Not found", "<p>Not found.</p>", 404)
         info = await run_in_threadpool(flow.enroll_page, rid, request.cookies.get(COOKIE, ""))
         nonce = secrets.token_urlsafe(18)
-        options = dict(info, user_id=_user_handle())
+        options = dict(info)
         body = ("<h1>Create your passkey</h1><p>Name: <b>%s</b>. Tap the button, then use your fingerprint or screen lock. "
                 "This must be done within a few minutes.</p><div id=pk data-o='%s'></div>"
                 "<button class=primary id=make>Create passkey</button><p id=msg role=status></p>"
@@ -294,11 +302,12 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         except ApprovalError as error:
             return refused(error)
         except Exception:
-            return JSONResponse({"ok": False, "message": "Something unexpected happened. Check the passkey list before trying again."},
-                                status_code=500)
-        text = "Passkey added: %s (%s)." % (done["label"], "synced through your Google account" if done["synced"]
-                                              else "stays on this device")
-        response = JSONResponse({"ok": True, "message": text}, headers={"Cache-Control": "no-store"})
+            return JSONResponse({"ok": False, "uncertain": True, "message": "The outcome is uncertain. Ask the assistant to run "
+                                 "passkey_status and check before trying again."}, status_code=500)
+        text = ("Passkey created: %s (%s). It cannot approve anything yet. Next: confirm it with your Auth0 sign-in (opening that now)."
+                % (done["label"], "synced through your Google account" if done["synced"] else "stays on this device"))
+        response = JSONResponse({"ok": True, "message": text, "next": "/approve/" + done["activation_request_id"]},
+                                headers={"Cache-Control": "no-store"})
         response.delete_cookie(COOKIE, path="/approve")
         return response
 

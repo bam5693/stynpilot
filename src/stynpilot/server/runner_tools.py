@@ -156,7 +156,7 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
         proposer = ctx.proposer
         expires = now() + timedelta(hours=1)
         payload = {"kind": "passkey", "action": action, "label": label if action == "enroll" else "",
-                   "kid": kid if action == "revoke" else "", "owner": owner, "device": device_id,
+                   "kid": kid if action == "revoke" else "", "pub": "", "owner": owner, "device": device_id,
                    "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
         software = "stynpilot-passkey-" + (label.lower().replace(" ", "-") if action == "enroll" else kid)
         result, _ = store.submit(kind="passkey", software=software, device=device_id, owner=owner, proposer=proposer,

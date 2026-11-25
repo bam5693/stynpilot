@@ -51,7 +51,8 @@ class Enrolling:
         store.open_window(rid, label, "auth0")
         info = store.begin(rid)
         auth = SoftAuthenticator(ORIGIN, RP, **auth_kw)
-        store.complete(rid, auth.register(bytes.fromhex(info["challenge"])))
+        done = store.complete(rid, auth.register(bytes.fromhex(info["challenge"])))
+        store.activate(done["kid"], done["label"], done["pub"], rid, "auth0")
         return auth
 
 
@@ -182,7 +183,7 @@ class InstallWithPasskey(unittest.TestCase, Enrolling):
         self.assertTrue(self.executor.install(payload, proof_for(spare, payload, challenge), challenge)["ok"])
         self.assertTrue(self.store_pk.audit_ok())
         events = [e["event"] for e in self.store_pk.audit_tail(50)]
-        for wanted in ("enrolled", "revoked", "approval", "refused"):
+        for wanted in ("enrolled", "registered_pending", "revoked", "proof_accepted", "refused"):
             self.assertIn(wanted, events)
 
     def test_audit_tampering_is_detected(self):
@@ -373,8 +374,8 @@ class PasskeyAdministration(unittest.TestCase, Enrolling):
         self.pk = self.new_store(self.tmp / "broker")
         self.executor.passkeys = self.pk
 
-    def request(self, action, label="", kid="", **kw):
-        return {"kind": "passkey", "action": action, "label": label, "kid": kid, "owner": OWNER, "device": DEVICE,
+    def request(self, action, label="", kid="", pub="", **kw):
+        return {"kind": "passkey", "action": action, "label": label, "kid": kid, "pub": pub, "owner": OWNER, "device": DEVICE,
                 "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3000)), **kw}
 
     def approve_with_auth0(self, payload):
@@ -392,10 +393,10 @@ class PasskeyAdministration(unittest.TestCase, Enrolling):
 
     def test_the_owner_reads_what_enrolling_means_including_the_sync_warning(self):
         text = "\n".join(self.executor.challenge(self.request("enroll", "Pixel phone"), "approve")["summary"])
-        for want in ("Pixel phone", "fingerprint or screen lock", "3 minutes", "syncs", "Google account"):
+        for want in ("Pixel phone", "3 minutes", "syncs", "Google account", "Auth0 sign-in", "second, final step"):
             self.assertIn(want, text)
 
-    def test_enrolling_with_auth0_then_the_phone_creates_the_key_inside_the_window(self):
+    def test_enrolling_with_auth0_then_the_phone_creates_a_powerless_key_then_a_named_activation(self):
         payload = self.request("enroll", "Pixel phone")
         result = self.approve_with_auth0(payload)
         self.assertEqual((result["ok"], result["enrollment_open"]), (True, True))
@@ -405,10 +406,93 @@ class PasskeyAdministration(unittest.TestCase, Enrolling):
         phone = SoftAuthenticator(ORIGIN, RP)
         done = self.executor.passkey_complete(rid, phone.register(bytes.fromhex(info["challenge"])))
         self.assertEqual((done["label"], done["synced"]), ("Pixel phone", True))
+        self.assertEqual(self.executor.passkey_list()["passkeys"], [])                      # created, but it can do nothing yet
+        self.assertEqual([k["kid"] for k in self.executor.passkey_list()["pending"]], [done["kid"]])
+        activation = self.request("activate", "Pixel phone", done["kid"], done["pub"])
+        result = self.approve_with_auth0(activation)
+        self.assertEqual((result["ok"], result["passkeys_active"]), (True, 1))
         listing = self.executor.passkey_list()
         self.assertEqual([k["label"] for k in listing["passkeys"]], ["Pixel phone"])
+        self.assertEqual(listing["pending"], [])
         self.assertNotIn("public_key", json.dumps(listing))
         self.denied("enrollment_already_used", self.executor.passkey_complete, rid, phone.register(bytes.fromhex(info["challenge"])))
+
+    def register_pending(self, label="Pixel", **kw):
+        payload = self.request("enroll", label)
+        self.approve_with_auth0(payload)
+        rid = request_id(payload)[0]
+        info = self.executor.passkey_begin(rid)
+        auth = SoftAuthenticator(ORIGIN, RP, **kw)
+        return auth, self.executor.passkey_complete(rid, auth.register(bytes.fromhex(info["challenge"]))), info
+
+    def test_a_pending_key_can_approve_nothing_until_the_owner_activates_that_exact_key(self):
+        auth, done, _ = self.register_pending()
+        payload = self.payload()
+        challenge = self.executor.challenge(payload, "approve")["challenge"]
+        self.denied("passkey_unknown_or_revoked", self.executor.runner_admin, payload, proof_for(auth, payload, challenge), challenge)
+        self.assertEqual(self.jobs.calls, [])
+
+    def test_the_activation_is_bound_to_the_exact_key_hash(self):
+        """The substitution attack: the owner approved key A; key B must not become active under that approval."""
+        a_auth, a, _ = self.register_pending("RealA")
+        b_auth, b, _ = self.register_pending("RealB")
+        activation_for_a = self.request("activate", "RealA", a["kid"], a["pub"])
+        # an approval of the activation of A is for A's hash: it can never activate B
+        forged = self.request("activate", "RealA", a["kid"], b["pub"])
+        self.assertNotEqual(request_id(activation_for_a)[0], request_id(forged)[0])
+        challenge = self.executor.challenge(forged, "approve")["challenge"]
+        stale_proof = self.proof(activation_for_a, challenge)                                  # signed for A's request
+        self.denied("proof_is_for_a_different_decision", self.executor.passkey_admin, forged, stale_proof, challenge)
+        result = self.approve_with_auth0(forged)                                              # even a fully approved wrong pairing fails
+        self.assertEqual((result["ok"], result["stopped"]), (False, "passkey_unknown"))
+        self.assertEqual(self.executor.passkey_list()["passkeys"], [])
+        self.assertTrue(self.approve_with_auth0(activation_for_a)["ok"])
+        self.assertEqual([k["kid"] for k in self.executor.passkey_list()["passkeys"]], [a["kid"]])
+
+    def test_a_passkey_can_never_add_a_passkey(self):
+        old = self.enroll(self.pk, "Existing")
+        for payload in (self.request("enroll", "Sneaky"),):
+            challenge = self.executor.challenge(payload, "approve")["challenge"]
+            self.denied("adding_a_passkey_needs_the_auth0_sign_in", self.executor.passkey_admin, payload,
+                        proof_for(old, payload, challenge), challenge)
+            self.denied("adding_a_passkey_needs_the_auth0_sign_in", self.executor.passkey_precheck, payload,
+                        proof_for(old, payload, challenge), challenge, "approve")
+        auth, done, _ = self.register_pending("Sneaky")
+        activation = self.request("activate", "Sneaky", done["kid"], done["pub"])
+        challenge = self.executor.challenge(activation, "approve")["challenge"]
+        self.denied("adding_a_passkey_needs_the_auth0_sign_in", self.executor.passkey_admin, activation,
+                    proof_for(old, activation, challenge), challenge)
+        self.assertEqual(len(self.executor.passkey_list()["passkeys"]), 1)
+
+    def test_pending_keys_expire(self):
+        auth, done, _ = self.register_pending()
+        self.pk.clock = lambda: time.time() + 2000
+        self.assertEqual(self.pk.pending(), [])
+        result = self.approve_with_auth0(self.request("activate", "Pixel", done["kid"], done["pub"]))
+        self.assertEqual((result["ok"], result["stopped"]), (False, "pending_passkey_expired"))
+
+    def test_each_enrollment_gets_its_own_account_handle_so_a_phone_cannot_overwrite_the_first_passkey(self):
+        first = self.enroll(self.pk, "One")
+        _, _, info_two = self.register_pending("Two")
+        _, _, info_three = self.register_pending("Three")
+        self.assertNotEqual(info_two["user_id"], info_three["user_id"])
+        self.assertEqual(len(info_two["user_id"]), 22)
+        self.assertEqual(len(self.pk.active()), 1)
+        self.assertEqual(len(self.executor.passkey_list()["pending"]), 2)
+        # the second enrollment tells the phone about every existing credential so the same authenticator is not re-enrolled
+        self.assertIn(self.pk.active()[0]["credential_id"], info_three["exclude"])
+
+    def test_a_failure_to_record_a_passkey_use_refuses_the_approval_and_burns_nothing(self):
+        phone = self.enroll(self.pk, "Phone")
+        payload = self.payload()
+        challenge = self.executor.challenge(payload, "approve")["challenge"]
+        original = self.pk.record_use
+        self.pk.record_use = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+        self.denied("passkey_record_failed_nothing_was_approved", self.executor.runner_admin, payload,
+                    proof_for(phone, payload, challenge), challenge)
+        self.assertEqual(self.jobs.calls, [])
+        self.pk.record_use = original
+        self.assertTrue(self.executor.runner_admin(payload, proof_for(phone, payload, challenge), challenge)["ok"])
 
     def test_window_is_single_use_short_and_origin_checked(self):
         payload = self.request("enroll", "Pixel")
@@ -450,7 +534,7 @@ class PasskeyAdministration(unittest.TestCase, Enrolling):
         payload = self.request("enroll", "Pixel")
         challenge = self.executor.challenge(payload, "approve")["challenge"]
         other = dict(payload, label="Attacker")
-        for bad in (dict(payload, action="delete"), dict(payload, label=""), dict(payload, kid="a" * 16),
+        for bad in (dict(payload, action="delete"), dict(payload, label=""), dict(payload, kid="a" * 16), dict(payload, pub="b" * 64),
                     dict(payload, owner="someone-else"), dict(payload, extra=1), dict(payload, label="x" * 60)):
             self.denied("passkey_request_invalid", self.executor.challenge, bad, "approve")
 
@@ -458,13 +542,14 @@ class PasskeyAdministration(unittest.TestCase, Enrolling):
         first = self.approve_enroll("One")
         second = self.approve_enroll("Two")
         kid = [k for k in self.executor.passkey_list()["passkeys"] if k["label"] == "One"][0]["kid"]
+        second_kid = [k for k in self.executor.passkey_list()["passkeys"] if k["label"] == "Two"][0]["kid"]
         result = self.approve_with_passkey(second, self.request("revoke", kid=kid))
         self.assertEqual((result["ok"], result["passkeys_active"], result["kid"]), (True, 1, kid))
         payload = self.request("revoke", kid="f" * 16)
         self.assertFalse(self.approve_with_passkey(second, payload)["ok"])                       # unknown passkey: stops, changes nothing
-        challenge = self.executor.challenge(self.request("enroll", "Three"), "approve")["challenge"]
-        self.denied("passkey_unknown_or_revoked", self.executor.passkey_admin, self.request("enroll", "Three"),
-                    proof_for(first, self.request("enroll", "Three"), challenge), challenge)
+        again = self.request("revoke", kid=second_kid)
+        challenge = self.executor.challenge(again, "approve")["challenge"]
+        self.denied("passkey_unknown_or_revoked", self.executor.passkey_admin, again, proof_for(first, again, challenge), challenge)
         self.assertTrue(self.pk.audit_ok())
 
     def approve_enroll(self, label):
@@ -472,7 +557,8 @@ class PasskeyAdministration(unittest.TestCase, Enrolling):
         self.approve_with_auth0(payload)
         info = self.executor.passkey_begin(request_id(payload)[0])
         auth = SoftAuthenticator(ORIGIN, RP, backup_eligible=False, backup_state=False)
-        self.executor.passkey_complete(request_id(payload)[0], auth.register(bytes.fromhex(info["challenge"])))
+        done = self.executor.passkey_complete(request_id(payload)[0], auth.register(bytes.fromhex(info["challenge"])))
+        self.assertTrue(self.approve_with_auth0(self.request("activate", label, done["kid"], done["pub"]))["ok"])
         return auth
 
     def test_device_bound_passkey_is_reported_as_not_synced(self):
@@ -546,7 +632,7 @@ class EnrollmentThroughTheBrowser(unittest.TestCase, Enrolling):
         self.proposer = SimpleNamespace(client="claude-connector", name="claude")
 
     def file(self, **kw):
-        payload = {"kind": "passkey", "action": "enroll", "label": "Pixel phone", "kid": "", "owner": OWNER, "device": DEVICE,
+        payload = {"kind": "passkey", "action": "enroll", "label": "Pixel phone", "kid": "", "pub": "", "owner": OWNER, "device": DEVICE,
                    "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3000))}
         payload.update(kw)
         from stynpilot.broker.proof import render_summary
@@ -594,6 +680,12 @@ class EnrollmentThroughTheBrowser(unittest.TestCase, Enrolling):
         self.assertEqual(done.status_code, 200, done.text)
         self.assertIn("Pixel phone", done.json()["message"])
         self.assertIn(post(body).status_code, (400, 403))                      # the window is spent
+        self.assertEqual(self.pk.active(), [])                                  # created, but powerless until the owner activates it
+        activation_rid = done.json()["next"].rsplit("/", 1)[1]
+        page = self.client.get(done.json()["next"])
+        self.assertNotIn("fingerprint or PIN", page.text)                       # adding a passkey is Auth0-only: no passkey button
+        self.assertIn("Activate the new passkey", page.text)
+        self.assertEqual(self.approve_with_auth0(activation_rid).status_code, 303)
         self.assertEqual([k["label"] for k in self.pk.active()], ["Pixel phone"])
         # ... and now that passkey approves a runner change from the one-tap page
         runner = self.payload()
@@ -611,6 +703,36 @@ class EnrollmentThroughTheBrowser(unittest.TestCase, Enrolling):
             headers={"content-type": "application/json", "origin": "https://" + HOST})
         self.assertEqual(sent.status_code, 200, sent.text)
         self.assertEqual(self.jobs.calls, ["setup", "selftest"])
+
+    def test_enrollment_request_page_has_no_passkey_button_and_uncertain_outcomes_point_at_status(self):
+        payload, rid = self.file()
+        self.approve_with_auth0(rid)
+        # an unexpected failure after the owner tapped must say "check the status", never "nothing was changed"
+        flow = self.flow
+        payload2, rid2 = self.file(label="Second")
+        page = self.client.get("/approve/" + rid2)
+        self.assertNotIn("fingerprint or PIN", page.text)
+        self.assertNotIn("script-src", page.headers["content-security-policy"])
+        original = flow.passkey_decide
+        flow.passkey_decide = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        import re
+        fields = dict(re.findall(r"name=(view|csrf) value='([^']+)'", page.text))
+        sent = self.client.post("/approve/passkey", content=json.dumps({"view": fields["view"], "csrf": fields["csrf"],
+                                "decision": "approve", "assertion": "{}"}),
+                                headers={"content-type": "application/json", "origin": "https://" + HOST})
+        flow.passkey_decide = original
+        self.assertEqual(sent.status_code, 500)
+        body = sent.json()
+        self.assertTrue(body["uncertain"])
+        self.assertEqual(body["next"], "/approve/status/" + rid2)
+        self.assertIn("status", body["message"])
+        self.assertNotIn("Nothing was changed", body["message"])
+
+    def test_the_script_never_claims_nothing_changed_after_the_request_was_sent(self):
+        from stynpilot import approval_web as web
+        for js in (web._PASSKEY_JS, web._ENROLL_JS):
+            self.assertIn("sent=true", js)
+            self.assertIn("result is uncertain", js)
 
     def test_only_the_browser_that_approved_may_create_the_passkey(self):
         payload, rid = self.file()
@@ -786,7 +908,7 @@ class UpgradeWithPasskey(unittest.TestCase, Enrolling):
         with self.assertRaises(ExecutionDenied):
             self.executor.upgrade(payload, proof, challenge)
         self.assertEqual(len(self.launched), 1)
-        self.assertIn("approval", [e["event"] for e in self.pk.audit_tail(20)])
+        self.assertIn("proof_accepted", [e["event"] for e in self.pk.audit_tail(20)])
 
     def test_a_revoked_passkey_cannot_start_an_upgrade(self):
         payload = self.good()

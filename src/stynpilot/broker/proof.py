@@ -70,11 +70,18 @@ def render_summary(payload):
         expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
         if payload.get("action") == "enroll":
             return ["Add a passkey named \"%s\" for approving StyNpilot changes." % str(payload.get("label")),
-                    "After you approve this, your phone is asked to create the passkey (fingerprint or screen lock). It must be "
-                    "created within 3 minutes, on this page's address only.",
+                    "After you approve this, your phone is asked to create the passkey. It must be created within 3 minutes, on this "
+                    "page's address only, and it can do nothing until you approve a second, final step that names that exact key.",
                     "If your phone syncs passkeys through your Google account, this one can also be used from any device signed in "
-                    "to that account. A passkey that stays on one device is safer; StyNpilot shows which kind each one is.",
+                    "to that account. Adding a passkey always asks for your Auth0 sign-in, never an existing passkey. A passkey that stays on one device is safer; StyNpilot shows which kind each one is.",
                     expires]
+        if payload.get("action") == "activate":
+            return ["Activate the new passkey \"%s\" (short ID %s, key fingerprint %s)." % (
+                        str(payload.get("label")), str(payload.get("kid")), str(payload.get("pub"))[:16]),
+                    "Until you approve this, that passkey can approve nothing. Your sign-in here commits to this exact key: no "
+                    "other key can be activated by it. After this, the passkey can approve StyNpilot changes whenever your phone "
+                    "confirms it is you (fingerprint, face or screen lock; the phone decides which).",
+                    "Approve only if you just created this passkey yourself. If you did not, deny it.", expires]
         return ["Remove the passkey with short ID %s." % str(payload.get("kid")),
                 "It can no longer approve anything. Other passkeys and your Auth0 sign-in keep working.", expires]
     if payload.get("kind") == "runner":

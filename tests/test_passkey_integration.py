@@ -936,7 +936,7 @@ except ImportError:          # pragma: no cover
     tu = None
 
 
-@unittest.skipIf(tu is None or jwt is None, "needs the upgrade test harness")
+@unittest.skipIf(tu is None or jwt is None or not tu.have_dpkg(), "needs the upgrade test harness and a working dpkg-deb: %s" % (getattr(tu, "DPKG_PROBLEM", None) or "ok"))
 class UpgradeWithPasskey(unittest.TestCase, Enrolling):
     """The self-upgrade (the riskiest YELLOW action) approved by a passkey, through the real installer and upgrade preparation."""
     setUpClass = classmethod(tu.UpgradeTests.setUpClass.__func__)

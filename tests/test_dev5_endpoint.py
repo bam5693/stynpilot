@@ -3,6 +3,11 @@ import http.server
 import json
 import threading
 import unittest
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(__file__))
+import loopback  # noqa: E402
 from types import SimpleNamespace
 from unittest import mock
 
@@ -43,6 +48,7 @@ class Server:
 
 
 class EndpointCheck(unittest.TestCase):
+    @loopback.needs_tcp      # the subject IS a real TCP client (token exchange / endpoint check)
     def test_answers_only_for_a_401_bearer_challenge(self):
         for status, challenge, expected in ((401, 'Bearer scope="x"', True), (401, None, False), (200, None, False),
                                             (500, 'Bearer', False), (404, None, False), (403, 'Bearer', False)):

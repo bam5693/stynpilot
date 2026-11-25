@@ -157,7 +157,8 @@ class UpgradeTests(unittest.TestCase):
 
     def build(self, **extra):
         options = {"root": self.root, "query_extra": ["--admindir=%s" % (self.root / "var/lib/dpkg")],
-                   "dpkg_extra": [], "config_files": [], "owner_user": "nobody", "restart": False, "doctor": False}
+                   "dpkg_extra": [], "config_files": [], "owner_user": "nobody", "restart": False, "doctor": False,
+                   "disk_reserve": 16 * 1024 * 1024}     # the release sandbox's /tmp is a 256 MiB tmpfs; the real 300 MiB is tested below
         self.executor = Executor(
             state_dir=self.tmp / "broker", owner=OWNER, device=DEVICE, verifier=self.verifier, run=apt.real_run,
             require_root=False, owner_uid=os.getuid(), release_keys=self.keys,
@@ -322,6 +323,17 @@ class UpgradeTests(unittest.TestCase):
         self.denied("already_decided_or_used", self.executor.challenge, payload, "approve")
 
     # -- the approved upgrade ---------------------------------------------------------------------
+    def test_an_upgrade_is_refused_when_free_disk_is_below_the_real_reserve(self):
+        from stynpilot.broker import upgrade as up
+        self.assertEqual(up.DISK_RESERVE, 300 * 1024 * 1024)
+        real = up.shutil.disk_usage
+        up.shutil.disk_usage = lambda path: real(path)._replace(free=up.DISK_RESERVE - 1)
+        self.addCleanup(setattr, up.shutil, "disk_usage", real)
+        u = up.Upgrader(self.executor, keys=self.keys, options={"root": self.root})
+        with self.assertRaises(up.UpgradeRefused) as refused:
+            u.prepare("r" * 64, {"manifest": {"size": 1}}, "0.1.0~dev1")
+        self.assertEqual(refused.exception.code, "not_enough_free_disk_space")
+
     def test_the_rollback_copy_is_built_under_a_private_umask(self):
         # The release sandbox runs with umask 0077: the rollback copy's control folder came out 0700 and dpkg-deb refused it.
         old = os.umask(0o077)

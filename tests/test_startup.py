@@ -8,6 +8,11 @@ import socket
 import tempfile
 import time
 import unittest
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(__file__))
+import loopback  # noqa: E402
 from pathlib import Path
 
 try:
@@ -32,10 +37,7 @@ MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": 
                "MCP-Protocol-Version": "2025-06-18"}
 
 
-def free_port():
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+free_port = loopback.free_port
 
 
 @unittest.skipIf(run is None, "server extras not installed")
@@ -48,6 +50,7 @@ class StartupTests(unittest.TestCase):
         cls.jwks = {"keys": [public]}
 
     def setUp(self):
+        loopback.install(self)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         owner = account_id(verified_issuer=ISS, verified_subject=SUBJECT)
@@ -73,7 +76,7 @@ class StartupTests(unittest.TestCase):
         self.port = free_port()
         self.running = run.start(router=router, public_host=HOST, port=self.port)
         self.addCleanup(self.running.stop)
-        self.client = httpx.Client(base_url="http://127.0.0.1:%d" % self.port, headers={"Host": HOST}, timeout=10, trust_env=False)
+        self.client = loopback.client("http://127.0.0.1:%d" % self.port, headers={"Host": HOST}, timeout=10, trust_env=False)
         self.addCleanup(self.client.close)
 
     def token(self, sub=SUBJECT, scope="health.read", azp="claude-connector"):
@@ -106,7 +109,7 @@ class StartupTests(unittest.TestCase):
     def test_unknown_host_is_refused(self):
         reply = self.client.get("/.well-known/oauth-protected-resource/mcp", headers={"Host": "evil.test"})
         self.assertEqual(reply.status_code, 400)
-        bad = httpx.post("http://127.0.0.1:%d/mcp" % self.port, headers={**MCP_HEADERS, "Host": "evil.test",
+        bad = loopback.post("http://127.0.0.1:%d/mcp" % self.port, headers={**MCP_HEADERS, "Host": "evil.test",
                          "Authorization": self.token()}, json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
                          trust_env=False)
         self.assertNotEqual(bad.status_code, 200)
@@ -177,7 +180,7 @@ class StartupTests(unittest.TestCase):
         self.addCleanup(running.stop)
         self.assertEqual(running.local_url, "http://127.0.0.1:%d/approve" % port)
         self.assertEqual(running.server.config.host, "127.0.0.1")
-        page = httpx.Client(base_url="http://127.0.0.1:%d" % port, timeout=10, trust_env=False)
+        page = loopback.client("http://127.0.0.1:%d" % port, timeout=10, trust_env=False)
         self.addCleanup(page.close)
         self.assertEqual(page.get("/approve/" + "a" * 64, headers={"Host": HOST}).status_code, 400)   # reached, unknown
         self.assertEqual(page.get("/approve/" + "a" * 64, headers={"Host": "evil.example"}).status_code, 421)
@@ -204,7 +207,7 @@ class StartupTests(unittest.TestCase):
         running = run.start(router=run.router_for_paired_device(**self.router_args), public_host=HOST,
                             port=port, propose=propose)
         self.addCleanup(running.stop)
-        client = httpx.Client(base_url="http://127.0.0.1:%d" % port, headers={"Host": HOST}, timeout=10,
+        client = loopback.client("http://127.0.0.1:%d" % port, headers={"Host": HOST}, timeout=10,
                               trust_env=False)
         self.addCleanup(client.close)
         listed = client.post("/mcp", headers={**MCP_HEADERS, "Authorization": self.token(scope="health.read workspace.propose")},

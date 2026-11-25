@@ -6,6 +6,11 @@ import socket
 import tempfile
 import time
 import unittest
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(__file__))
+import loopback  # noqa: E402
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,10 +42,7 @@ MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": 
                "MCP-Protocol-Version": "2025-06-18"}
 
 
-def free_port():
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+free_port = loopback.free_port
 
 
 def owner_data(tmp, **over):
@@ -56,6 +58,7 @@ def owner_data(tmp, **over):
 @unittest.skipIf(jwt is None, "PyJWT/cryptography not installed")
 class ConfigTests(unittest.TestCase):
     def setUp(self):
+        loopback.install(self)
         t = tempfile.TemporaryDirectory()
         self.addCleanup(t.cleanup)
         self.tmp = Path(t.name)
@@ -112,6 +115,7 @@ class OwnerServiceTests(unittest.TestCase):
     setUpClass = classmethod(tb.BrokerTests.setUpClass.__func__)
 
     def setUp(self):
+        loopback.install(self)
         tb.BrokerTests.setUp(self)
         owner = OWNER
         make_pairing_db(self.tmp / "pairing", [(DEVICE, owner, time.time() + 3600, None, ["workspace.propose"])])
@@ -225,7 +229,7 @@ class OwnerServiceTests(unittest.TestCase):
         self.provision()
         svc = self.start(self.broker(self.NOT_STARTED))
         self.assertIsNotNone(svc.flow._pool)
-        page = httpx.Client(base_url="http://127.0.0.1:%d" % self.approval_port, timeout=10, trust_env=False)
+        page = loopback.client("http://127.0.0.1:%d" % self.approval_port, timeout=10, trust_env=False)
         self.addCleanup(page.close)
         self.assertEqual(page.get("/approve/" + "a" * 64, headers={"Host": self.config.approval_public_host}).status_code, 400)
         self.assertEqual(page.get("/approve/" + "a" * 64, headers={"Host": "evil.example"}).status_code, 421)
@@ -332,7 +336,7 @@ class OwnerServiceTests(unittest.TestCase):
         self.provision()
         answer = {"v": self.NOT_STARTED}
         svc = self.start(self.broker(lambda: answer["v"]))
-        client = httpx.Client(base_url="http://127.0.0.1:%d" % self.mcp_port, headers={"Host": MCP_HOST}, timeout=10,
+        client = loopback.client("http://127.0.0.1:%d" % self.mcp_port, headers={"Host": MCP_HOST}, timeout=10,
                               trust_env=False)
         self.addCleanup(client.close)
 
@@ -369,6 +373,7 @@ class InstallerServiceTests(unittest.TestCase):
     setUpClass = classmethod(tb.BrokerTests.setUpClass.__func__)
 
     def setUp(self):
+        loopback.install(self)
         tb.BrokerTests.setUp(self)
 
     def config(self):
@@ -406,6 +411,7 @@ class KeyRotationTests(unittest.TestCase):
     other_expiry = staticmethod(tb.BrokerTests.other_expiry)
 
     def setUp(self):
+        loopback.install(self)
         tb.BrokerTests.setUp(self)
         from stynpilot.broker.proof import ProofVerifier
         new = rsa.generate_private_key(public_exponent=65537, key_size=2048)

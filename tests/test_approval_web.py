@@ -4,6 +4,11 @@ import json
 import threading
 import time
 import unittest
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(__file__))
+import loopback  # noqa: E402
 import urllib.parse
 
 try:
@@ -136,6 +141,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.client.get("/approve/not-a-request").status_code, 404)
         self.assertEqual(self.client.get("/approve/" + "f" * 64).status_code, 400)
 
+    @loopback.needs_tcp      # the subject IS a real TCP client (token exchange / endpoint check)
     def test_token_exchange_requires_https_and_returns_the_id_token(self):
         with self.assertRaises(ValueError):
             token_exchange(token_endpoint="http://issuer.example.test/oauth/token", client_id="a", redirect_uri="https://x")

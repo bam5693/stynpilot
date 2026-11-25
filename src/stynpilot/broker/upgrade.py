@@ -44,6 +44,7 @@ SOFTWARE = "stynpilot-self"
 PACKAGE = "stynpilot"
 KEEP = 3                                                      # previous packages kept for rollback
 JOB_GRACE = 90                                                # seconds before "no unit, no result" means vanished
+DISK_RESERVE = 300 * 1024 * 1024        # free space kept beyond 6x the package size before an upgrade starts
 _ALLOWED_PREFIXES = ("usr/lib/stynpilot/", "usr/libexec/stynpilot/", "usr/share/stynpilot/", "usr/share/doc/stynpilot/",
                      "usr/lib/systemd/system/stynpilot-", "usr/lib/systemd/user/stynpilot-",
                      "usr/share/applications/stynpilot-", "usr/share/polkit-1/actions/org.stynpilot.policy",
@@ -87,6 +88,7 @@ class Upgrader:
         self.worker_source = Path(o.get("worker_source", Path(__file__).resolve().parent.parent / "upgrade_worker.py"))
         self.python = o.get("python", "/usr/bin/python3")
         self.endpoint_check = o.get("endpoint_check", upgrade_worker.endpoint_answers)
+        self.disk_reserve = int(o.get("disk_reserve", DISK_RESERVE))   # tests in a small private /tmp lower it; the machine never does
         self.jobs = executor.dir / "upgrades"
         self.jobs.mkdir(exist_ok=True, mode=0o700)
         (executor.dir / "kept").mkdir(exist_ok=True, mode=0o700)
@@ -348,7 +350,7 @@ class Upgrader:
         """Download, inspect, save the rollback copy, write job.json. Nothing on the machine changes. Returns job dir."""
         manifest = content["manifest"]
         free = shutil.disk_usage(self.ex.dir).free
-        if free < 6 * manifest["size"] + 300 * 1024 * 1024:
+        if free < 6 * manifest["size"] + self.disk_reserve:
             raise UpgradeRefused("not_enough_free_disk_space")
         job = self.job_dir(rid)
         if job.exists():

@@ -68,11 +68,33 @@ this revision answers ChatGPT's review of it (3 blockers, the lost-nonce-log des
 - States: awaiting_authorization -> (authorized at the installer) -> in progress (journal state) -> completed | failed;
   interrupted = journal present, resumed automatically. Results carry `rotation` and `progress` read from the journal itself.
 
-## Overlap and rollback compatibility
-- The installer refuses installs, rollbacks, upgrades and another rotation while a root rotation is active
-  (`key_rotation_in_progress`). A root rotation itself holds the installer's operation lock, so it never runs during an install,
-  rollback or backup of the installer's records. Vault operations are serialized by the vault lock; restore (stages 3/4) must
-  check the journal too.
+## Overlap with package changes (second review, commit after 8ab01c0)
+- Installer: every package-changing entry point refuses while the installer's rotation journal is active or damaged
+  (`key_rotation_in_progress`), early AND again under the installer operation lock: `upgrade` (preflight + under the lock before
+  the job is prepared or the approval spent), `release` (via the release gate at challenge time and under the lock before the
+  transaction is reserved), `release_resume` (under the lock) and the release gate used by every resumed step; installs and
+  rollbacks through `_no_other_change` (already under the lock). This also holds between interrupted rotation attempts, when no
+  lock is held: the journal itself is the block.
+- A root rotation step (start or resume) runs while HOLDING the installer operation lock, and only if no other installer change
+  is running or a release is pending - checked under that lock. So neither side can start between the other's check and action.
+- Owner side: the owner service refuses to send an upgrade or release approval to the installer, and the release-resume tool
+  refuses, while ANY owner rotation journal exists (also the awaiting-authorization marker, or a damaged one). New owner markers
+  are only created by the single approval worker, so this cannot race with an upgrade approval. The root vault's state is never
+  taken to cover the owner vault.
+
+## Completion is always reconciled
+- Every finished rotation writes `<request id> completed|cancelled` to the append-only, fsynced `rotation-results.log` BEFORE its
+  journal is removed.
+- Owner side: at start and on every vault tick, an owner rotation request still in flight whose exact request id is recorded
+  as completed/cancelled (and no journal for it) is settled from that record.
+- Installer side: a rotation interrupted while its approval was handled is first recorded as failed with
+  `rotation: in_progress` + durable progress; when it finishes (scheduler resume) the record is replaced with the real outcome
+  (`finished_later`); if the installer died before that, it is reconciled from the results log at the next start/tick. The
+  owner's request record follows the installer's final record (the one correction allowed after a final state).
+- Lost-key preservation: an identical copy left by an interrupted move is fsynced (file and folder) again before the source is
+  removed.
+
+## Rollback compatibility
 - Rollback to 0.1.0~dev23 checked with the RELEASED dev23 vault code (`a611385`) against rotated vaults: after a completed normal
   rotation it works normally; after `fresh_key` the backups under the kept generation fail its recheck and are reported
   (`backups_failed_a_recheck`) and kept, never deleted; after `lost_key` it works on the new key and ignores `unreadable/`; cut

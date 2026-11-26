@@ -38,6 +38,8 @@ disposable environments, never live security-critical state. Do not weaken any s
 ## Current work: Dev23 stage 2 (secure key rotation), package 0.1.0.dev24
 - Branch `claude/dev23-stage2-keys` from the released commit a611385. See `docs/DEV23_STAGE2_KEY_ROTATION.md`.
 - Also on this branch: the retention approval summary now says plainly that owner-side automatic deletion is temporarily off.
+- Second review (8ab01c0): remaining blocker = rotation exclusion on every upgrade/release/resume path (installer, under the
+  lock) and owner-side coordination with package replacement; should-fix = completion reconciliation; fixed in the next commit.
 - ChatGPT review of 28a5a7a: architecture accepted; 3 blockers (premature key destruction, owner-side hand-off durability,
   lost-key archive preservation), lost-nonce-log design (fresh generation, no re-encryption) and extra safety checks - all
   addressed in the next commit (see the doc). Key retirement is now a tracked follow-up after Dev24 external recovery.

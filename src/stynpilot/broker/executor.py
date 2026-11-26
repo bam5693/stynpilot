@@ -154,6 +154,20 @@ class Runs:
             db.execute("UPDATE runs SET state=?, result=?, finished=? WHERE request_id=?",
                        (state, json.dumps(result, sort_keys=True), self.clock(), request_id))
 
+    def unsettled_rotations(self):
+        """Installer-side key rotations recorded as interrupted ('in_progress'), to be settled with their real outcome."""
+        with self._tx() as db:
+            rows = db.execute("SELECT request_id, result FROM runs WHERE state='failed' AND result LIKE '%\"rotation\": \"in_progress\"%'")
+            out = []
+            for row in rows:
+                try:
+                    result = json.loads(row["result"])
+                except ValueError:
+                    continue
+                if result.get("action") == "rotate_key" and result.get("side") == "root" and result.get("rotation") == "in_progress":
+                    out.append(row["request_id"])
+            return out
+
     def running(self):
         with self._tx() as db:
             return [r["request_id"] for r in db.execute("SELECT request_id FROM runs WHERE state='running'")]
@@ -718,6 +732,7 @@ class Executor:
             raise ExecutionDenied(refused.code) from None
         if self.needs_attention():
             raise ExecutionDenied("owner_intervention_required")
+        self._rotation_guard()
         if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
             raise ExecutionDenied("already_decided_or_used")
         return content
@@ -736,6 +751,7 @@ class Executor:
             self._backup_records(rid)
             _, _, installed = self.upgrader.check(payload)
             with statelock.operation(self.dir):
+                self._rotation_guard()                        # under the lock: a rotation cannot start or be mid-way now
                 job = self.upgrader.prepare(rid, content, installed)
                 try:
                     self._used_passkey(passkey, rid, "approve")
@@ -910,6 +926,7 @@ class Executor:
             raise ExecutionDenied("owner_intervention_required")
         if [r for r in self.runs.running() if r != rid]:
             raise ExecutionDenied("another_change_is_still_running")
+        self._rotation_guard()
 
     def _tx_copy_path(self, rid):
         return self._tx_path(rid).with_suffix(".deb")
@@ -968,6 +985,7 @@ class Executor:
             if len(data) != intent["size"] or hashlib.sha256(data).hexdigest() != intent["sha256"]:
                 raise AuthorityError("verified_package_was_altered")
             with statelock.operation(self.dir):
+                self._rotation_guard()                        # before anything is reserved or spent
                 tx = {"rid": rid, "intent": intent, "state": "authorized", "created": self.clock_now(), "last": "authorized"}
                 self._tx_path(rid).parent.mkdir(exist_ok=True, mode=0o700)
                 self._tx_copy_path(rid).unlink(missing_ok=True)
@@ -1007,6 +1025,7 @@ class Executor:
             raise ExecutionDenied("release_approval_expired_start_again_with_a_new_approval")
         try:
             with statelock.operation(self.dir):
+                self._rotation_guard()
                 if tx["state"] == "authorized":              # the approval WAS spent (the run is 'running'); only the note was lost
                     tx.update(state="reserved", last="reserved")
                     self._tx_save(tx)
@@ -1167,17 +1186,57 @@ class Executor:
         except statelock.Busy:
             raise ExecutionDenied("a_backup_or_restore_is_running_try_again") from None
 
+    def _rotation_guard(self):
+        """No install, rollback, upgrade, release (or release resume) while the installer's backup key rotation is active or its
+        journal is damaged - also between interrupted attempts, when no lock is held. Called UNDER the operation lock by every
+        change path (a rotation takes the same lock and checks for running changes under it)."""
+        vault_ = getattr(self, "vault", None)
+        if vault_ is None:
+            return
+        try:
+            rotating = vault_._rotation_active()
+        except Exception:
+            rotating = True
+        if rotating:
+            raise ExecutionDenied("key_rotation_in_progress")
+
+    def attach_vault(self, vault_):
+        """Wire the installer's own vault: rotations see running changes, and report their real final outcome here."""
+        self.vault = vault_
+        vault_.change_running = lambda own: bool([r for r in self.runs.running() if r != own]) or self._pending_release()
+        vault_.on_rotation_finished = self._rotation_finished
+        vault_.tick_hooks.append(self.reconcile_rotations)
+        self.reconcile_rotations()
+        return vault_
+
+    def _rotation_finished(self, rid, result):
+        """A root rotation that was interrupted when its approval was handled finished later: replace the stale record."""
+        record = self.runs.status(rid)
+        old = record.get("result") or {}
+        if record["state"] == "failed" and old.get("action") == "rotate_key" and old.get("side") == "root" \
+                and old.get("rotation") == "in_progress":
+            final = dict(old, ok=bool(result.get("ok")), rotation=result.get("rotation"), progress=None, finished_later=True)
+            final.pop("stopped", None)
+            if not result.get("ok"):
+                final["stopped"] = result.get("stopped") or result.get("error") or "key_rotation_failed"
+            for key in ("reencrypted", "left_with_old_key", "moved_unreadable", "generations_kept"):
+                if key in result:
+                    final[key] = result[key]
+            self.runs.finish(rid, "done" if result.get("ok") else "failed", final)
+
+    def reconcile_rotations(self):
+        """At start and on every vault tick: a rotation whose completion was durably recorded by the vault but not yet here."""
+        vault_ = getattr(self, "vault", None)
+        if vault_ is None:
+            return
+        for rid in self.runs.unsettled_rotations():
+            if vault_.rotation_outcome(rid) == "completed" and (vault_.journal_request() or ("",))[0] != rid:
+                self._rotation_finished(rid, {"ok": True, "rotation": "completed"})
+
     def _no_other_change(self):
         if self.needs_attention():
             raise ExecutionDenied("owner_intervention_required")
-        vault_ = getattr(self, "vault", None)
-        if vault_ is not None:
-            try:
-                rotating = vault_._rotation_active()
-            except Exception:
-                rotating = True
-            if rotating:
-                raise ExecutionDenied("key_rotation_in_progress")   # no install, rollback, upgrade or second rotation meanwhile
+        self._rotation_guard()
         self._settle_upgrades()
         if self.runs.running():
             raise ExecutionDenied("another_change_is_still_running")

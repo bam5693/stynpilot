@@ -78,12 +78,16 @@ CHILD_TIMEOUT = 1800
 NONCE_LOG = "nonces.log"
 ROTATION = "rotation.json"             # durable key-rotation journal (resumable at every step)
 ROTATION_REQUESTS = "rotation-requests.log"   # append-only, fsynced, unbounded: every approval id ever spent on a rotation
+ROTATION_RESULTS = "rotation-results.log"     # append-only, fsynced: '<request id> completed|cancelled', written BEFORE the journal ends
 ROTATION_MODES = ("normal", "fresh_key", "lost_key")
+_TRANSIENT = ("another_backup_operation_is_running", "another_change_is_still_running",
+              "an_install_or_rollback_is_running_try_again_when_it_finishes", "backup_process_timed_out")
 AWAIT_GRACE = 600                      # owner side: how long a fresh authorization marker is left to the approval flow itself
 _HEX16 = re.compile(r"[0-9a-f]{16}\Z")
 _RID = re.compile(r"[0-9a-f]{64}\Z")
 _NONCE = re.compile(r"[0-9a-f]{24}\Z")
 _CLOSED_TORN = re.compile(r"[0-9a-f]{0,63}!\Z")
+_OUTCOME = re.compile(r"[0-9a-f]{64} (completed|cancelled)\Z")
 _SECRET_BYTES = (b"BEGIN PRIVATE KEY", b"BEGIN OPENSSH PRIVATE KEY", b"BEGIN RSA PRIVATE KEY", b"BEGIN EC PRIVATE KEY",
                  b"ghp_", b"github_pat_", b"gho_", b"ghs_")
 _SECRET_KEY = re.compile(r"(token|secret|password|passphrase|private|api[_-]?key|credential)", re.I)
@@ -180,6 +184,14 @@ def _append_line(path, line):
     finally:
         os.close(fd)
     _fsync_dir(Path(path).parent)
+
+
+def _fsync_file(path):
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _file_sha(path):
@@ -364,7 +376,9 @@ class Vault:
         self.retention_source = retention_source              # owner side: the installer's approved setting is the authority
         self.prune_allowed = prune_allowed                     # False on the owner side in Dev23 stage 1 (see service.owner_vault)
         self.authorization_source = None                       # owner side: rid -> 'authorized' | 'refused' | 'unknown' (installer record)
-        self.on_rotation_finished = None                       # owner side: settles the owner's request record when a rotation ends
+        self.on_rotation_finished = None                       # settles the request record (owner store / installer run) at the end
+        self.change_running = None                             # root side: rid -> True while another installer change runs/pends
+        self.tick_hooks = []                                   # small reconciliation steps run at the end of every tick
         self._aesgcm = aesgcm
         self._mutex = threading.Lock()
         self._held = threading.local()
@@ -703,6 +717,31 @@ class Vault:
         if request_id not in self._spent():
             _append_line(self.folder / ROTATION_REQUESTS, request_id)
 
+    def _record_outcome(self, request_id, outcome):
+        """Durable final outcome, written BEFORE the journal is removed, so completion can always be reconciled after a crash."""
+        if self.rotation_outcome(request_id) is None:
+            _append_line(self.folder / ROTATION_RESULTS, "%s %s" % (request_id, outcome))
+
+    def rotation_outcome(self, request_id):
+        """'completed' | 'cancelled' | None (never finished here). Read-only; safe from any thread."""
+        try:
+            lines = _read_lines(self.folder / ROTATION_RESULTS, _OUTCOME, 16 << 20)
+        except (FileNotFoundError, VaultError):
+            return None
+        for line in lines:
+            rid, outcome = line.split(" ")
+            if rid == request_id:
+                return outcome
+        return None
+
+    def journal_request(self):
+        """(request id, state) of the journal present, or None. A damaged journal reports ('damaged', 'damaged')."""
+        try:
+            journal = self._journal()
+        except VaultError:
+            return ("damaged", "damaged")
+        return None if journal is None else (journal["request_id"], journal["state"])
+
     def _new_key_files(self, folder):
         """A fresh key + its EMPTY nonce log in ``folder`` (both exclusive, fsynced). Returns the key id."""
         raw = KEY_MAGIC + secrets.token_bytes(8) + secrets.token_bytes(32)
@@ -740,6 +779,7 @@ class Vault:
         if journal is None or journal["request_id"] != request_id or journal["state"] != "awaiting_authorization":
             raise VaultError("nothing_to_cancel")
         self._spend(request_id)
+        self._record_outcome(request_id, "cancelled")
         self._end_journal()
         return {"ok": True, "cancelled": True}
 
@@ -769,12 +809,6 @@ class Vault:
             self._spend(request_id)                         # and this approval can never start another one
         elif request_id is not None and journal["request_id"] != request_id:
             raise VaultError("another_key_rotation_is_in_progress")
-        if self.side == "root":
-            try:
-                with statelock.operation(self.state_dir, "an_install_or_rollback_is_running_try_again_when_it_finishes"):
-                    return self._advance(journal)
-            except statelock.Busy as busy:
-                raise VaultError(busy.code) from None
         return self._advance(journal)
 
     def _advance(self, journal):
@@ -893,6 +927,7 @@ class Vault:
         index = self._index()
         index["last_rotation"] = dict(summary, at=int(self.clock()), mode=journal["mode"], request_id=journal["request_id"])
         self._save(index)
+        self._record_outcome(journal["request_id"], "completed")
         self._end_journal()
         return dict(summary, ok=True, mode=journal["mode"], request_id=journal["request_id"], generations_kept=len(self.generations()))
 
@@ -946,7 +981,9 @@ class Vault:
             target = folder / (name if n == 0 else "%s.%d" % (name, n))
             if os.path.lexists(str(target)):
                 if not target.is_symlink() and target.is_file() and _file_sha(target) == want:
-                    break                                       # already preserved by an interrupted earlier move
+                    _fsync_file(target)
+                    _fsync_dir(folder)                          # an interrupted earlier move: make sure THAT entry is durable
+                    break
                 continue                                        # never overwrite a different preserved file
             os.link(str(source), str(target))
             _fsync_dir(folder)
@@ -1004,6 +1041,7 @@ class Vault:
             index["last_rotation"] = {"at": int(self.clock()), "request_id": journal["request_id"], "mode": "lost_key",
                                       "moved_unreadable": len(journal["moved"])}
             self._save(index)
+            self._record_outcome(journal["request_id"], "completed")
             self._end_journal()
             return {"ok": True, "mode": "lost_key", "request_id": journal["request_id"], "moved_unreadable": len(journal["moved"])}
         raise VaultError("key_rotation_journal_damaged")
@@ -1464,7 +1502,7 @@ class Vault:
     def rotate_key(self, mode, request_id):
         """Owner-approved (YELLOW) key rotation. request_id=None resumes an interrupted one. The result always carries the
         DURABLE state: rotation 'completed', 'in_progress' (journal present: it resumes) or 'failed' (nothing in progress)."""
-        result = dict(self._run("rotate", args={"mode": mode, "request_id": request_id}))
+        result = dict(self._rotate_exclusive(mode, request_id))
         if result.get("nothing_to_resume"):
             return result
         progress = self.rotation_progress()
@@ -1476,14 +1514,37 @@ class Vault:
         else:
             result["rotation"] = "failed"
         rid = result.get("request_id") or request_id
-        if result["rotation"] != "in_progress" and rid and self.on_rotation_finished is not None:
-            if result["rotation"] == "completed" or result.get("error") not in ("another_key_rotation_is_in_progress",
-                                                                                  "another_backup_operation_is_running"):
-                try:
-                    self.on_rotation_finished(rid, result)
-                except Exception:
-                    pass
+        if result["rotation"] == "completed" and rid:
+            self._notify(rid, result)
         return result
+
+    def _notify(self, rid, result):
+        if self.on_rotation_finished is not None:
+            try:
+                self.on_rotation_finished(rid, result)
+            except Exception:
+                pass
+
+    def _rotate_exclusive(self, mode, request_id):
+        """Root side: the whole rotation step (start or resume) runs while holding the installer's operation lock, and only if
+        no other installer change (install, rollback, upgrade, release) is running or pending - checked UNDER that lock, so a
+        change can never start in between (the installer checks for an active journal under the same lock)."""
+        if self.side != "root":
+            return self._run("rotate", args={"mode": mode, "request_id": request_id})
+        try:
+            with statelock.operation(self.state_dir, "an_install_or_rollback_is_running_try_again_when_it_finishes"):
+                if self.change_running is not None:
+                    current = self.journal_request()
+                    own = request_id or (current[0] if current else None)
+                    try:
+                        busy = self.change_running(own)
+                    except Exception:
+                        busy = True
+                    if busy:
+                        return {"ok": False, "error": "another_change_is_still_running"}
+                return self._run("rotate", args={"mode": mode, "request_id": request_id})
+        except statelock.Busy as busy:
+            return {"ok": False, "error": busy.code}
 
     def prepare_rotation(self, mode, request_id, expires_at):
         """Owner side, BEFORE the installer is asked: the durable marker of an approved-but-not-yet-authorized rotation."""
@@ -1495,15 +1556,19 @@ class Vault:
             return None
         verdict = self.authorization_source(journal["request_id"])
         if verdict == "authorized":
-            return self.rotate_key(journal["mode"], journal["request_id"])
+            result = self.rotate_key(journal["mode"], journal["request_id"])
+            if result.get("rotation") == "failed" and result.get("error") not in _TRANSIENT:
+                verdict = "refused"                             # it can never start (e.g. key state changed): end it honestly
+                stopped = result.get("error")
+            else:
+                return result
+        else:
+            stopped = "installer_did_not_authorize"
         if verdict == "refused":
             result = self._guard(lambda: self._op_cancel(journal["request_id"]))
-            if result.get("ok") and self.on_rotation_finished is not None:
-                try:
-                    self.on_rotation_finished(journal["request_id"], {"ok": False, "stopped": "installer_did_not_authorize",
-                                                                      "rotation": "failed", "changed_anything": False})
-                except Exception:
-                    pass
+            if result.get("ok"):
+                self._notify(journal["request_id"], {"ok": False, "stopped": stopped, "rotation": "failed",
+                                                     "changed_anything": False})
             return result
         return {"ok": None, "waiting_for_installer": True}
 
@@ -1522,6 +1587,7 @@ class Vault:
         if self._rotation_active():
             done["rotate"] = self.rotate_key(None, None)        # an interrupted rotation finishes before anything else
             if self._rotation_active():
+                self._run_hooks()
                 return done
         index = self._index()
         now = int(self.clock())
@@ -1543,7 +1609,15 @@ class Vault:
         last_drill = (index.get("last_drill") or {}).get("at") or 0
         if now - last_drill >= DRILL_EVERY and (newest or done.get("backup", {}).get("ok")):
             done["drill"] = self.drill()
+        self._run_hooks()
         return done
+
+    def _run_hooks(self):
+        for hook in list(self.tick_hooks):
+            try:
+                hook()
+            except Exception:
+                pass
 
     def _guard(self, fn):
         try:

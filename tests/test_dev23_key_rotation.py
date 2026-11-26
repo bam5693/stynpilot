@@ -736,6 +736,24 @@ class OwnerHandOffEndToEndTests(unittest.TestCase):
         self.assertFalse((self.o.tmp / "vault" / "rotation.json").exists())
         self.assertEqual(self.vault.rotate_key("normal", rid)["error"], "key_rotation_request_already_used")
 
+    def test_a_crash_after_completion_but_before_the_request_is_settled_is_reconciled_on_start(self):
+        rid, finish = self.file_and_approve()
+
+        def die(*a):
+            raise _Crash()
+        self.vault.on_rotation_finished = die                                 # dies right after the journal was removed
+        with self.assertRaises(_Crash):
+            finish()
+        self.assertNotEqual(self.key(), self.old)
+        self.assertFalse((self.o.tmp / "vault" / "rotation.json").exists())
+        self.assertEqual(self.vault.rotation_outcome(rid), "completed")      # durable, by exact request id
+        self.assertEqual(self.a.store.status(rid, owner=tapp.OWNER, device=tapp.DEVICE)["state"], "running")
+        flow = self.wire(self.a.make_flow())                                  # restart
+        flow.recover(patient=True)
+        self.service._owner_rotation_reconciler(self.a.store, flow, self.vault, self.a.executor)()
+        record = self.a.store.status(rid, owner=tapp.OWNER, device=tapp.DEVICE)
+        self.assertEqual(record["state"], "done")
+
 
 @unittest.skipIf(door is None or tv is None, "needs PyJWT, cryptography")
 class RotationOverlapTests(unittest.TestCase):
@@ -760,7 +778,7 @@ class RotationOverlapTests(unittest.TestCase):
         self.assertTrue(r.v.tick()["rotate"]["ok"])                           # resumes and finishes
         r.executor._no_other_change()
 
-    def test_a_root_rotation_never_runs_during_an_install_or_rollback(self):
+    def test_a_root_rotation_never_starts_during_an_install_or_rollback(self):
         from stynpilot import statelock
         r = RotationApprovalTests("test_root_rotation_runs_once_with_the_owners_proof")
         RotationApprovalTests.setUpClass()
@@ -772,4 +790,216 @@ class RotationOverlapTests(unittest.TestCase):
             result = r.v.rotate_key("normal", "ab" * 32)
         self.assertEqual((result["ok"], result["error"]), (False, "an_install_or_rollback_is_running_try_again_when_it_finishes"))
         self.assertEqual((r.a.tmp / "rootvault" / "backup-key").read_bytes(), old)
-        self.assertTrue(r.v.tick()["rotate"]["ok"])
+        self.assertFalse((r.a.tmp / "rootvault" / "rotation.json").exists())  # it never started
+        self.assertTrue(r.v.rotate_key("normal", "ab" * 32)["ok"])            # the same approval works once the lock is free
+
+
+try:
+    import test_release_authority as tra
+except Exception:                                    # pragma: no cover
+    tra = None
+
+
+def _active_journal(folder, *, damaged=False):
+    folder.mkdir(mode=0o700, exist_ok=True)
+    data = "{not json" if damaged else json.dumps({"schema": 1, "mode": "normal", "request_id": "ab" * 32, "state": "reencrypt",
+                                                    "started": 1, "old_key_id": "1" * 16, "new_key_id": "2" * 16, "done": [],
+                                                    "kept_old": []})
+    (folder / "rotation.json").write_text(data)
+    os.chmod(folder / "rotation.json", 0o600)
+
+
+@unittest.skipIf(tra is None or getattr(tra, "tu", None) is None, "needs the release test harness")
+class RotationBlocksPackageChangesTests(unittest.TestCase):
+    """The REAL upgrade, release and release-resume entry points refuse while an installer rotation is active or its journal is
+    damaged - also when the journal appears after the early checks (the check is repeated under the operation lock)."""
+
+    @classmethod
+    def setUpClass(cls):
+        tra.OneApprovalTests.setUpClass()
+
+    def setUp(self):
+        from stynpilot.broker.executor import ExecutionDenied
+        from stynpilot.requests import request_id
+        self.ExecutionDenied, self.request_id = ExecutionDenied, request_id
+        r = tra.OneApprovalTests("test_approval_signs_publishes_and_starts_the_protected_upgrade_once")
+        r.setUp()
+        self.addCleanup(r.doCleanups)
+        self.r = r
+        self.rootvault = r.tmp / "rootvault"
+        r.executor.attach_vault(vault.Vault(side="root", state_dir=r.tmp / "broker", folder=self.rootvault))
+
+    def code(self, fn, *args):
+        with self.assertRaises(self.ExecutionDenied) as caught:
+            fn(*args)
+        return caught.exception.code
+
+    def test_an_upgrade_is_refused_while_a_rotation_is_active_or_damaged_and_nothing_is_spent(self):
+        r = self.r
+        payload = r.good()
+        challenge, token = r.approve(payload)
+        for damaged in (False, True):
+            _active_journal(self.rootvault, damaged=damaged)
+            self.assertEqual(self.code(r.executor.challenge, payload, "approve"), "key_rotation_in_progress")
+            self.assertEqual(self.code(r.executor.upgrade, payload, token, challenge), "key_rotation_in_progress")
+            self.assertEqual(r.executor.runs.status(self.request_id(payload)[0])["state"], "not_started")
+            self.assertEqual(r.launched, [])
+        os.unlink(self.rootvault / "rotation.json")
+        self.assertTrue(r.executor.upgrade(payload, token, challenge)["pending"])     # the same approval works afterwards
+
+    def test_an_upgrade_is_refused_when_a_rotation_starts_after_the_early_checks(self):
+        r = self.r
+        payload, go = r.attempt()
+        real = r.executor._backup_records
+        r.executor._backup_records = lambda rid: (real(rid), _active_journal(self.rootvault))
+        self.assertEqual(self.code(go), "key_rotation_in_progress")           # re-checked under the operation lock
+        self.assertEqual(r.executor.runs.status(self.request_id(payload)[0])["state"], "not_started")
+        self.assertEqual(r.launched, [])
+
+    def test_a_release_is_refused_while_a_rotation_is_active_and_nothing_is_published_or_spent(self):
+        r = self.r
+        payload, challenge, proof = r.go()
+        _active_journal(self.rootvault)
+        self.assertEqual(self.code(r.executor.challenge, payload, "approve"), "key_rotation_in_progress")
+        self.assertEqual(self.code(r.executor.release, payload, proof, challenge), "key_rotation_in_progress")
+        os.unlink(self.rootvault / "rotation.json")
+        real = r.auth.preflight
+        r.auth.preflight = lambda intent: (real(intent), _active_journal(self.rootvault))   # appears after the early checks
+        self.assertEqual(self.code(r.executor.release, payload, proof, challenge), "key_rotation_in_progress")
+        self.assertEqual(r.executor.runs.status(r.rid)["state"], "not_started")
+        self.assertEqual(r.http.releases, {})
+        self.assertEqual(r.launched, [])
+
+    def test_a_release_resume_is_refused_between_interrupted_rotation_attempts(self):
+        r = self.r
+        payload, challenge, proof = r.go()
+        r.http.fail_upload = True
+        with self.assertRaises(self.ExecutionDenied):
+            r.executor.release(payload, proof, challenge)
+        r.http.fail_upload = False
+        _active_journal(self.rootvault)                                       # an interrupted rotation: no lock is held now
+        self.assertEqual(self.code(r.executor.release_resume, r.rid), "key_rotation_in_progress")
+        self.assertEqual(r.launched, [])
+        os.unlink(self.rootvault / "rotation.json")
+        self.assertTrue(r.executor.release_resume(r.rid)["pending"])
+
+    def test_a_rotation_never_starts_while_an_upgrade_or_release_is_running_or_pending(self):
+        r = self.r
+        payload, go = r.attempt()
+        go()                                                                  # the upgrade worker runs on its own
+        result = r.executor.vault.rotate_key("normal", "cd" * 32)
+        self.assertEqual(result["error"], "another_change_is_still_running")
+        self.assertFalse((self.rootvault / "rotation.json").exists())
+
+
+@unittest.skipIf(tv is None, "needs cryptography")
+class OwnerRotationBlocksPackageChangesTests(unittest.TestCase):
+    def setUp(self):
+        from stynpilot import service
+        self.service = service
+        self.o = tv.OwnerVaultTests("test_status_shows_metadata_only")
+        self.o.setUp()
+        self.addCleanup(self.o.doCleanups)
+        self.before = service._owner_before_run(self.o.tmp, lambda: self.o.vault)
+
+    def test_the_owner_side_refuses_an_upgrade_or_release_while_its_own_rotation_exists(self):
+        self.assertTrue(self.o.vault.backup_now()["ok"])
+        self.o.vault.prepare_rotation("normal", RID, int(self.o.clock()) + 3600)
+        for kind in ("upgrade", "release"):
+            with self.assertRaises(VaultError) as caught:
+                self.before({"kind": kind}, "cd" * 32)
+            self.assertEqual(caught.exception.code, "owner_key_rotation_in_progress")
+        _active_journal(self.o.tmp / "vault", damaged=True)
+        with self.assertRaises(VaultError):
+            self.before({"kind": "upgrade"}, "cd" * 32)
+        os.unlink(self.o.tmp / "vault" / "rotation.json")
+        self.before({"kind": "install"}, "cd" * 32)                           # unrelated kinds are not affected
+
+    def test_the_release_resume_tool_refuses_while_an_owner_rotation_exists(self):
+        t = tv.BackupToolTests("test_backup_tools_work_and_writes_need_the_write_gate")
+        t.setUp()
+        self.addCleanup(t.doCleanups)
+        t.o.vault.prepare_rotation("normal", RID, 10 ** 10)
+        out = t.h.call("commander_resume_stynpilot_release", t.h.d(request_id="cd" * 32))
+        self.assertEqual(out["error"], "owner_key_rotation_in_progress")
+
+
+@unittest.skipIf(door is None or tv is None, "needs PyJWT, cryptography")
+class RootOutcomeTests(unittest.TestCase):
+    def setUp(self):
+        RotationApprovalTests.setUpClass()
+        self.r = RotationApprovalTests("test_root_rotation_runs_once_with_the_owners_proof")
+        self.r.setUp()
+        self.addCleanup(self.r.doCleanups)
+        self.r.executor.attach_vault(self.r.v)
+        self.assertTrue(self.r.v.backup_now()["ok"])
+
+    def interrupted(self):
+        payload = self.r.rpayload()
+        with mock.patch.object(vault.Vault, "_reencrypt_one", side_effect=VaultError("insufficient_storage")):
+            _, result = self.r.approve(payload)
+        rid = door.request_id(payload)[0]
+        self.assertEqual(result["rotation"], "in_progress")
+        record = self.r.executor.runs.status(rid)
+        self.assertEqual((record["state"], record["result"]["rotation"]), ("failed", "in_progress"))
+        return rid
+
+    def test_an_interrupted_root_rotation_later_reports_its_real_outcome(self):
+        rid = self.interrupted()
+        self.assertTrue(self.r.v.tick()["rotate"]["ok"])
+        record = self.r.executor.runs.status(rid)
+        self.assertEqual((record["state"], record["result"]["rotation"], record["result"]["ok"]), ("done", "completed", True))
+        self.assertTrue(record["result"]["finished_later"])
+        self.assertEqual(self.r.executor.runs.unsettled_rotations(), [])
+
+    def test_a_crash_before_the_installer_record_was_updated_is_reconciled_from_the_vault(self):
+        rid = self.interrupted()
+        self.r.v.on_rotation_finished = None                                  # the installer died before recording it
+        self.assertTrue(self.r.v.rotate_key(None, None)["ok"])
+        self.assertEqual(self.r.executor.runs.status(rid)["state"], "failed")
+        self.r.executor.attach_vault(self.r.v)                                # installer restart
+        self.assertEqual(self.r.executor.runs.status(rid)["state"], "done")
+
+    def test_the_owner_request_record_follows_the_installers_final_outcome(self):
+        from stynpilot import service
+        from stynpilot.requests import RequestStore
+        from types import SimpleNamespace
+        rid = self.interrupted()
+        store = RequestStore(self.r.a.tmp / "owner-requests.sqlite3")
+        payload = self.r.rpayload()
+        receipt, _ = store.submit(kind="backup", software="stynpilot-backup-key-root", device=door.DEVICE, owner=door.OWNER,
+                                  proposer=SimpleNamespace(client="c", name="c"), payload=payload, summary=["x"],
+                                  expires=10 ** 10)
+        orid = receipt["request_id"]
+        store.transition(orid, "pending", "approved")
+        store.transition(orid, "approved", "running")
+        store.transition(orid, "running", "failed", result={"ok": False, "action": "rotate_key", "side": "root",
+                                                             "rotation": "in_progress"})
+        broker = type("B", (), {"status": lambda self, x: self.r.executor.status(rid)})()
+        broker.r = self.r
+        self.assertTrue(self.r.v.tick()["rotate"]["ok"])
+        owner_vault = tv.OwnerVaultTests("test_status_shows_metadata_only")
+        owner_vault.setUp()
+        self.addCleanup(owner_vault.doCleanups)
+        service._owner_rotation_reconciler(store, None, owner_vault.vault, broker)()
+        record = store.status(orid, owner=door.OWNER, device=door.DEVICE)
+        self.assertEqual(record["state"], "done")
+        self.assertEqual(store.interrupted_rotations(), [])
+
+
+@unittest.skipIf(tv is None, "needs cryptography")
+class PreserveDurabilityTests(unittest.TestCase):
+    def test_an_identical_copy_left_by_an_interrupted_move_is_made_durable_before_the_source_goes(self):
+        k = KeyRotationTests("test_a_swapped_key_is_never_trusted")
+        k.setUp()
+        unreadable = k.folder / "unreadable"
+        unreadable.mkdir(mode=0o700)
+        name = next(iter(k.headers()))
+        os.link(k.folder / name, unreadable / name)
+        events = []
+        real_dir, real_unlink = vault._fsync_dir, vault.os.unlink
+        with mock.patch.object(vault, "_fsync_dir", lambda p: (events.append(("fsync", str(p))), real_dir(p))), \
+                mock.patch.object(vault.os, "unlink", lambda p, *a, **kw: (events.append(("unlink", str(p))), real_unlink(p, *a, **kw))):
+            k.vault._preserve(k.folder / name, unreadable, name)
+        self.assertEqual(events[:2], [("fsync", str(unreadable)), ("unlink", str(k.folder / name))])
+        self.assertEqual(events[2], ("fsync", str(k.folder)))

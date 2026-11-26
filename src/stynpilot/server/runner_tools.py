@@ -269,6 +269,8 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
         def work(owner):
             if type(request_id) is not str or not re.fullmatch(r"[0-9a-f]{64}", request_id):
                 raise WorkspaceError("request_id_invalid")
+            if vault is not None and vault.journal_request() is not None:
+                raise WorkspaceError("owner_key_rotation_in_progress")   # never resume a package replacement under a rotation
             return broker.release_resume(request_id)
         return run("commander_resume_stynpilot_release", device_id, work, write=True)
 

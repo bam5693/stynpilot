@@ -36,7 +36,9 @@ _SAFE_RESULT = ("ok", "stopped", "installed", "rollback_id", "restored", "restor
                 "not_restored", "needs_owner_intervention", "denied_by_owner", "backup_scope", "limits",
                 "pending", "started", "rolled_back", "from_version", "to_version", "notes", "config_preserved",
                 "action", "workspace", "entries", "skipped", "runner_user", "enabled", "selftest",
-                "enrollment_open", "label", "kid", "passkeys_active")
+                "enrollment_open", "label", "kid", "passkeys_active",
+                "side", "mode", "rotation", "progress", "reencrypted", "left_with_old_key", "moved_unreadable",
+                "generations_kept", "owner_side_authorized", "finished_later")
 KINDS = ("install", "rollback", "upgrade", "runner", "passkey", "release", "backup")
 MAX_PENDING_PER_CLIENT = 5
 _REQUEST_ID = re.compile(r"[a-f0-9]{64}\Z")
@@ -163,6 +165,33 @@ class RequestStore:
             db.execute("UPDATE requests SET state=?, decided=COALESCE(decided, ?), result=COALESCE(?, result) "
                        "WHERE request_id=?", (to_state, self.clock(), safe, request_id_value))
             return True
+
+    def interrupted_rotations(self):
+        """Requests recorded as failed while their installer-side rotation was still in progress (it resumes by itself)."""
+        with self._tx() as db:
+            rows = db.execute("SELECT request_id, result FROM requests WHERE kind='backup' AND state='failed'").fetchall()
+        out = []
+        for row in rows:
+            try:
+                result = json.loads(row["result"] or "{}")
+            except ValueError:
+                continue
+            if result.get("action") == "rotate_key" and result.get("side") == "root" and result.get("rotation") == "in_progress":
+                out.append(row["request_id"])
+        return out
+
+    def settle_rotation(self, request_id_value, to_state, result):
+        """The ONE correction allowed after a final state: an interrupted installer-side rotation that later really finished
+        replaces its stale 'in progress' result with the installer's final one."""
+        if to_state not in ("done", "failed") or result.get("rotation") not in ("completed", "failed"):
+            raise RequestError("illegal_transition")
+        if request_id_value not in self.interrupted_rotations():
+            return False
+        safe = json.dumps({k: result[k] for k in _SAFE_RESULT if k in result}, sort_keys=True)
+        with self._tx() as db:
+            db.execute("UPDATE requests SET state=?, result=? WHERE request_id=? AND state='failed' AND kind='backup'",
+                       (to_state, safe, request_id_value))
+        return True
 
     def in_flight(self):
         with self._tx() as db:

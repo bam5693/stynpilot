@@ -305,6 +305,10 @@ def _owner_before_run(state, get_vault):
     upgrade = _owner_backup_before_upgrade(state)
 
     def before(payload, rid):
+        if payload.get("kind") in ("upgrade", "release"):
+            vault_ = get_vault()
+            if vault_ is not None and vault_.journal_request() is not None:
+                raise _vault_error("owner_key_rotation_in_progress")   # never replace the package under an owner-side rotation
         upgrade(payload, rid)
         if payload.get("kind") == "backup" and payload.get("action") == "rotate_key" and payload.get("side") == "owner":
             from datetime import datetime, timezone
@@ -344,6 +348,35 @@ def _settle_request(store, flow):
         store.transition(rid, "approved", "running")
         store.transition(rid, "running", flow._state_for(result), result={k: v for k, v in result.items() if k != "pending"})
     return settle
+
+
+def _owner_rotation_reconciler(store, flow, vault_, broker):
+    """Startup and every vault tick: (1) an owner rotation whose completion the vault recorded durably but whose request was
+    never settled (crash between the two) is settled from that record and its exact request id; (2) an installer-side rotation
+    first reported as interrupted gets its real final outcome from the installer's record."""
+    settle = _settle_request(store, flow)
+
+    def reconcile():
+        current = vault_.journal_request()
+        for rid in store.in_flight():
+            payload = store.payload(rid)
+            if (isinstance(payload, dict) and payload.get("kind") == "backup" and payload.get("action") == "rotate_key"
+                    and payload.get("side") == "owner" and (current or ("",))[0] != rid):
+                outcome = vault_.rotation_outcome(rid)
+                if outcome == "completed":
+                    settle(rid, {"ok": True, "action": "rotate_key", "side": "owner", "rotation": "completed"})
+                elif outcome == "cancelled":
+                    settle(rid, {"ok": False, "action": "rotate_key", "side": "owner", "rotation": "failed",
+                                 "stopped": "installer_did_not_authorize_or_it_could_not_start", "changed_anything": False})
+        for rid in store.interrupted_rotations():
+            try:
+                record = broker.status(rid)
+            except Exception:
+                continue
+            result = record.get("result") or {}
+            if record.get("state") in ("done", "failed") and result.get("rotation") in ("completed", "failed"):
+                store.settle_rotation(rid, "done" if record["state"] == "done" else "failed", result)
+    return reconcile
 
 
 def start_owner_service(config, *, broker=None, exchange=None, start_listener=None, start_mcp=None, tokens=None,
@@ -405,6 +438,12 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
         service_vault[0] = service.vault
         service.vault.authorization_source = _rotation_authorization(broker)
         service.vault.on_rotation_finished = _settle_request(store, flow)
+        reconcile = _owner_rotation_reconciler(store, flow, service.vault, broker)
+        service.vault.tick_hooks.append(reconcile)
+        try:
+            reconcile()
+        except Exception:
+            pass
         flow.after_run = _owner_after_approval(lambda: service.vault)
         diag = dict(policy=safefs.Policy(home=home,
                                          project_roots=safefs.load_project_roots(state / PROJECT_ROOTS_FILE, home),
@@ -646,7 +685,7 @@ def main(argv=None):                                       # pragma: no cover - 
         service = build_installer(config, jwks=fetch_jwks(config.issuer),
                                   jwks_loader=lambda: fetch_jwks(config.issuer))     # rotation: only on an unknown key ID
         from . import vault as _vault
-        service.vault = service.executor.vault = root_vault(args.config, config)
+        service.vault = service.executor.attach_vault(root_vault(args.config, config))
         _vault.start_scheduler(service.vault)                 # first backup shortly after start, then hourly checks; never raises
         service.serve_forever()
         return 0

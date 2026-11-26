@@ -387,6 +387,53 @@ class RunnerToolTests(unittest.TestCase):
                          ("runner", "settle_inference", "a"*32))
         self.assertTrue(all(call == "inference_claim_status" for call, args in self.broker.calls))
 
+    def test_active_inference_withdrawal_is_observed_without_status_polling(self):
+        import threading
+        from unittest.mock import patch
+        from stynpilot.local_ai import MODEL
+        for action in ("revoke", "remove_workspace", "lose_claim"):
+            self.authorize("local-ai-pilot")
+            self.clients.reinstate("chatgpt-connector")
+            entered, interrupted, release = threading.Event(), threading.Event(), threading.Event()
+            with patch("stynpilot.local_ai.http.client.HTTPConnection") as transport:
+                conn = transport.return_value
+                reply = conn.getresponse.return_value.__enter__.return_value
+                reply.status = 200
+                def shutdown(_):
+                    interrupted.set()
+                    release.set()
+                conn.sock.shutdown.side_effect = shutdown
+                def read(_):
+                    entered.set()
+                    release.wait(5)
+                    return json.dumps(dict(done=True,model=MODEL,response="discard")).encode()
+                reply.read.side_effect = read
+                result=self.call("local_ai_submit",self.d(prompt="test"))
+                self.assertTrue(result["ok"],result)
+                jid=result["result"]["job_id"]
+                try:
+                    self.assertTrue(entered.wait(3))
+                    if action=="revoke":
+                        self.clients.revoke("chatgpt-connector")
+                    elif action=="remove_workspace":
+                        self.authorize("app")
+                    else:
+                        self.broker.inference_claim=None
+                    self.assertTrue(interrupted.wait(3),action)
+                finally:
+                    release.set()
+                self.clients.reinstate("chatgpt-connector")
+                self.authorize("local-ai-pilot")
+                deadline=time.monotonic()+3
+                while time.monotonic()<deadline:
+                    out=self.call("local_ai_status",self.d(job_id=jid))
+                    if out["ok"] and out["result"]["state"]=="cancelled":
+                        break
+                    time.sleep(.01)
+                self.assertEqual(out["result"]["state"],"cancelled",out)
+                self.assertNotIn("output",out["result"])
+                self.assertFalse(any(call=="inference_finish" and args.get("job_id")==jid for call,args in self.broker.calls))
+
 
 if __name__ == "__main__":
     unittest.main()

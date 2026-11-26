@@ -40,7 +40,7 @@ def _error(code):
 
 
 def register(server, *, router, clients, store, bearer, broker, projects_dir, approval_url=None, clock=None, limiter=None,
-             vault=None):
+             vault=None, inference_readiness_probe=None):
     gate = ProposeGate(router=router, clients=clients)
     limiter = limiter or RateLimit(per_minute=120)
     now = clock or (lambda: datetime.now(timezone.utc))
@@ -87,15 +87,16 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
     # A narrow, owner-side inference bridge, not a network exception for the project runner.
     from .. import local_ai, local_ai_readiness
     inference = local_ai.Jobs()
+    readiness_probe = inference_readiness_probe or local_ai_readiness.inspect
 
     @server.tool(name="local_ai_readiness", title="Inspect fixed local AI resource controls", annotations=READ_ONLY,
                  description="Read-only bounded evidence for the owner-managed Ollama service. Reports effective cgroup limits, process identity, fixed environment checks and listener. Not proof of model availability, egress isolation or recovery readiness.")
     def inference_readiness(device_id: str) -> dict:
-        return run("local_ai_readiness", device_id, lambda owner: local_ai_readiness.inspect(), write=False)
+        return run("local_ai_readiness", device_id, lambda owner: readiness_probe(), write=False)
 
     def submit_inference(owner, device_id, prompt):
         caller = inference_caller(owner, device_id)
-        if local_ai_readiness.inspect().get("resource_checks_passed") is not True:
+        if readiness_probe().get("resource_checks_passed") is not True:
             raise local_ai.LocalAIError("local_ai_containment_required")
         # Recheck after sampling; cross-process recovery exclusion still required before release.
         inference_caller(owner, device_id)

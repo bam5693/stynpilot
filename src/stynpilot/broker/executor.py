@@ -220,6 +220,7 @@ class Executor:
         for sub in ("snapshots", "downloads", "attention", "attention-resolved"):
             (self.dir / sub).mkdir(exist_ok=True, mode=0o700)
         self.owner_uid = owner_uid
+        self.inference_settlement_fence = None
         self.upgrader = Upgrader(self, keys=release_keys, fetch=fetch_release, launch=launch_worker,
                                  options=upgrade_options)
         self.jobs = jobs
@@ -718,7 +719,18 @@ class Executor:
         return payload
 
     def runner_admin(self, payload, proof_token, challenge):
-        """Execute an owner-approved runner change (setup, authorize a workspace, remove one). Synchronous."""
+        """Execute an owner-approved runner change. Settlement requires an exclusive worker fence."""
+        if type(payload) is dict and payload.get("action") == "settle_inference":
+            if self.inference_settlement_fence is None:
+                raise ExecutionDenied("inference_fence_unavailable")
+            try:
+                with self.inference_settlement_fence():
+                    return self._runner_admin(payload, proof_token, challenge)
+            except managed_activity.ActivityError as error:
+                raise ExecutionDenied(error.code) from None
+        return self._runner_admin(payload, proof_token, challenge)
+
+    def _runner_admin(self, payload, proof_token, challenge):
         self._check_payload(payload)
         self._no_other_change()
         if payload["action"] == "settle_inference":
@@ -807,6 +819,8 @@ class Executor:
             except managed_activity.ActivityError as error:
                 raise ExecutionDenied(error.code) from None
             return {"claim": claim if claim and claim["kind"] == "inference" else None}
+        if call in ("inference_claim", "inference_validate") and self.inference_settlement_fence is None:
+            raise ExecutionDenied("inference_fence_unavailable")
         if call == "inference_validate":
             if set(args) != {"job_id"} or type(args["job_id"]) is not str or not managed_activity.ID.fullmatch(args["job_id"]):
                 raise ExecutionDenied("activity_claim_invalid")

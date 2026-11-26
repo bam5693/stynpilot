@@ -51,7 +51,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import catalog, impact, root_restore, statelock
+from .. import catalog, impact, managed_activity, root_restore, statelock
 from ..ledger import InstallLedger, LedgerError
 from ..plan import PlanError, validate_plan
 from ..requests import request_id as payload_hash
@@ -639,6 +639,10 @@ class Executor:
                         or any(t.is_alive() for t in self._builds.values())
                         or self.jobs is None or not self.jobs.enabled() or self.jobs._live):
                     raise ExecutionDenied("restore_requires_idle_installer_and_runner")
+                try:
+                    managed_activity.require_idle(self.dir)
+                except managed_activity.ActivityError as error:
+                    raise ExecutionDenied(error.code) from None
                 if not root_restore.still_current(self.vault, payload):
                     raise ExecutionDenied("approved_restore_changed")
                 rid, _ = payload_hash(payload)
@@ -771,6 +775,22 @@ class Executor:
                     "gate_open": not root_restore.held(self.dir) and enabled and test.get("ok") is True and test.get("version") == jobs.version,
                     "workspaces": [name_of(w["path"]) for w in jobs.workspaces()],
                     "recipes": {rid: r.title for rid, r in sorted(runner_policy.RECIPES.items())}}
+        if call in ("inference_claim", "inference_finish"):
+            if set(args) != {"job_id"}:
+                raise ExecutionDenied("activity_claim_invalid")
+            try:
+                if call == "inference_claim":
+                    from ..local_ai import require_workspace, LocalAIError
+                    try:
+                        require_workspace(self._runner_green("status", {}))
+                    except LocalAIError as error:
+                        raise ExecutionDenied(error.code) from None
+                    managed_activity.claim(self.dir, "inference", args["job_id"])
+                else:
+                    managed_activity.finish(self.dir, "inference", args["job_id"])
+            except managed_activity.ActivityError as error:
+                raise ExecutionDenied(error.code) from None
+            return {"ok": True}
         if call == "selftest":
             return self._safe_selftest(jobs.selftest())
         if call == "workspaces":

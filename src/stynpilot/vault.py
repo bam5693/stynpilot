@@ -301,6 +301,7 @@ class Vault:
         self.limits = dict({"gather": MAX_GATHER, "file": MAX_ONE_FILE, "extra": MAX_EXTRA, "memory": CHILD_MEMORY}, **(limits or {}))
         self.isolate = isolate
         self.retention_source = retention_source              # owner side: the installer's approved setting is the authority
+        self.policy_confirmed = retention_source is None       # owner side: only after the installer's policy was confirmed
         self._aesgcm = aesgcm
         self._mutex = threading.Lock()
         self.key_file = self.folder / "backup-key"
@@ -319,14 +320,21 @@ class Vault:
 
     # .. retention settings (changed only through an owner-approved request) .....................................................
     def effective_retention(self):
-        """The approved setting in the vault (settings.json, private, ours), else the built-in default (self.retention)."""
+        """The approved setting in the vault (settings.json, private, ours), else the built-in default (self.retention).
+        ``trusted`` is False when a settings file EXISTS but cannot be trusted (damaged, loose, out of range): then nothing is pruned
+        (the owner approved a policy we cannot read; falling back to the default could delete backups it would keep)."""
+        path = self.folder / SETTINGS
+        if not os.path.lexists(str(path)):
+            return dict(self.retention, approved=None, at=None, trusted=True)
         try:
-            data = json.loads(_read_private(self.folder / SETTINGS, 4096).decode())
-            if (type(data) is dict and data.get("schema") == 1 and valid_retention(data.get("daily"), data.get("weekly"))):
-                return {"daily": data["daily"], "weekly": data["weekly"], "approved": data.get("request_id"), "at": data.get("at")}
+            data = json.loads(_read_private(path, 4096).decode())
+            if (type(data) is dict and data.get("schema") == 1 and valid_retention(data.get("daily"), data.get("weekly"))
+                    and type(data.get("request_id")) is str):
+                return {"daily": data["daily"], "weekly": data["weekly"], "approved": data["request_id"], "at": data.get("at"),
+                        "trusted": True}
         except (OSError, VaultError, ValueError, UnicodeError):
             pass
-        return dict(self.retention, approved=None, at=None)
+        return dict(self.retention, approved=None, at=None, trusted=False)
 
     def set_retention(self, daily, weekly, request_id):
         """Store an approved retention setting atomically. Bounds are enforced here too, whatever the caller checked."""
@@ -614,11 +622,27 @@ class Vault:
         skip, self._skip_retention = getattr(self, "_skip_retention", False), False
         if skip or index.get("damaged") or not self._valid_index(index):
             return []                                           # never delete anything on the strength of a doubtful index
+        retention = self.effective_retention()
+        if not retention["trusted"] or not self.policy_confirmed:
+            index["prune_held"] = "retention_settings_untrusted" if not retention["trusted"] else "retention_policy_unconfirmed"
+            return []                                           # back up and verify, but delete nothing under a doubtful policy
+        index.pop("prune_held", None)
         verified = sorted((info["created"], name) for name, info in index["backups"].items()
                           if info.get("verified_at") and (self.folder / name).is_file())
         if not verified:
             return []
         complete = [(c, n) for c, n in verified if not index["backups"][n].get("incomplete")]
+        if complete:
+            newest_complete = index["backups"][complete[-1][1]]
+            if int(self.clock()) - (newest_complete.get("checked_at") or newest_complete["verified_at"]) > DAY:
+                try:                                            # prune only on the strength of a FRESH check of the last good point
+                    self._verify(complete[-1][1], index)
+                    newest_complete["checked_at"] = int(self.clock())
+                except Exception as error:
+                    newest_complete["verified_at"], newest_complete["check_failed"] = None, True
+                    newest_complete["check_error"] = str(getattr(error, "code", type(error).__name__))[:80]
+                    index["prune_held"] = "newest_complete_backup_failed_its_check"
+                    return []
         keep = {verified[-1][1], protect}                       # the newest VERIFIED backup (and the one just made) are never deleted
         if complete:
             keep.add(complete[-1][1])                           # ... nor the newest COMPLETE verified one, however many partial follow
@@ -626,7 +650,6 @@ class Vault:
         for created, name in (complete or verified):            # the daily/weekly windows are filled with complete backups only
             days[time.strftime("%Y%m%d", time.gmtime(created))] = name
             weeks[time.strftime("%G%V", time.gmtime(created))] = name
-        retention = self.effective_retention()
         for groups, count in ((days, retention["daily"]), (weeks, retention["weekly"])):
             if count > 0:
                 keep |= {name for _, name in sorted(groups.items())[-count:]}
@@ -684,6 +707,7 @@ class Vault:
             entry = index["backups"][name]
             entry["verified_at"] = entry["checked_at"] = int(self.clock())
             index["last_success"], index["last_error"] = int(self.clock()), None
+            index.setdefault("full_check_at", int(self.clock()))   # durable start of the monthly schedule, independent of retention
             removed = self._retain(index, protect=name)
             self._save(index)
             return {"ok": True, "backup": name, "removed": len(removed), "excluded": entry["excluded"],
@@ -796,19 +820,31 @@ class Vault:
     # .. public ...................................................................................................................
     def _spec(self, op, manual):
         return {"side": self.side, "state_dir": str(self.state_dir), "folder": str(self.folder), "extras": self._extra_list(),
-                "version": self.version, "retention": self.retention, "limits": self.limits, "op": op, "manual": manual}
+                "version": self.version, "retention": self.retention, "limits": self.limits, "op": op, "manual": manual,
+                "policy_confirmed": self.policy_confirmed}
 
     def _sync_retention(self):
+        """Owner side: fetch the installer's policy. Pruning is allowed only when this run confirmed it (the installer answered
+        with a valid policy: an approved one, or 'none approved' = the default)."""
         if self.retention_source is None:
             return
+        self.policy_confirmed = False
         try:
             theirs = self.retention_source()
-            mine = self.effective_retention()
-            if (isinstance(theirs, dict) and theirs.get("approved") and valid_retention(theirs.get("daily"), theirs.get("weekly"))
-                    and (theirs["daily"], theirs["weekly"], theirs["approved"]) != (mine["daily"], mine["weekly"], mine["approved"])):
-                self.set_retention(theirs["daily"], theirs["weekly"], theirs["approved"])
         except Exception:
-            pass                                               # unreachable installer: keep the last setting we had
+            return                                             # unreachable installer: back up and verify, prune nothing
+        if not isinstance(theirs, dict) or not valid_retention(theirs.get("daily"), theirs.get("weekly")) or theirs.get("trusted") is False:
+            return
+        try:
+            mine = self.effective_retention()
+            if theirs.get("approved"):
+                if (theirs["daily"], theirs["weekly"], theirs["approved"]) != (mine["daily"], mine["weekly"], mine["approved"]):
+                    self.set_retention(theirs["daily"], theirs["weekly"], theirs["approved"])
+            elif os.path.lexists(str(self.folder / SETTINGS)):
+                return                                         # we hold an approved setting the installer no longer reports: hold
+            self.policy_confirmed = True
+        except Exception:
+            return
 
     def _run(self, op, manual=False):
         self._sync_retention()
@@ -874,7 +910,7 @@ class Vault:
         if any(not (self.folder / n).is_file() or now - (i.get("checked_at") or i["verified_at"]) >= DAY for n, i in watched.items()):
             done["recheck"] = self.recheck()
             index = self._index()
-        if verified and now - (index.get("full_check_at") or verified[0][2]["verified_at"]) >= FULL_CHECK_EVERY:
+        if verified and now - (index.get("full_check_at") or now) >= FULL_CHECK_EVERY:
             done["recheck_all"] = self.recheck_all()
             index = self._index()
         newest = max((i["verified_at"] or 0 for i in index["backups"].values()), default=0)
@@ -926,6 +962,11 @@ class Vault:
                 problems.append("no_complete_verified_backup")
             elif now - complete[-1]["created"] > OVERDUE_AFTER:
                 problems.append("complete_backup_overdue")
+            retention = self.effective_retention()
+            if not retention["trusted"]:
+                problems.append("retention_settings_untrusted")
+            if index.get("prune_held"):
+                problems.append("pruning_on_hold:" + str(index["prune_held"]))
             bad = [n for n, i in index["backups"].items() if i.get("check_failed")]
             if bad:
                 problems.append("backups_failed_a_recheck:%d" % len(bad))
@@ -966,6 +1007,7 @@ def _child():
         return                                                # fail closed: no heavy work without the limit
     v = Vault(side=spec["side"], state_dir=spec["state_dir"], folder=spec["folder"], extras=[tuple(e) for e in spec["extras"]],
               version=spec["version"], retention=spec["retention"], limits=spec["limits"])
+    v.policy_confirmed = spec.get("policy_confirmed") is True
     result = v._guard(lambda: v._op(spec["op"], spec["manual"]))
     sys.stdout.write(json.dumps(result) + "\n")
 def start_scheduler(vault, *, interval=3600, first_delay=30, stop=None):

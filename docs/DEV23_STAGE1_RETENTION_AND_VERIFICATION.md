@@ -21,3 +21,15 @@
 - A backup that fails stops counting (`check_failed`) but is never deleted by retention; status reports
   `backups_failed_a_recheck:<n>`, `no_complete_verified_backup`, `complete_backup_overdue`; if the newest complete one failed, a
   new backup is made at once.
+
+## Review corrections (fail-closed pruning)
+- A settings file that exists but cannot be trusted (damaged, unreadable, loose, out of range) no longer falls back to 7+4:
+  backups continue and are verified, but NOTHING is pruned (`retention_settings_untrusted`, `pruning_on_hold:<why>`).
+- Owner side: pruning only after this run confirmed the installer's policy (a valid answer: approved, or none approved). If the
+  installer is unreachable, answers with an untrusted policy, or no longer reports an approval the owner side holds, pruning is
+  held (`retention_policy_unconfirmed`).
+- Before pruning, the newest complete verified backup must have been checked within a day; if not, it is re-verified first, and
+  if that fails it is kept (check_failed) and nothing is pruned.
+- The monthly full check has a durable start (`full_check_at`, set at the first successful backup) and no longer depends on the
+  oldest retained backup; 65 days of daily backups under normal retention run it at least twice.
+- Release versions: the package dev number increments per release (stage 1 = 0.1.0.dev23); a published version is never reused.

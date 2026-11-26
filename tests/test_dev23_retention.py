@@ -47,9 +47,9 @@ class RetentionSettingTests(unittest.TestCase):
         settings = self.o.tmp / "vault" / vault.SETTINGS
         settings.write_text(json.dumps({"schema": 1, "daily": 0, "weekly": 0, "request_id": "c" * 64}))
         os.chmod(settings, 0o600)
-        self.assertEqual(self.vault.effective_retention()["daily"], 7)          # out of range on disk -> the safe default
+        self.assertFalse(self.vault.effective_retention()["trusted"])            # out of range on disk -> NOT trusted
         os.chmod(settings, 0o644)
-        self.assertIsNone(self.vault.effective_retention()["approved"])          # a loose file is not trusted
+        self.assertFalse(self.vault.effective_retention()["trusted"])            # a loose file is not trusted either
 
     def test_the_owner_side_follows_the_installers_approved_setting(self):
         self.vault.retention_source = lambda: {"daily": 3, "weekly": 2, "approved": "d" * 64}
@@ -62,6 +62,77 @@ class RetentionSettingTests(unittest.TestCase):
         self.vault.retention_source = lambda: {"daily": 0, "weekly": 99, "approved": "e" * 64}
         self.vault.backup_now()
         self.assertEqual(self.vault.effective_retention()["daily"], 3)           # an out-of-range answer is ignored
+
+
+@unittest.skipIf(door is None, "needs PyJWT, cryptography")
+class PruneFailClosedTests(unittest.TestCase):
+    """Review BLOCKER: a policy we cannot trust or confirm, or a stale check of the last good point, never leads to deletion."""
+
+    def setUp(self):
+        self.o = tv.OwnerVaultTests("test_status_shows_metadata_only")
+        self.o.setUp()
+        self.vault = self.o.vault
+
+    def count(self):
+        return len(list((self.o.tmp / "vault").glob("*.stynvault")))
+
+    def daily(self, n):
+        for _ in range(n):
+            self.o.clock.t += tv.DAY
+            self.assertTrue(self.vault.backup_now()["ok"])
+
+    def test_a_damaged_approved_settings_file_holds_all_pruning_but_backups_continue(self):
+        self.vault.set_retention(1, 0, "a" * 64)
+        self.daily(3)
+        self.assertEqual(self.count(), 1)                                        # the approved 1 daily works
+        (self.o.tmp / "vault" / vault.SETTINGS).write_text("{damaged")
+        self.daily(12)
+        self.assertEqual(self.count(), 13)                                       # nothing deleted, every day backed up
+        problems = self.vault.status()["problems"]
+        self.assertIn("retention_settings_untrusted", problems)
+        self.assertIn("pruning_on_hold:retention_settings_untrusted", problems)
+
+    def test_the_owner_side_prunes_only_after_confirming_the_installers_policy(self):
+        self.vault.retention_source = lambda: (_ for _ in ()).throw(OSError("installer down"))
+        self.vault.retention = {"daily": 1, "weekly": 0}
+        self.daily(5)
+        self.assertEqual(self.count(), 5)                                        # policy unconfirmed: nothing deleted
+        self.assertIn("pruning_on_hold:retention_policy_unconfirmed", self.vault.status()["problems"])
+        self.vault.retention_source = lambda: {"daily": 1, "weekly": 0, "approved": "b" * 64, "trusted": True}
+        self.daily(1)
+        self.assertEqual(self.count(), 1)                                        # confirmed: the approved rule applies
+        self.vault.retention_source = lambda: {"daily": 7, "weekly": 4, "approved": None, "trusted": True}
+        self.daily(3)
+        self.assertEqual(self.count(), 4)                                        # we hold an approval the installer lost: hold
+        self.vault.retention_source = lambda: {"daily": 7, "weekly": 4, "approved": None, "trusted": False}
+        self.daily(1)
+        self.assertIn("pruning_on_hold:retention_policy_unconfirmed", self.vault.status()["problems"])
+
+    def test_a_stale_verification_flag_is_rechecked_before_anything_is_pruned(self):
+        from stynpilot import service
+        self.vault.extras = [("owner.json", self.o.settings, "json", True, service.OWNER_KEYS)]
+        good = self.vault.backup_now()["backup"]
+        self.o.settings.write_text(json.dumps({"mcp_port": 8000, "github_token": "x"}))  # later backups are incomplete
+        self.vault.retention = {"daily": 1, "weekly": 0}
+        self.daily(2)
+        path = self.o.tmp / "vault" / good
+        data = bytearray(path.read_bytes())
+        data[-3] ^= 1
+        path.write_bytes(bytes(data))                                           # the last good point went bad since its check
+        self.daily(3)
+        names = {p.name for p in (self.o.tmp / "vault").glob("*.stynvault")}
+        self.assertIn(good, names)                                              # kept (check_failed), never pruned
+        self.assertTrue(any(p.startswith("backups_failed_a_recheck") for p in self.vault.status()["problems"]))
+
+    def test_monthly_full_checks_happen_under_normal_retention_over_60_days(self):
+        starts = []
+        real = self.vault.recheck_all
+        self.vault.recheck_all = lambda: starts.append(self.o.clock.t) or real()
+        for _ in range(65):
+            self.o.clock.t += tv.DAY
+            self.vault.tick()
+        self.assertGreaterEqual(len(starts), 2)                                  # due from the first backup, not the oldest kept one
+        self.assertLessEqual(self.count(), 2 + 7 + 4)
 
 
 @unittest.skipIf(door is None, "needs PyJWT, cryptography")

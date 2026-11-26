@@ -72,3 +72,27 @@ class SettlementTests(unittest.TestCase):
             self.assertFalse(s.empty_group(group))
             (group/"cgroup.events").write_text("populated 0\nfrozen 0\n")
             self.assertTrue(s.empty_group(group))
+
+    def test_normal_finish_requires_actual_idle_evidence(self):
+        data = {
+            "cgroup.procs": b"123\n",
+            "cgroup.stat": b"nr_descendants 0\nnr_dying_descendants 0\n",
+            "memory.current": b"123456",
+            "memory.swap.current": b"0",
+        }
+        def read(path, limit):
+            return data[path.name]
+        listener = b'LISTEN 0 4096 127.0.0.1:11435 0.0.0.0:* users:(("ollama",pid=123,fd=3))'
+        def verify():
+            now = iter((0, 11, 22))
+            s.verify_idle(self.uid, command=self.command, scan=lambda:listener, read=read,
+                          clock=lambda:next(now), sleep=lambda _:None)
+        verify()
+        for name, value in (("cgroup.procs", b"123\n124"), ("cgroup.stat", b"nr_descendants 1\nnr_dying_descendants 0"),
+                            ("memory.current", b"2147483648"), ("memory.swap.current", b"1")):
+            old = data[name]
+            data[name] = value
+            with self.assertRaises(ActivityError):
+                verify()
+            data[name] = old
+        self.assertNotIn("stop",self.calls)

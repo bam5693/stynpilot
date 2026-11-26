@@ -80,3 +80,35 @@ class ActivityTests(unittest.TestCase):
         with self.assertRaises(activity.ActivityError):
             activity.current(self.state)
         self.assertTrue(activity.held(self.state))
+
+
+    def test_inference_process_death_keeps_durable_reservation(self):
+        import subprocess
+        import sys
+        from stynpilot import local_ai
+        package_root = str(Path(local_ai.__file__).resolve().parent.parent)
+        script = """import os, sys, threading
+from stynpilot import managed_activity, local_ai
+state = sys.argv[1]
+def die(body, stop):
+    os._exit(17)
+jobs = local_ai.Jobs(die,
+    reserve=lambda jid: managed_activity.claim(state, "inference", jid),
+    finish=lambda jid: managed_activity.finish(state, "inference", jid))
+jobs.submit(("owner", "device", "client"), "synthetic prompt")
+threading.Event().wait(3)
+os._exit(19)
+"""
+        child = subprocess.run([sys.executable, "-c", script, str(self.state)],
+                               env={"PATH": "/usr/bin:/bin", "PYTHONPATH": package_root},
+                               capture_output=True, timeout=5, check=False)
+        self.assertEqual(child.returncode,17,child.stderr)
+        record=activity.current(self.state)
+        self.assertEqual(record["kind"],"inference")
+        with self.assertRaises(activity.ActivityError):
+            activity.require_idle(self.state)
+        with self.assertRaises(activity.ActivityError):
+            activity.claim(self.state,"dev_lab",self.job)
+        # Explicit exact settlement is the only way to free this test record.
+        activity.finish(self.state,"inference",record["job_id"])
+        activity.require_idle(self.state)

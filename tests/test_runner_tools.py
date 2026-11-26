@@ -80,6 +80,8 @@ class FakeBroker:
                     "selftest": {"ran": self.gate, "ok": self.gate}}
         if call == "workspaces":
             return {"workspaces": [{"name": w, "enrolled_at": 1} for w in self.workspaces]}
+        if call in ("inference_claim", "inference_finish"):
+            return {"ok": True}
         if call == "run":
             return {"job_id": "a" * 32, "argv": ["/usr/bin/git"], "limits": {}}
         return {"call": call, "args": args}

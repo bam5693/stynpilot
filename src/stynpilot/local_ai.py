@@ -15,6 +15,7 @@ MAX_REPLY = 65536
 MAX_JOBS = 8
 TTL = 600
 DEADLINE = 240
+AUTH_POLL = 0.5
 
 
 class LocalAIError(Exception):
@@ -116,7 +117,7 @@ class Jobs:
             if row["finished"] is not None and now - row["finished"] >= TTL:
                 del self._jobs[jid]
 
-    def submit(self, caller, prompt):
+    def submit(self, caller, prompt, *, authorize=None):
         body = request_body(prompt)
         with self._lock:
             self._prune()
@@ -132,7 +133,7 @@ class Jobs:
                    "finished": None, "output": None, "error": None}
             self._jobs[jid] = row
             self._active = jid
-            worker = threading.Thread(target=self._run, args=(jid, row, body), daemon=True)
+            worker = threading.Thread(target=self._run, args=(jid, row, body, authorize), daemon=True)
             try:
                 worker.start()
             except Exception:
@@ -141,9 +142,32 @@ class Jobs:
                 raise LocalAIError("local_ai_start_failed") from None
             return {"job_id": jid, "state": "running", "model": MODEL}
 
-    def _run(self, jid, row, body):
+    def _run(self, jid, row, body, authorize=None):
         output, error = None, "local_ai_unavailable"
+        completed = threading.Event()
+        monitor = None
+
+        def allowed():
+            try:
+                return authorize is None or authorize(jid) is True
+            except Exception:
+                return False
+
+        def watch_authority():
+            while not completed.wait(AUTH_POLL):
+                if not allowed():
+                    row["stop"].set()
+                    return
+
         try:
+            if not allowed():
+                row["stop"].set()
+                raise LocalAIError("local_ai_authorization_withdrawn")
+            if authorize is not None:
+                monitor = threading.Thread(target=watch_authority, daemon=True)
+                monitor.start()
+            if row["stop"].is_set():
+                raise LocalAIError("local_ai_cancelled")
             output = self._transport(body, row["stop"])
             error = None
             if type(output) is not str or len(output.encode("utf-8")) > MAX_REPLY:
@@ -153,6 +177,13 @@ class Jobs:
         except Exception:
             error = "local_ai_unavailable"
         finally:
+            completed.set()
+            if monitor is not None and monitor.ident is not None:
+                # Never start another job while a previous authority probe is
+                # outstanding. A hung check retains the claim and fails closed.
+                monitor.join()
+            if error is None and not row["stop"].is_set() and not allowed():
+                row["stop"].set()
             # Do not equate an HTTP disconnect with model-server quiescence.
             # Only a complete, validated response may settle this draft claim.
             # Cancellation, timeout, crash and uncertain completion retain it.

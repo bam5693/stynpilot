@@ -17,3 +17,25 @@ The packaged Stage 3 operation restores selected installer records using a verif
 For a scoped source review, run ShellCheck on `tools/dev/*.sh`, Pyflakes on the modified Python files, and Bandit with Python 3.14 support on the privileged code paths. Keep the findings with the candidate logs. These checks complement the package, runtime and confinement tests.
 
 For recovery fault scenarios, build media with `tools/dev/restore-media.sh PACKAGE --fault-cases` and require the serial marker `STYNPILOT_RESTORE_FAULT_CASES_OK`. This exercises a temporary owner endpoint outage and a persistent outage in the disposable guest. For a power interruption, build media with `--power-case` and launch with `--power-cycle-marker STYNPILOT_CUT_POWER_NOW --marker STYNPILOT_POWER_RECOVERY_OK`. Preserve both serial logs. A missing marker is a failed or incomplete run.
+
+
+## Restricted MCP integration (development only)
+
+The first integration stage adds `dev_lab_status`, a read-only, paired-device
+preflight that checks fixed owner lab metadata, KVM API access, available RAM
+and free work-volume storage. It returns booleans and planned scenario names,
+not host paths or raw cache files. Cache presence is NOT artifact integrity
+verification. A successful preflight never authorizes execution; launch remains
+disabled in this stage. The fixed default location is used; a custom lab
+location needs separate owner enrollment.
+
+The planned execution vocabulary is exact lowercase 40-hex Git commit and one
+of: offline_normal, offline_release_sandbox, static_checks, reproducible_build,
+guest_boot_smoke, guest_restore, guest_restore_faults, guest_power_recovery.
+No caller-selected commands, paths, URLs, ISO files, or success markers.
+Launch, progress, output, cancellation, owner enrollment and managed cleanup
+are not yet exposed. Before implementing launch, provision trusted immutable
+launcher and cache identity, make preparation strictly cache-only, isolate
+candidate builds and tests, and run in a bounded managed cgroup with private
+results and durable recovery exclusion. The current interactive launcher is
+not itself a remote execution trust boundary.

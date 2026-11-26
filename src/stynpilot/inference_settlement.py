@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import pwd
 import re
+import secrets
 import subprocess
 import time
 from pathlib import Path
@@ -24,21 +25,44 @@ def service_cgroup(uid):
 
 
 def owner_command(uid, operation):
-    """Run a fixed systemctl operation AS the enrolled unprivileged owner."""
+    """Fixed transient helper as the owner; installer retains ProtectHome=yes."""
+    if type(uid) is not int or uid <= 0 or operation not in ("show", "stop"):
+        raise ActivityError("inference_owner_invalid")
     account = pwd.getpwuid(uid)
-    if uid <= 0 or account.pw_uid != uid or operation not in ("show", "stop"):
+    if account.pw_uid != uid:
         raise ActivityError("inference_owner_invalid")
     argv = ["/usr/bin/systemctl", "--user", operation]
     if operation == "show":
         argv += ["--no-pager", "--property=LoadState,ActiveState,MainPID,ControlGroup"]
     argv.append(UNIT)
-    result = subprocess.run(
-        argv, user=uid, group=account.pw_gid, extra_groups=[], cwd="/",
-        env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
-             "XDG_RUNTIME_DIR": f"/run/user/{uid}",
-             "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus"},
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, timeout=5 if operation == "show" else 30, check=True)
+    timeout = 5 if operation == "show" else 30
+    unit = "stynpilot-inference-helper-" + secrets.token_hex(8)
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+    cmd = ["/usr/bin/systemd-run", "--pipe", "--wait", "--collect", "--quiet", "--unit", unit,
+           "--uid=" + str(uid), "--gid=" + str(account.pw_gid),
+           "-p", "RuntimeMaxSec=" + str(timeout), "-p", "TimeoutStopSec=5",
+           "-p", "ProtectSystem=strict", "-p", "PrivateNetwork=yes",
+           "-p", "PrivateTmp=yes", "-p", "NoNewPrivileges=yes",
+           "-p", "CapabilityBoundingSet=", "-p", "RestrictAddressFamilies=AF_UNIX",
+           "-p", "MemoryMax=128M", "-p", "TasksMax=32",
+           "--setenv=XDG_RUNTIME_DIR=/run/user/" + str(uid),
+           "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + str(uid) + "/bus",
+           "--", *argv]
+    try:
+        result = subprocess.run(cmd, cwd="/", env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=timeout + 7, check=True)
+    except subprocess.TimeoutExpired:
+        # Same bounded helper cleanup pattern as broker/helper.py. Never
+        # interpret a lost helper reply as a completed service operation.
+        try:
+            subprocess.run(["/usr/bin/systemctl", "kill", "--signal=SIGKILL", unit + ".service"],
+                           cwd="/", env=env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=2, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        raise ActivityError("inference_unit_helper_timed_out") from None
     if len(result.stdout) > 16384:
         raise ActivityError("inference_unit_evidence_invalid")
     return result.stdout.decode("utf-8")

@@ -293,7 +293,7 @@ class Vault:
     its own memory limit, so running out of memory or a crash there can never take the owner service or the installer down."""
 
     def __init__(self, *, side, state_dir, folder, extras=(), version="", clock=time.time, retention=None, aesgcm=None,
-                 space=shutil.disk_usage, isolate=False, limits=None, retention_source=None, prune_lease=None, prune_release=None):
+                 space=shutil.disk_usage, isolate=False, limits=None, retention_source=None, prune_allowed=True):
         if side not in ("owner", "root"):
             raise ValueError("side")
         self.side, self.state_dir, self.folder = side, Path(state_dir), Path(folder)
@@ -302,9 +302,7 @@ class Vault:
         self.limits = dict({"gather": MAX_GATHER, "file": MAX_ONE_FILE, "extra": MAX_EXTRA, "memory": CHILD_MEMORY}, **(limits or {}))
         self.isolate = isolate
         self.retention_source = retention_source              # owner side: the installer's approved setting is the authority
-        self.policy_confirmed = retention_source is None       # owner side: only inside a pruning lease (see _prune_under_lease)
-        self.prune_lease = prune_lease                         # owner side: () -> {"lease": token, "policy": {...}} from the installer
-        self.prune_release = prune_release or (lambda token: None)
+        self.prune_allowed = prune_allowed                     # False on the owner side in Dev23 stage 1 (see service.owner_vault)
         self._aesgcm = aesgcm
         self._mutex = threading.Lock()
         self._held = threading.local()
@@ -324,30 +322,44 @@ class Vault:
 
     # .. retention settings (changed only through an owner-approved request) .....................................................
     def effective_retention(self):
-        """The approved setting in the vault (settings.json, private, ours), else the built-in default (self.retention).
-        ``trusted`` is False when a settings file EXISTS but cannot be trusted (damaged, loose, out of range): then nothing is pruned
-        (the owner approved a policy we cannot read; falling back to the default could delete backups it would keep)."""
+        """The approved setting in the vault, else the built-in default (self.retention). ``trusted`` is False -- and nothing is
+        pruned -- unless the settings file EXACTLY matches the LATEST entry of the durable approval log (policy.log), or neither
+        exists (first-time default). Damage, a loose file, out-of-range values, a crash between the two writes, an older setting
+        than the latest approval or any uncertainty all hold pruning."""
         path = self.folder / SETTINGS
+        latest, evidence = self._latest_policy()
         if not os.path.lexists(str(path)):
-            # No settings file: the built-in default is trusted ONLY if no policy was ever approved here. Once one was, a missing
-            # file means a LOST approval, and pruning holds.
-            return dict(self.retention, approved=None, at=None, trusted=not self._policy_evidence())
+            return dict(self.retention, approved=None, at=None, trusted=not evidence)
         try:
             data = json.loads(_read_private(path, 4096).decode())
             if (type(data) is dict and data.get("schema") == 1 and valid_retention(data.get("daily"), data.get("weekly"))
-                    and type(data.get("request_id")) is str):
+                    and type(data.get("request_id")) is str
+                    and latest == (data["request_id"], data["daily"], data["weekly"])):
                 return {"daily": data["daily"], "weekly": data["weekly"], "approved": data["request_id"], "at": data.get("at"),
                         "trusted": True}
         except (OSError, VaultError, ValueError, UnicodeError):
             pass
         return dict(self.retention, approved=None, at=None, trusted=False)
 
-    def _policy_evidence(self):
+    def _latest_policy(self):
+        """(latest (request_id, daily, weekly) or None, whether any evidence exists). A damaged last line -> (None, True)."""
         log = self.folder / POLICY_LOG
+        if not os.path.lexists(str(log)):
+            return None, False
         try:
-            return os.path.lexists(str(log)) and (log.is_symlink() or os.lstat(str(log)).st_size > 0)
-        except OSError:
-            return True                                    # cannot tell: treat as "a policy existed" (holds pruning)
+            lines = [l for l in _read_private(log, 1 << 20).decode("ascii").splitlines() if l.strip()]
+        except (OSError, VaultError, UnicodeError):
+            return None, True
+        if not lines:
+            return None, False
+        parts = lines[-1].split()
+        if (len(parts) != 3 or not re.fullmatch(r"[0-9a-f]{64}", parts[0]) or not parts[1].isdigit() or not parts[2].isdigit()
+                or not valid_retention(int(parts[1]), int(parts[2]))):
+            return None, True
+        return (parts[0], int(parts[1]), int(parts[2])), True
+
+    def _policy_evidence(self):
+        return self._latest_policy()[1]
 
     def set_retention(self, daily, weekly, request_id):
         """Store an approved retention setting atomically. Bounds are enforced here too, whatever the caller checked."""
@@ -664,9 +676,12 @@ class Vault:
                     newest_complete["check_error"] = str(getattr(error, "code", type(error).__name__))[:80]
                     index["prune_held"] = "newest_complete_backup_failed_its_check"
                     return []
+        if not self.prune_allowed:
+            index["prune_held"] = "owner_side_pruning_disabled_until_safe_coordination"
+            return []
         retention = self.effective_retention()
-        if not retention["trusted"] or not self.policy_confirmed:
-            index["prune_held"] = "retention_settings_untrusted" if not retention["trusted"] else "retention_policy_unconfirmed"
+        if not retention["trusted"]:
+            index["prune_held"] = "retention_settings_untrusted"
             return []                                           # back up and verify, but delete nothing under a doubtful policy
         index.pop("prune_held", None)
         keep = {verified[-1][1], protect}                       # the newest VERIFIED backup (and the one just made) are never deleted
@@ -851,7 +866,7 @@ class Vault:
     def _spec(self, op, manual):
         return {"side": self.side, "state_dir": str(self.state_dir), "folder": str(self.folder), "extras": self._extra_list(),
                 "version": self.version, "retention": self.retention, "limits": self.limits, "op": op, "manual": manual,
-                "policy_confirmed": self.policy_confirmed}
+                "prune_allowed": self.prune_allowed}
 
     def _adopt(self, theirs):
         """Owner side: take over the installer's policy. True only if it is valid, trusted and consistent with what we hold."""
@@ -873,40 +888,9 @@ class Vault:
         except Exception:
             pass
 
-    def _prune_under_lease(self):
-        """Owner side, after a successful backup: prune only while the installer holds a LEASE that stops any retention change, and
-        only with the policy that lease returned. Index-only work (the child already refreshed the last good point's check)."""
-        if self.prune_lease is None:
-            return {"pruned": 0, "held": "retention_policy_unconfirmed"}
-        try:
-            lease = self.prune_lease()
-        except Exception:
-            lease = None
-        token = lease.get("lease") if isinstance(lease, dict) else None
-        try:
-            def prune():
-                index = self._index()
-                self.policy_confirmed = bool(token) and self._adopt(lease.get("policy"))
-                try:
-                    removed = self._retain(index, allow_verify=False)
-                finally:
-                    self.policy_confirmed = False
-                self._save(index)
-                return {"pruned": len(removed), "held": index.get("prune_held")}
-            return self._guard(prune)
-        finally:
-            if token:
-                try:
-                    self.prune_release(token)
-                except Exception:
-                    pass                                     # the lease also expires by itself
-
     def _run(self, op, manual=False):
         self._sync_retention()
-        result = self._run_op(op, manual)
-        if self.retention_source is not None and op == "backup" and isinstance(result, dict) and result.get("ok"):
-            result["retention"] = self._prune_under_lease()
-        return result
+        return self._run_op(op, manual)
 
     def _run_op(self, op, manual=False):
         if not self.isolate:
@@ -1068,7 +1052,7 @@ def _child():
         return                                                # fail closed: no heavy work without the limit
     v = Vault(side=spec["side"], state_dir=spec["state_dir"], folder=spec["folder"], extras=[tuple(e) for e in spec["extras"]],
               version=spec["version"], retention=spec["retention"], limits=spec["limits"])
-    v.policy_confirmed = spec.get("policy_confirmed") is True
+    v.prune_allowed = spec.get("prune_allowed") is True
     result = v._guard(lambda: v._op(spec["op"], spec["manual"]))
     sys.stdout.write(json.dumps(result) + "\n")
 def start_scheduler(vault, *, interval=3600, first_delay=30, stop=None):

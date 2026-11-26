@@ -92,54 +92,47 @@ class PruneFailClosedTests(unittest.TestCase):
         self.assertIn("retention_settings_untrusted", problems)
         self.assertIn("pruning_on_hold:retention_settings_untrusted", problems)
 
-    def owner_side(self, policy):
-        """Wire the vault like the owner service: policy reads and a pruning lease from a (fake) installer."""
-        installer = type("I", (), {})()
-        installer.policy, installer.leases, installer.released = policy, [], []
+    def test_owner_side_pruning_is_disabled_and_reported_while_backups_continue(self):
+        from stynpilot import service
+        owner = service.owner_vault(self.o.config, settings_path=self.o.settings, isolate=False, clock=self.o.clock,
+                                    space=self.o.space, retention_source=lambda: {"daily": 1, "weekly": 0, "approved": "b" * 64,
+                                                                                    "trusted": True})
+        owner.extras = self.vault.extras
+        for _ in range(12):
+            self.o.clock.t += tv.DAY
+            self.assertTrue(owner.backup_now()["ok"])
+        self.assertEqual(len(list((self.o.config.state_dir / "vault").glob("*.stynvault"))), 12)      # nothing deleted
+        status = owner.status()
+        self.assertIn("pruning_on_hold:owner_side_pruning_disabled_until_safe_coordination", status["problems"])
+        self.assertEqual(status["retention"]["daily"], 1)                        # the installer's policy is still shown
+        self.assertTrue(status["newest_complete_verified"])
 
-        def lease():
-            if installer.policy is None:
-                raise OSError("installer down")
-            installer.leases.append(dict(installer.policy))
-            return {"lease": "t%d" % len(installer.leases), "policy": dict(installer.policy)}
-        self.vault.retention_source = lambda: (dict(installer.policy) if installer.policy is not None
-                                               else (_ for _ in ()).throw(OSError("installer down")))
-        self.vault.prune_lease, self.vault.prune_release = lease, installer.released.append
-        self.vault.policy_confirmed = False
-        return installer
-
-    def test_the_owner_side_prunes_only_under_the_installers_lease_and_policy(self):
-        installer = self.owner_side(None)                                        # installer unreachable
+    def test_a_crash_between_the_two_policy_writes_holds_pruning(self):
+        self.vault.set_retention(5, 2, "a" * 64)
+        self.assertTrue(self.vault.effective_retention()["trusted"])
+        log = self.o.tmp / "vault" / vault.POLICY_LOG
+        with open(log, "a") as handle:                                          # a newer approval was logged, then power was lost
+            handle.write("%s 1 0\n" % ("f" * 64))                              # before settings.json changed
+        self.assertFalse(self.vault.effective_retention()["trusted"])            # settings no longer match the latest approval
         self.vault.retention = {"daily": 1, "weekly": 0}
-        self.daily(5)
-        self.assertEqual(self.count(), 5)                                        # policy unconfirmed: nothing deleted
-        self.assertIn("pruning_on_hold:retention_policy_unconfirmed", self.vault.status()["problems"])
-        installer.policy = {"daily": 1, "weekly": 0, "approved": "b" * 64, "trusted": True}
+        self.daily(6)
+        self.assertEqual(self.count(), 6)
+        self.assertIn("pruning_on_hold:retention_settings_untrusted", self.vault.status()["problems"])
+        with open(log, "a") as handle:
+            handle.write("garbage line\n")                                     # a damaged last entry is uncertain evidence
+        self.assertFalse(self.vault.effective_retention()["trusted"])
+        self.vault.set_retention(3, 0, "1" * 64)                                # a proper new approval restores trust
+        self.assertTrue(self.vault.effective_retention()["trusted"])
         self.daily(1)
-        self.assertEqual(self.count(), 1)                                        # confirmed under a lease: the approved rule applies
-        self.assertEqual(installer.released, ["t1"])                             # and the lease was released
-        installer.policy = {"daily": 7, "weekly": 4, "approved": None, "trusted": True}
-        self.daily(3)
-        self.assertEqual(self.count(), 4)                                        # we hold an approval the installer lost: hold
-        installer.policy = {"daily": 7, "weekly": 4, "approved": None, "trusted": False}
-        self.daily(1)
-        self.assertIn("pruning_on_hold:retention_policy_unconfirmed", self.vault.status()["problems"])
+        self.assertEqual(self.count(), 3)
 
-    def test_a_policy_approved_after_the_sync_is_the_one_pruning_uses(self):
-        installer = self.owner_side({"daily": 1, "weekly": 0, "approved": "c" * 64, "trusted": True})
-        self.daily(3)
-        self.assertEqual(self.count(), 1)
-        real_source = self.vault.retention_source
-        changed = {"daily": 5, "weekly": 0, "approved": "d" * 64, "trusted": True}
-
-        def sync_then_change():                                                 # the owner syncs the OLD policy, then a newer one
-            old = real_source()                                                 # is approved before pruning starts
-            installer.policy = changed
-            return old
-        self.vault.retention_source = sync_then_change
-        self.daily(4)
-        self.assertEqual(self.vault.effective_retention()["approved"], "d" * 64)
-        self.assertEqual(self.count(), 5)                                        # pruned with the NEWER rule (5 daily), not the old 1
+    def test_a_settings_file_matching_an_older_approval_is_not_trusted(self):
+        self.vault.set_retention(10, 4, "a" * 64)
+        old = (self.o.tmp / "vault" / vault.SETTINGS).read_bytes()
+        self.vault.set_retention(2, 0, "b" * 64)
+        (self.o.tmp / "vault" / vault.SETTINGS).write_bytes(old)                 # an older, different setting put back
+        os.chmod(self.o.tmp / "vault" / vault.SETTINGS, 0o600)
+        self.assertFalse(self.vault.effective_retention()["trusted"])
 
     def test_a_missing_settings_file_after_an_approval_holds_pruning(self):
         self.vault.set_retention(2, 0, "e" * 64)
@@ -212,19 +205,6 @@ class ApprovalTests(unittest.TestCase):
         self.assertEqual((result["ok"], result["daily"], result["weekly"]), (True, 10, 6))
         self.assertEqual(self.v.effective_retention()["approved"], door.request_id(payload)[0])
         self.denied("already_decided_or_used", self.executor.challenge, payload, "approve")      # never replayable
-
-    def test_no_retention_change_is_applied_while_the_owner_side_prunes(self):
-        lease = self.executor.take_prune_lease()
-        self.denied("backup_pruning_in_progress_try_again_shortly", self.executor.challenge, self.bpayload(), "approve")
-        payload = self.bpayload(daily=12)
-        self.executor.release_prune_lease("wrong token")
-        self.denied("backup_pruning_in_progress_try_again_shortly", self.executor.challenge, payload, "approve")
-        self.executor.release_prune_lease(lease)
-        out = self.executor.challenge(payload, "approve")                      # nothing was spent while it was held
-        self.assertTrue(self.executor.backup_admin(payload, self.proof(payload, out["challenge"]), out["challenge"])["ok"])
-        self.executor.take_prune_lease()
-        self.executor._prune_lease = (self.executor._prune_lease[0], 0)          # an expired lease no longer blocks
-        self.executor.challenge(self.bpayload(daily=13), "approve")
 
     def test_out_of_range_forged_or_expired_requests_change_nothing(self):
         for bad in (self.bpayload(daily=0), self.bpayload(weekly=13), self.bpayload(daily="7"), self.bpayload(action="restore"),

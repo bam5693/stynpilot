@@ -177,7 +177,6 @@ class Executor:
                  allow_remote_activation=False, authority=None, sleep=time.sleep):
         self.dir = Path(state_dir)
         self.vault = None                                      # the root backup vault (dev22), set by the installer at start
-        self._lease_lock, self._prune_lease = threading.Lock(), None
         if require_root and not apt.is_root():
             raise ExecutionDenied("installer_must_run_as_root")
         self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -557,29 +556,7 @@ class Executor:
             raise ExecutionDenied("plan_invalid_or_expired")
         if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
             raise ExecutionDenied("already_decided_or_used")
-        if self._prune_leased():
-            raise ExecutionDenied("backup_pruning_in_progress_try_again_shortly")   # checked BEFORE the approval is spent
         return payload
-
-    PRUNE_LEASE_SECONDS = 120
-
-    def take_prune_lease(self):
-        """The owner side is about to prune under the CURRENT policy: no retention change may be applied until it is released (or
-        expires). Independently enforced here, at the only place a retention change can happen."""
-        import secrets as _secrets
-        with self._lease_lock:
-            token = _secrets.token_hex(16)
-            self._prune_lease = (token, time.monotonic() + self.PRUNE_LEASE_SECONDS)
-            return token
-
-    def release_prune_lease(self, token):
-        with self._lease_lock:
-            if self._prune_lease and type(token) is str and self._prune_lease[0] == token:
-                self._prune_lease = None
-
-    def _prune_leased(self):
-        with self._lease_lock:
-            return bool(self._prune_lease and self._prune_lease[1] > time.monotonic())
 
     def backup_admin(self, payload, proof_token, challenge):
         """Execute an owner-approved backup setting change. Synchronous; nothing is deleted at this moment."""

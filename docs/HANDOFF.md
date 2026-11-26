@@ -40,9 +40,10 @@ disposable environments, never live security-critical state. Do not weaken any s
 - Branch `claude/dev23-stage1-retention`. First reviewed commit `9cc6a50` (version 0.1.0.dev23). ChatGPT review: architecture,
   payload validation, single-use approval, write gate and daily verification PASSED. The findings below are FIXED in commit
   `d2366356` and the second review's findings in the following commit (see the branch head and the private plan for exact
-  hashes and test numbers): a MISSING settings file after any approval (durable `policy.log` evidence) holds pruning, and owner-
-  side pruning happens only under an installer-held lease, with the lease's policy (no retention change can be applied while the
-  lease is held).
+  hashes and test numbers): settings are trusted only if they exactly match the latest durable `policy.log` entry (missing,
+  inconsistent or damaged evidence holds pruning), and owner-side pruning is DISABLED for this stage (reported as a hold;
+  owner backups and checks continue). REQUIRED FOLLOW-UP: safe owner-side pruning with coordination that survives concurrent
+  installer connections and restarts (no timeout-based leases).
   **Exact next action:** ChatGPT focused review of the branch head -> if PASS, automated release as 0.1.0~dev23 -> live checks
   -> start Dev23 stage 2 (secure key rotation) on a NEW branch from the released commit, package version 0.1.0.dev24.
 - Findings (now fixed):

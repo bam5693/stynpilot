@@ -227,6 +227,9 @@ def owner_vault(config, *, settings_path=None, **kw):
     extras = [("owner.json", settings, "json", True, OWNER_KEYS), ("pairing.sqlite3", config.pairing_db, "sqlite", True, None),
               ("read-roots.json", config.state_dir / PROJECT_ROOTS_FILE, "json", False, {"project_roots"})]
     kw.setdefault("isolate", True)
+    # Owner-side PRUNING is disabled in Dev23 stage 1: it would need coordination with the installer's policy that survives
+    # concurrency and restarts (tracked follow-up). Owner backups and verification continue; the hold is reported.
+    kw.setdefault("prune_allowed", False)
     return vault.Vault(side="owner", state_dir=config.state_dir, folder=config.state_dir / "vault", extras=extras,
                        version=__version__, **kw)
 
@@ -325,9 +328,7 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
         from .diagnostics import Diagnostics
         from .system_status import SystemStatus
         home = os.path.expanduser("~")
-        service.vault = vault or owner_vault(config, retention_source=lambda: broker.vault_settings(),
-                                             prune_lease=lambda: broker.vault_prune_lease(),
-                                             prune_release=lambda token: broker.vault_prune_release(token))
+        service.vault = vault or owner_vault(config, retention_source=lambda: broker.vault_settings())
         diag = dict(policy=safefs.Policy(home=home,
                                          project_roots=safefs.load_project_roots(state / PROJECT_ROOTS_FILE, home),
                                          extra_deny=[config.state_dir, config.pairing_db, config.broker_socket]),

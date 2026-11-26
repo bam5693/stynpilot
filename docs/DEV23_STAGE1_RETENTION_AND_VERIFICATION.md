@@ -34,12 +34,14 @@
   oldest retained backup; 65 days of daily backups under normal retention run it at least twice.
 - Release versions: the package dev number increments per release (stage 1 = 0.1.0.dev23); a published version is never reused.
 
-## Second focused review
-- Durable approval evidence: every applied policy is appended (fsynced) to `policy.log` BEFORE settings.json is written. A missing
-  settings.json is the trusted built-in default only when no policy was ever approved there; otherwise it is a lost approval and
-  pruning holds (`retention_settings_untrusted`).
-- Owner/installer race closed by independently enforced coordination: the owner side prunes only inside a lease taken from the
-  installer (`vault_prune_lease`, 120 s) and only with the policy that lease returned; while a lease is held the installer refuses
-  to apply a retention change (`backup_pruning_in_progress_try_again_shortly`, checked before any approval is spent). Pruning
-  runs in the owner service itself but is index-only (the worker already re-verified the last good point); any failure holds.
-- Root side: a retention change already waits for the vault lock, so it can never change the rule under a running backup.
+## Second and third focused reviews
+- Crash consistency: every applied policy is appended (fsynced) to `policy.log` BEFORE settings.json is written, and a setting is
+  trusted only if settings.json EXACTLY matches the LATEST log entry (request id, daily, weekly). A missing settings file is the
+  first-time default only when the log has no entries. A crash between the two writes, an older setting than the latest
+  approval, a damaged last log entry, a loose or damaged file: pruning holds (`retention_settings_untrusted`).
+- Owner-side pruning is DISABLED in this stage (the earlier lease design was not robust across concurrent installer connections,
+  restarts and expiry, so it was removed rather than patched with timeouts). Owner backups, verification, re-checks and drills
+  continue; status reports `pruning_on_hold:owner_side_pruning_disabled_until_safe_coordination`. Owner backups are small
+  (~170 KB each). Safe owner pruning is a required follow-up.
+- Root side: pruning continues under the vault lock (a retention change waits for any running backup operation) with the
+  crash-consistent policy check above. Retention changes are serialized by the installer's one-change-at-a-time lock.

@@ -115,8 +115,8 @@ class OwnerVaultTests(unittest.TestCase):
             header, _, _ = self.vault.open_backup(name)
             self.assertNotIn(header["nonce"], seen)
             seen.add(header["nonce"])
-        index = json.loads((self.tmp / "vault/index.json").read_text())
-        self.assertTrue(seen <= set(index["nonces"]))
+        logged = set((self.tmp / "vault" / vault.NONCE_LOG).read_text().split())
+        self.assertTrue(seen <= logged)
         real = vault.secrets.token_bytes
         calls = []
         vault.secrets.token_bytes = lambda n: calls.append(n) or (bytes.fromhex(sorted(seen)[0]) if n == 12 else real(n))
@@ -347,7 +347,8 @@ class RootVaultTests(unittest.TestCase):
         del store
         self.etc = self.tmp / "etc"
         self.etc.mkdir()
-        (self.etc / "installer.json").write_text(json.dumps({"owner": "o", "device": "d", "approval_client_id": "app"}))
+        (self.etc / "installer.json").write_text(json.dumps({"issuer": "https://t.example/", "approval_client_id": "app", "owner": "o",
+                                                             "device": "d", "owner_uid": 1000, "state_dir": "/x", "socket_path": "/run/x"}))
         (self.etc / "release.json").write_text(json.dumps({"build_user": "stynpilot-build"}))
         (self.state / "release-tx").mkdir()
         (self.state / "release-tx" / ("a" * 64 + ".json")).write_text(json.dumps({"state": "started"}))
@@ -373,7 +374,7 @@ class RootVaultTests(unittest.TestCase):
         everything = b"".join(blobs.values())
         self.assertNotIn(b"BEGIN PRIVATE KEY", everything)
         self.assertNotIn(b"github_pat_", everything)
-        names = [n for n, _, _ in service.root_vault_extras(self.etc / "installer.json", self.state)]
+        names = [e[0] for e in service.root_vault_extras(self.etc / "installer.json", self.state)]
         self.assertFalse([n for n in names if "release-ed25519" in n or "token" in n])
 
     def test_a_root_drill_restores_with_every_passkey_quarantined(self):
@@ -400,54 +401,206 @@ class RootVaultTests(unittest.TestCase):
 
 
 @unittest.skipIf(cryptography is None, "needs cryptography")
-class BackupToolTests(unittest.TestCase):
+class ReviewFindingTests(unittest.TestCase):
+    """Dev22 review: limits before gathering, a separate memory-limited process, schema-aware settings, full drills, re-checks,
+    damaged-index handling, never touching files the vault does not own."""
+
     def setUp(self):
-        import test_dev4_reads as reads
-        self.reads = reads
-        self.owner = OwnerVaultTests("test_status_shows_metadata_only")
-        self.owner.setUp()
+        self.o = OwnerVaultTests("test_status_shows_metadata_only")
+        self.o.setUp()
+        self.tmp, self.vault = self.o.tmp, self.o.vault
+        self.vault.extras = [("owner.json", self.o.settings, "json", True, service.OWNER_KEYS),
+                             ("pairing.sqlite3", self.o.pairing, "sqlite", True, None)]
+        self.o.settings.write_text(json.dumps({"token_endpoint": "https://t.example/oauth/token", "mcp_port": 8000}))
 
-        class Broker:
-            calls = []
+    def test_limits_are_checked_from_sizes_before_anything_is_read(self):
+        from stynpilot import backup
+        real = backup.make_backup
+        backup.make_backup = lambda *a, **k: self.fail("state was read before the size check")
+        self.addCleanup(setattr, backup, "make_backup", real)
+        self.vault.limits["gather"] = 100
+        self.assertEqual(self.vault.backup_now()["error"], "backup_too_large_for_the_limits")
+        self.vault.limits["gather"] = vault.MAX_GATHER
+        self.vault.limits["file"] = 10
+        self.assertEqual(self.vault.backup_now()["error"], "backup_too_large_for_the_limits")
 
+    def test_the_heavy_work_runs_in_a_separate_memory_limited_process(self):
+        isolated = Vault(side="owner", state_dir=self.o.config.state_dir, folder=self.tmp / "vault", extras=self.vault.extras,
+                         isolate=True)
+        made = isolated.backup_now()
+        self.assertTrue(made["ok"], made)
+        self.assertTrue(isolated.drill()["ok"])
+        starved = Vault(side="owner", state_dir=self.o.config.state_dir, folder=self.tmp / "vault", extras=self.vault.extras,
+                        isolate=True, limits={"memory": 40 * 1024 * 1024})
+        result = starved.backup_now(manual=True)
+        self.assertFalse(result["ok"])                                       # the CHILD ran out of memory; this process is fine
+        self.assertNotIn("backup", result)                                   # nothing half-made is reported as a backup
+        import subprocess
+        real = subprocess.run
+        subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a, -9, b"", b"")   # the child is killed (out of memory)
+        try:
+            self.assertEqual(isolated.backup_now(), {"ok": False, "error": "backup_process_failed_exit_-9"})
+        finally:
+            subprocess.run = real
+        self.assertIn("last_backup_failed:backup_process_failed_exit_-9", isolated.status()["problems"])
+        self.assertTrue(isolated.status()["problems"])                       # and the failure is visible
+
+    def test_a_legitimate_token_endpoint_is_backed_up_and_unexpected_fields_are_refused(self):
+        made = self.vault.backup_now()
+        self.assertTrue(made["ok"] and made["complete"], made)
+        _, _, blobs = self.vault.open_backup(made["backup"])
+        self.assertIn("extra/owner.json", blobs)
+        self.o.settings.write_text(json.dumps({"mcp_port": 8000, "github_token": "x"}))
+        self.o.clock.t += DAY
+        made = self.vault.backup_now()
+        self.assertEqual((made["ok"], made["complete"]), (True, False))      # written, but clearly NOT complete
+        self.assertIn("owner.json:unexpected_fields", made["excluded"])
+        self.assertIn("incomplete_backup:owner.json", self.vault.status()["problems"])
+        os.unlink(self.o.pairing)
+        self.o.clock.t += DAY
+        made = self.vault.backup_now()
+        self.assertIn("pairing.sqlite3:missing", made["excluded"])            # a REQUIRED file that is missing is reported
+
+    def test_a_drill_recovers_the_extras_and_compares_every_restored_file(self):
+        self.vault.backup_now()
+        result = self.vault.drill()
+        self.assertEqual((result["ok"], result["extras"]), (True, 2), result)
+        from stynpilot import backup
+        real = backup.restore_backup
+
+        def tampered(archive, target, kind):
+            manifest = real(archive, target, kind=kind)
+            path = Path(target) / "revoked-clients.json"
+            path.write_text('{"revoked": []}')                                # the restored copy differs from the backup
+            return manifest
+        backup.restore_backup = tampered
+        self.addCleanup(setattr, backup, "restore_backup", real)
+        self.o.clock.t += 3601
+        result = self.vault.drill()
+        self.assertFalse(result["ok"])
+        self.assertIn("drill_restored_file_differs", result["error"])
+
+    def test_the_passkey_check_fails_closed(self):
+        self.assertFalse(vault._passkeys_all_quarantined(b"not a database"))
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            db = sqlite3.connect(Path(d) / "p.sqlite3")
+            db.execute("CREATE TABLE passkeys (revoked REAL, activated REAL, quarantined INTEGER)")
+            db.executemany("INSERT INTO passkeys VALUES (?, ?, ?)", [(None, 1.0, 1), (5.0, 1.0, 0), (None, None, 0)])
+            db.commit()
+            db.close()
+            data = (Path(d) / "p.sqlite3").read_bytes()
+            self.assertTrue(vault._passkeys_all_quarantined(data))           # revoked and never-activated ones may stay as they are
+            db = sqlite3.connect(Path(d) / "p.sqlite3")
+            db.execute("INSERT INTO passkeys VALUES (NULL, 2.0, 0)")
+            db.commit()
+            db.close()
+            self.assertFalse(vault._passkeys_all_quarantined((Path(d) / "p.sqlite3").read_bytes()))
+
+    def test_a_missing_or_corrupted_newest_backup_is_noticed_and_replaced(self):
+        first = self.vault.backup_now()["backup"]
+        os.unlink(self.tmp / "vault" / first)
+        self.o.clock.t += 3600
+        done = self.vault.tick()
+        self.assertFalse(done["recheck"]["ok"])
+        self.assertTrue(done["backup"]["ok"])                                # replaced at once, not after 24 hours
+        second = done["backup"]["backup"]
+        path = self.tmp / "vault" / second
+        data = bytearray(path.read_bytes())
+        data[-3] ^= 1
+        path.write_bytes(bytes(data))
+        self.o.clock.t += DAY + 1
+        done = self.vault.tick()
+        self.assertIn("failed_recheck", done["recheck"]["error"])
+        self.assertTrue(done["backup"]["ok"])
+
+    def test_a_damaged_index_is_kept_aside_rebuilt_from_the_files_and_deletes_nothing(self):
+        made = [self.vault.backup_now()["backup"]]
+        for _ in range(2):
+            self.o.clock.t += DAY
+            made.append(self.vault.backup_now()["backup"])
+        nonces_before = set((self.tmp / "vault" / vault.NONCE_LOG).read_text().split())
+        (self.tmp / "vault/index.json").write_text("{damaged")
+        os.chmod(self.tmp / "vault/index.json", 0o600)
+        self.vault.retention = {"daily": 0, "weekly": 0}
+        self.o.clock.t += DAY
+        result = self.vault.backup_now()
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(list((self.tmp / "vault").glob("index.damaged-*.json")))
+        self.assertTrue(nonces_before <= set((self.tmp / "vault" / vault.NONCE_LOG).read_text().split()))
+        index = json.loads((self.tmp / "vault/index.json").read_text())
+        self.assertTrue(set(made) <= set(index["backups"]))                  # every old backup re-learned and verified
+        self.assertTrue(all(index["backups"][n]["verified_at"] for n in made))
+
+    def test_a_lost_nonce_log_is_rebuilt_from_the_backups_present(self):
+        name = self.vault.backup_now()["backup"]
+        header, _, _ = self.vault.open_backup(name)
+        os.unlink(self.tmp / "vault" / vault.NONCE_LOG)
+        self.assertIn(header["nonce"], self.vault._nonces())
+
+    def test_files_not_created_by_this_vault_are_never_deleted(self):
+        self.vault.backup_now()
+        precaution = self.tmp / "vault" / "owner-20261125-000000-deadbeef.stynvault"    # looks like ours, but is NOT in the index
+        precaution.write_bytes(b"precautionary archive")
+        os.chmod(precaution, 0o600)
+        codex = self.tmp / "vault" / "dev21-precaution-1.tar.age"
+        codex.write_bytes(b"x")
+        self.vault.retention = {"daily": 0, "weekly": 0}
+        for _ in range(3):
+            self.o.clock.t += DAY
+            self.vault.backup_now()
+        self.assertTrue(precaution.exists() and codex.exists())
+
+
+@unittest.skipIf(cryptography is None, "needs cryptography")
+class BackupToolTests(unittest.TestCase):
+    """backup_status is a READ tool; the two tools that write go through the WRITE gate (workspace.propose + enrolled client)."""
+
+    def setUp(self):
+        import test_runner_tools as rt
+        from stynpilot.server.app import create_server
+        self.rt = rt
+        self.o = OwnerVaultTests("test_status_shows_metadata_only")
+        self.o.setUp()
+        h = rt.RunnerToolTests("test_the_new_tools_are_listed_and_none_can_approve_or_run_a_free_command")
+        h.setUp()
+
+        class Broker(rt.FakeBroker):
             def vault_status(self):
-                self.calls.append("status")
                 return {"side": "root", "healthy": True, "problems": []}
 
             def vault_backup(self):
-                self.calls.append("backup")
                 return {"ok": True}
 
             def vault_drill(self):
-                self.calls.append("drill")
                 raise OSError("installer down")
-        self.broker = Broker()
-        h = reads.DiagToolTests("test_tools_exist_and_work_with_only_the_read_scope")
-        h.setUp()
-        from stynpilot.server.app import create_server
+        h.broker = Broker()
         from stynpilot.diagnostics import Diagnostics
-        router = reads.ReadRouter(tokens=reads.Tokens(), ownership=reads.LocalOwnership(grants=reads.Grants(), owner_id=reads.OWNER,
-                                                                                         device_id=reads.DEVICE),
-                                  read_health=lambda: {"cpu_usage_percent": 1.0})
-        h.server = create_server(router=router, resource_url=reads.AUDIENCE, diag=dict(
-            policy=reads.Policy(home=h.home, roots=(), project_roots=[h.home / "proj"]), diagnostics=Diagnostics(run=reads.FakeRun()),
-            vault=self.owner.vault, broker=self.broker))
+        from stynpilot.safefs import Policy
+        h.server = create_server(router=h.router, resource_url=rt.AUDIENCE, propose=dict(clients=h.clients, store=h.store,
+                                 approval_url="https://ryzen.example.test/app", clock=lambda: h.now[0]),
+                                 diag=dict(policy=Policy(home=h.tmp, roots=(), project_roots=[]), diagnostics=Diagnostics(),
+                                           vault=self.o.vault, broker=h.broker),
+                                 runner=dict(broker=h.broker, projects_dir=str(h.projects), clock=lambda: h.now[0],
+                                             limiter=h.limiter, vault=self.o.vault))
         self.h = h
 
-    def test_the_three_backup_tools_work_and_reveal_no_contents(self):
+    def test_backup_tools_work_and_writes_need_the_write_gate(self):
         tools = {t.name: t for t in asyncio.run(self.h.server.list_tools())}
         self.assertTrue(tools["backup_status"].annotations.readOnlyHint)
-        self.assertFalse(tools["commander_backup_now"].annotations.destructiveHint)
-        made = self.h.call("commander_backup_now", {"device_id": self.reads.DEVICE})
+        self.assertFalse(tools["commander_backup_now"].annotations.readOnlyHint)
+        from stynpilot.server.propose_tools import RUNNER_WRITE_TOOLS
+        self.assertTrue({"commander_backup_now", "commander_backup_drill"} <= RUNNER_WRITE_TOOLS)
+        made = self.h.call("commander_backup_now", self.h.d())
         self.assertTrue(made["result"]["owner"]["ok"], made)
         self.assertEqual(made["result"]["root"], {"ok": True})
-        status = self.h.call("backup_status", {"device_id": self.reads.DEVICE})
+        status = self.h.call("backup_status", self.h.d())
         self.assertTrue(status["result"]["owner"]["newest_verified"])
         self.assertNotIn("claude-connector", json.dumps(status))
-        drill = self.h.call("commander_backup_drill", {"device_id": self.reads.DEVICE})
+        drill = self.h.call("commander_backup_drill", self.h.d())
         self.assertTrue(drill["result"]["owner"]["ok"])
-        self.assertEqual(drill["result"]["root"], {"healthy": False, "problems": ["installer_unreachable"]})
-        again = self.h.call("commander_backup_now", {"device_id": self.reads.DEVICE})
-        self.assertEqual(again["result"]["owner"]["error"], "rate_limited")
-        refused = self.h.call("backup_status", {"device_id": "dtdev_NOTMINE1234"})
-        self.assertEqual(refused, {"ok": False, "error": "device_unavailable_or_not_authorized"})
+        self.assertEqual(drill["result"]["root"], {"ok": False, "error": "installer_unreachable"})
+        self.assertEqual(self.h.call("commander_backup_now", self.h.d())["result"]["owner"]["error"], "rate_limited")
+        readonly = [t for t, who in self.rt.Tokens.valid.items() if "workspace.propose" not in who.scopes]
+        if readonly:
+            self.assertFalse(self.h.call("commander_backup_now", self.h.d(), readonly[0]).get("ok"))

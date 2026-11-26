@@ -25,3 +25,25 @@ backs up the root side as root. Each side has its own key and can open only its 
 - Tools: backup_status (GREEN, read-only, metadata only), commander_backup_now and commander_backup_drill (GREEN, owner side then
   root side, rate limited 10 min / 1 h). Retention changes, key export, external destinations and live restore are YELLOW (Dev23/24).
 - Failures never stop the services: every error is recorded and shown (overdue, key missing, corruption, low storage, failed drill).
+
+## Review corrections (focused review)
+- Resource safety: every backup, verification, re-check and drill runs in a separate short-lived process (`python3 -I`, address
+  space limited to 1280 MiB); the owner service and the installer only read the small index. A child that runs out of memory,
+  crashes or times out is recorded (`backup_process_failed_exit_N`) and the service carries on. Sizes are checked from `lstat`
+  BEFORE anything is read: 256 MiB per backup, 128 MiB per state file, 16 MiB per settings file.
+- Settings are checked against their own schema (owner.json = OWNER_KEYS, so token_endpoint is fine; installer.json,
+  passkeys.json, release.json, read-roots.json, trusted-release-keys.json likewise); unexpected fields are refused. Required files
+  (owner.json, the pairing database; installer.json) that are missing or refused make the backup `complete: false`, reported as
+  `incomplete_backup:<names>`.
+- Drills restore the state archive AND every extra into the scratch folder, compare every restored file's hash with the backup
+  (the passkey database must instead have every activated, non-revoked passkey quarantined; any SQLite error fails), and run
+  integrity checks.
+- Re-checks: the newest verified backup is checked for presence hourly and fully daily; a missing or damaged one stops counting
+  and a replacement backup is made at once.
+- Index: schema and every name are validated before retention may delete anything; a damaged index is kept aside
+  (`index.damaged-<time>.json`), rebuilt from the backup files themselves (each re-verified) and retention is skipped in that run.
+  Nonces live in an append-only, fsynced `nonces.log` (plus the headers of every backup present), independent of the index.
+- Retention deletes only files named like its own backups AND listed in its own index; anything else in or near the vault
+  (including Codex's two precautionary Dev21 archives, wherever they are kept) is never touched.
+- commander_backup_now and commander_backup_drill go through the write gate (workspace.propose + an enrolled client), like the
+  other tools that change something; backup_status stays a read tool.

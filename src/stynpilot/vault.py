@@ -55,10 +55,15 @@ MANUAL_BACKUP_EVERY = 600              # rate limits for requests from assistant
 MANUAL_DRILL_EVERY = 3600
 OVERDUE_AFTER = 2 * DAY
 DEFAULT_RETENTION = {"daily": 7, "weekly": 4}
-MAX_BACKUP = 2 * 1024 * 1024 * 1024
-MAX_EXTRA = 64 * 1024 * 1024
-MAX_NONCES = 50000
+# Conservative limits, checked from file sizes BEFORE anything is read (the real state is a few MB).
+MAX_GATHER = 256 * 1024 * 1024          # everything one backup may read
+MAX_ONE_FILE = 128 * 1024 * 1024        # any single state or extra file
+MAX_BACKUP = MAX_GATHER + (16 << 20)     # a stored backup file (bundle + overhead)
+MAX_EXTRA = 16 * 1024 * 1024            # one settings/extra file
 SPACE_MARGIN = 64 * 1024 * 1024
+CHILD_MEMORY = 1280 * 1024 * 1024       # address-space limit of the separate process that does the heavy work
+CHILD_TIMEOUT = 1800
+NONCE_LOG = "nonces.log"
 _SECRET_BYTES = (b"BEGIN PRIVATE KEY", b"BEGIN OPENSSH PRIVATE KEY", b"BEGIN RSA PRIVATE KEY", b"BEGIN EC PRIVATE KEY",
                  b"ghp_", b"github_pat_", b"gho_", b"ghs_")
 _SECRET_KEY = re.compile(r"(token|secret|password|passphrase|private|api[_-]?key|credential)", re.I)
@@ -137,26 +142,74 @@ def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _secret_free(name, data):
-    """True when a file may be backed up: no private-key or GitHub-token markers, and (for JSON) no secret-named key."""
+def _secret_free(name, data, allowed_keys=None):
+    """Why a file may NOT be backed up, or None. No private-key or GitHub-token markers anywhere. A settings file with a known schema
+    must be a JSON object whose top-level keys are within that schema (so a legitimate field such as token_endpoint is fine, and an
+    unexpected field is refused); a file without a schema must have no secret-named key at any depth."""
     if any(marker in data for marker in _SECRET_BYTES):
-        return False
+        return "looks_like_a_secret"
+    if allowed_keys is not None:
+        try:
+            doc = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            return "unreadable_json"
+        if type(doc) is not dict or set(doc) - set(allowed_keys):
+            return "unexpected_fields"
+        return None
     if name.endswith(".json"):
         try:
             doc = json.loads(data.decode("utf-8"))
         except (ValueError, UnicodeError):
-            return False
+            return "unreadable_json"
         stack = [doc]
         while stack:
             item = stack.pop()
             if isinstance(item, dict):
                 for key, value in item.items():
-                    if _SECRET_KEY.search(str(key)) and key not in ("approval_client_id",):
-                        return False
+                    if _SECRET_KEY.search(str(key)):
+                        return "looks_like_a_secret"
                     stack.append(value)
             elif isinstance(item, list):
                 stack.extend(item)
-    return True
+    return None
+
+
+def _state_sizes(state_dir, side):
+    """(total bytes, largest file) of what backup.make_backup will read, from sizes alone (nothing is opened)."""
+    state_dir = Path(state_dir)
+    names = list(backup.OWNER_FILES) if side == "owner" else list(backup.ROOT_DBS) + list(backup.ROOT_OPTIONAL_DBS)
+    total = largest = 0
+    for name in names:
+        try:
+            size = os.lstat(str(state_dir / name)).st_size
+        except FileNotFoundError:
+            continue
+        total, largest = total + size, max(largest, size)
+    if side == "root":
+        for tree in backup.ROOT_TREES:
+            for path in (state_dir / tree).rglob("*") if (state_dir / tree).is_dir() else ():
+                if path.is_file() and not path.is_symlink():
+                    size = path.lstat().st_size
+                    total, largest = total + size, max(largest, size)
+    return total, largest
+
+
+def _passkeys_all_quarantined(data):
+    """True only if the database opens and EVERY activated, non-revoked passkey is quarantined (as quarantine_after_restore makes
+    them). Any SQLite error is a failure (fail closed)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = Path(tmp) / "p.sqlite3"
+        copy.write_bytes(data)
+        try:
+            db = sqlite3.connect("file:%s?mode=ro" % copy, uri=True)
+            try:
+                live = db.execute("SELECT COUNT(*) FROM passkeys WHERE revoked IS NULL AND activated IS NOT NULL "
+                                  "AND quarantined != 1").fetchone()[0]
+                return live == 0
+            finally:
+                db.close()
+        except sqlite3.Error:
+            return False
 
 
 def _sqlite_ok(data):
@@ -224,49 +277,127 @@ def unpack_bundle(data):
 
 # -- the vault -----------------------------------------------------------------------------------------------------------------
 class Vault:
+    """One side's vault. The heavy work (reading, encrypting, decrypting, restoring) runs in a SEPARATE short-lived process with
+    its own memory limit, so running out of memory or a crash there can never take the owner service or the installer down."""
+
     def __init__(self, *, side, state_dir, folder, extras=(), version="", clock=time.time, retention=None, aesgcm=None,
-                 space=shutil.disk_usage):
+                 space=shutil.disk_usage, isolate=False, limits=None):
         if side not in ("owner", "root"):
             raise ValueError("side")
         self.side, self.state_dir, self.folder = side, Path(state_dir), Path(folder)
-        self.extras, self.version, self.clock, self.space = list(extras), version, clock, space
+        self.extras, self.version, self.clock, self.space = extras, version, clock, space
         self.retention = dict(DEFAULT_RETENTION, **(retention or {}))
+        self.limits = dict({"gather": MAX_GATHER, "file": MAX_ONE_FILE, "extra": MAX_EXTRA, "memory": CHILD_MEMORY}, **(limits or {}))
+        self.isolate = isolate
         self._aesgcm = aesgcm
         self._mutex = threading.Lock()
         self.key_file = self.folder / "backup-key"
         self.index_file = "index.json"
 
+    def _extra_list(self):
+        """[(name, path, kind, required, allowed_keys)]; older 3-item entries mean optional with no schema."""
+        out = []
+        for item in self.extras:
+            item = tuple(item)
+            name, path, kind = item[:3]
+            required = bool(item[3]) if len(item) > 3 else False
+            allowed = (sorted(item[4]) if item[4] is not None else None) if len(item) > 4 else None
+            out.append((name, str(path), kind, required, allowed))
+        return out
+
     # .. index ..................................................................................................................
+    def _valid_index(self, index):
+        if type(index) is not dict or index.get("schema") != 1 or index.get("side") != self.side or type(index.get("backups")) is not dict:
+            return False
+        for name, info in index["backups"].items():
+            if (not NAME.fullmatch(name) or not name.startswith(self.side + "-") or type(info) is not dict
+                    or type(info.get("created")) is not int or type(info.get("size")) is not int
+                    or info.get("verified_at") is not None and type(info["verified_at"]) is not int):
+                return False
+        return True
+
     def _index(self):
         try:
             data = _read_private(self.folder / self.index_file, 8 << 20)
             index = json.loads(data.decode())
-            if type(index) is dict and index.get("schema") == 1:
+            if self._valid_index(index):
+                index.setdefault("manual", {})
                 return index
-            return dict(self._empty(), damaged=True)
         except FileNotFoundError:
             return self._empty()
         except (VaultError, ValueError, UnicodeError, OSError):
-            return dict(self._empty(), damaged=True)
+            pass
+        return dict(self._empty(), damaged=True)
 
     def _empty(self):
-        return {"schema": 1, "side": self.side, "key_id": None, "backups": {}, "nonces": [], "last_attempt": None,
-                "last_success": None, "last_error": None, "last_drill": None, "manual": {}}
+        return {"schema": 1, "side": self.side, "key_id": None, "backups": {}, "last_attempt": None, "last_success": None,
+                "last_error": None, "last_drill": None, "manual": {}}
 
     def _save(self, index):
-        index.pop("damaged", None)
-        index["nonces"] = index["nonces"][-MAX_NONCES:]
+        if index.pop("damaged", None):                       # never silently discard a damaged index: keep it aside, then rebuild
+            try:
+                os.replace(str(self.folder / self.index_file),
+                           str(self.folder / ("index.damaged-%d.json" % int(self.clock()))))
+            except FileNotFoundError:
+                pass
         _write_atomic(self.folder, self.index_file, json.dumps(index, sort_keys=True).encode())
+
+    def _rebuild(self, index):
+        """After index damage: re-learn every backup file present from its own (authenticated) contents. Nothing is deleted."""
+        for path in self._files():
+            if path.name in index["backups"]:
+                continue
+            try:
+                header, _, _ = self._verify(path.name, index)
+                index["backups"][path.name] = {"created": int(header["created"]), "size": path.lstat().st_size,
+                                               "verified_at": int(self.clock()), "checked_at": int(self.clock()), "excluded": []}
+            except Exception:
+                index["backups"][path.name] = {"created": int(path.lstat().st_mtime), "size": path.lstat().st_size,
+                                               "verified_at": None, "failed": True, "excluded": []}
+        index["rebuilt_at"] = int(self.clock())
+        self._skip_retention = True                            # no retention in the same run as a rebuild
+
+    # .. nonces: an append-only log, fsynced before a nonce is used, independent of the index ..................................
+    def _nonces(self):
+        used = set()
+        try:
+            data = _read_private(self.folder / NONCE_LOG, 64 << 20)
+            used |= {line for line in data.decode("ascii", "replace").split() if re.fullmatch(r"[0-9a-f]{24}", line)}
+        except FileNotFoundError:
+            pass
+        for path in self._files():                           # and every backup still present, in case the log was lost
+            try:
+                with open(str(path), "rb") as handle:
+                    head = handle.read(4096)
+                (size,) = struct.unpack(">H", head[8:10])
+                nonce = json.loads(head[10:10 + size].decode()).get("nonce")
+                if isinstance(nonce, str):
+                    used.add(nonce)
+            except Exception:
+                continue
+        return used
+
+    def _record_nonce(self, nonce):
+        fd = os.open(str(self.folder / NONCE_LOG), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            if os.fstat(fd).st_uid != os.geteuid() or os.fstat(fd).st_mode & 0o077:
+                raise VaultError("file_not_private_or_not_ours")
+            os.write(fd, (nonce + "\n").encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _fsync_dir(self.folder)
 
     # .. key ....................................................................................................................
     def _files(self):
-        return sorted(p for p in self.folder.iterdir() if NAME.fullmatch(p.name) and p.name.startswith(self.side + "-"))
+        return sorted(p for p in self.folder.iterdir() if NAME.fullmatch(p.name) and p.name.startswith(self.side + "-")
+                      and p.is_file() and not p.is_symlink())
 
     def _key(self, index, *, create):
         try:
             raw = _read_private(self.key_file, 64)
         except FileNotFoundError:
-            if index.get("key_id") or self._files() or index.get("damaged"):
+            if index.get("key_id") or self._files() or index.get("damaged") or (self.folder / NONCE_LOG).exists():
                 raise VaultError("backup_key_missing")          # never silently replace a key that existing backups need
             if not create:
                 raise VaultError("backup_key_missing")
@@ -293,41 +424,59 @@ class Vault:
 
     # .. gather .................................................................................................................
     def _gather(self):
-        """(bundle bytes, excluded names). The state archive is backup.py's own, verified format."""
+        """(bundle bytes, excluded, incomplete). Sizes are checked BEFORE anything is read."""
+        total, largest = _state_sizes(self.state_dir, self.side)
+        extras = self._extra_list()
+        sizes = {}
+        for name, path, kind, required, allowed in extras:
+            try:
+                info = os.lstat(path)
+                sizes[name] = info.st_size if stat.S_ISREG(info.st_mode) else 0
+            except FileNotFoundError:
+                sizes[name] = 0
+        total += sum(sizes.values())
+        if total > self.limits["gather"] or largest > self.limits["file"]:
+            raise VaultError("backup_too_large_for_the_limits")
         with tempfile.TemporaryDirectory(dir=str(self.work)) as tmp:
             archive = Path(tmp) / "state.tar"
             backup.make_backup(self.state_dir, archive, kind=self.side, clock=self.clock)
             blobs = {"state.tar": archive.read_bytes()}
-        excluded = []
-        for name, path, kind in self.extras:
+        excluded, incomplete = [], []
+        for name, path, kind, required, allowed in extras:
             path = Path(path)
+            why = None
             try:
                 if path.is_symlink():
-                    excluded.append(name + ":link")
-                    continue
-                if not path.is_file():
-                    continue                                    # optional settings that do not exist are simply absent
-                if path.stat().st_size > MAX_EXTRA:
-                    excluded.append(name + ":too_large")
-                    continue
-                data = _snapshot_sqlite(path) if kind == "sqlite" else path.read_bytes()
+                    why = "link"
+                elif not path.is_file():
+                    why = "missing"
+                elif sizes[name] > self.limits["extra"]:
+                    why = "too_large"
+                else:
+                    data = _snapshot_sqlite(path) if kind == "sqlite" else path.read_bytes()
+                    if kind == "sqlite":
+                        why = None if _sqlite_ok(data) else "database_damaged"
+                    else:
+                        why = _secret_free(name, data, allowed)
             except (OSError, sqlite3.Error):
-                excluded.append(name + ":unreadable")
-                continue
-            if kind != "sqlite" and not _secret_free(name, data):
-                excluded.append(name + ":looks_like_a_secret")
-                continue
-            blobs["extra/" + name] = data
-        meta = {"format": FORMAT, "side": self.side, "created": int(self.clock()), "version": self.version, "excluded": excluded}
-        return pack_bundle(meta, blobs), excluded
+                why = "unreadable"
+            if why is None:
+                blobs["extra/" + name] = data
+            elif why != "missing" or required:
+                excluded.append("%s:%s" % (name, why))
+            if why is not None and required:
+                incomplete.append(name)
+        meta = {"format": FORMAT, "side": self.side, "created": int(self.clock()), "version": self.version, "excluded": excluded,
+                "incomplete": incomplete, "extras": {n: {"kind": k} for n, _, k, _, _ in extras if "extra/" + n in blobs}}
+        return pack_bundle(meta, blobs), excluded, incomplete
 
     @property
     def work(self):
         return _private_folder(self.folder / ".work")
 
     # .. create / verify ........................................................................................................
-    def _new_nonce(self, index):
-        used = set(index["nonces"])
+    def _new_nonce(self):
+        used = self._nonces()
         for _ in range(8):
             nonce = secrets.token_bytes(12).hex()
             if nonce not in used:
@@ -337,27 +486,29 @@ class Vault:
     def _create(self, index):
         key_id, key = self._key(index, create=True)
         index["key_id"] = key_id
-        bundle, excluded = self._gather()
+        bundle, excluded, incomplete = self._gather()
         free = self.space(str(self.folder)).free
         if free < 2 * len(bundle) + SPACE_MARGIN:
             raise VaultError("insufficient_storage")            # nothing is deleted to make room
-        nonce = self._new_nonce(index)
+        nonce = self._new_nonce()
         now = int(self.clock())
         header = json.dumps({"format": FORMAT, "side": self.side, "created": now, "version": self.version, "key_id": key_id,
                              "nonce": nonce, "size": len(bundle)}, sort_keys=True, separators=(",", ":")).encode()
         aad = MAGIC + struct.pack(">H", len(header)) + header
         blob = aad + self._cipher(key).encrypt(bytes.fromhex(nonce), bundle, aad)
+        del bundle
         name = "%s-%s-%s%s" % (self.side, time.strftime("%Y%m%d-%H%M%S", time.gmtime(now)), secrets.token_hex(4), SUFFIX)
-        index["nonces"].append(nonce)
-        self._save(index)                                       # the nonce is recorded BEFORE the backup can exist
+        self._record_nonce(nonce)                               # recorded BEFORE the backup can exist
+        self._save(index)
         _write_atomic(self.folder, name, blob)
-        index["backups"][name] = {"created": now, "size": len(blob), "verified_at": None, "excluded": excluded}
+        index["backups"][name] = {"created": now, "size": len(blob), "verified_at": None, "excluded": excluded,
+                                  "incomplete": incomplete}
         return name
 
     def open_backup(self, name, index=None):
-        """(header, bundle index, blobs) of one backup, fully checked. Raises VaultError."""
+        """(header, bundle meta, blobs) of one backup, fully checked. Raises VaultError."""
         index = index or self._index()
-        if not NAME.fullmatch(name):
+        if not NAME.fullmatch(name) or not name.startswith(self.side + "-"):
             raise VaultError("not_a_vault_backup")
         blob = _read_private(self.folder / name, MAX_BACKUP)
         if not blob.startswith(MAGIC) or len(blob) < 10:
@@ -369,7 +520,8 @@ class Vault:
         except (ValueError, UnicodeError):
             raise VaultError("backup_damaged") from None
         if (type(header) is not dict or set(header) != {"format", "side", "created", "version", "key_id", "nonce", "size"}
-                or header["format"] != FORMAT or header["side"] != self.side or not re.fullmatch(r"[0-9a-f]{24}", str(header["nonce"]))):
+                or header["format"] != FORMAT or header["side"] != self.side or not re.fullmatch(r"[0-9a-f]{24}", str(header["nonce"]))
+                or type(header["size"]) is not int or header["size"] > MAX_BACKUP):
             raise VaultError("backup_damaged")
         key_id, key = self._key(index, create=False)
         if header["key_id"] != key_id:
@@ -378,6 +530,7 @@ class Vault:
             bundle = self._cipher(key).decrypt(bytes.fromhex(header["nonce"]), blob[10 + size:], aad)
         except Exception:
             raise VaultError("backup_failed_authentication_damaged_or_altered") from None
+        del blob
         meta, blobs = unpack_bundle(bundle)
         if meta.get("side") != self.side or meta.get("format") != FORMAT or len(bundle) != header["size"] or "state.tar" not in blobs:
             raise VaultError("backup_damaged")
@@ -399,8 +552,11 @@ class Vault:
 
     # .. retention ..............................................................................................................
     def _retain(self, index, protect=None):
+        skip, self._skip_retention = getattr(self, "_skip_retention", False), False
+        if skip or index.get("damaged") or not self._valid_index(index):
+            return []                                           # never delete anything on the strength of a doubtful index
         verified = sorted((info["created"], name) for name, info in index["backups"].items()
-                          if info.get("verified_at") and (self.folder / name).exists())
+                          if info.get("verified_at") and (self.folder / name).is_file())
         if not verified:
             return []
         keep = {verified[-1][1], protect}                       # the newest VERIFIED backup (and the one just made) are never deleted
@@ -414,12 +570,15 @@ class Vault:
         removed = []
         for name in list(index["backups"]):
             info = index["backups"][name]
-            if name in keep:
+            if name in keep or not NAME.fullmatch(name) or not name.startswith(self.side + "-"):
                 continue
-            if not info.get("verified_at") and info["created"] >= verified[-1][0]:
-                continue                                        # a newer, unverified backup is kept for inspection
+            if not info.get("verified_at") and not info.get("failed") and info["created"] >= verified[-1][0]:
+                continue                                        # a newer, not-yet-verified backup is kept
+            path = self.folder / name
+            if path.is_symlink() or (path.exists() and not path.is_file()):
+                continue
             try:
-                os.unlink(str(self.folder / name))
+                os.unlink(str(path))
             except FileNotFoundError:
                 pass
             del index["backups"][name]
@@ -428,7 +587,7 @@ class Vault:
             _fsync_dir(self.folder)
         return removed
 
-    # .. public operations ......................................................................................................
+    # .. the operations (run inside the separate process when isolate=True) ......................................................
     def _locked(self, fn):
         with self._mutex:
             _private_folder(self.folder)
@@ -442,92 +601,179 @@ class Vault:
             finally:
                 os.close(lock)
 
-    def backup_now(self, *, manual=False):
-        """Create, verify, then apply retention. Returns a short result; failures are recorded, never raised to the caller."""
-        def run():
-            index = self._index()
-            now = int(self.clock())
-            if manual and now - index["manual"].get("backup", 0) < MANUAL_BACKUP_EVERY:
-                return {"ok": False, "error": "rate_limited", "retry_after": MANUAL_BACKUP_EVERY - (now - index["manual"]["backup"])}
-            if manual:
-                index["manual"]["backup"] = now
-            index["last_attempt"] = now
+    def _load(self):
+        index = self._index()
+        if index.get("damaged"):
+            self._rebuild(index)
+        return index
+
+    def _op_backup(self, manual):
+        index = self._load()
+        now = int(self.clock())
+        if manual and now - index["manual"].get("backup", 0) < MANUAL_BACKUP_EVERY:
+            return {"ok": False, "error": "rate_limited", "retry_after": MANUAL_BACKUP_EVERY - (now - index["manual"]["backup"])}
+        if manual:
+            index["manual"]["backup"] = now
+        index["last_attempt"] = now
+        try:
+            name = self._create(index)
+            self._verify(name, index)
+            entry = index["backups"][name]
+            entry["verified_at"] = entry["checked_at"] = int(self.clock())
+            index["last_success"], index["last_error"] = int(self.clock()), None
+            removed = self._retain(index, protect=name)
+            self._save(index)
+            return {"ok": True, "backup": name, "removed": len(removed), "excluded": entry["excluded"],
+                    "complete": not entry["incomplete"]}
+        except Exception as error:                              # recorded here, so even an unexpected failure is visible
+            return self._failed(index, now, error)
+
+    def _failed(self, index, now, error):
+        code = getattr(error, "code", None) or (str(error) if isinstance(error, backup.BackupError) else type(error).__name__)
+        index["last_error"] = {"at": now, "code": str(code)[:120]}
+        try:
+            self._save(index)
+        except OSError:
+            pass
+        return {"ok": False, "error": str(code)[:120]}
+
+    def _op_recheck(self):
+        """Is the newest verified backup still present and intact? If not it stops counting, and a new backup is due at once."""
+        index = self._load()
+        verified = sorted((info["created"], name) for name, info in index["backups"].items() if info.get("verified_at"))
+        if not verified:
+            return {"ok": True, "checked": None}
+        name = verified[-1][1]
+        try:
+            if not (self.folder / name).is_file():
+                raise VaultError("verified_backup_file_missing")
+            self._verify(name, index)
+            index["backups"][name]["checked_at"] = int(self.clock())
+            self._save(index)
+            return {"ok": True, "checked": name}
+        except Exception as error:
+            entry = index["backups"][name]
+            entry["verified_at"], entry["failed"] = None, True
+            index["last_error"] = {"at": int(self.clock()), "code": "newest_backup_failed_recheck_" + str(getattr(error, "code", type(error).__name__))[:80]}
+            self._save(index)
+            return {"ok": False, "error": index["last_error"]["code"]}
+
+    def _op_drill(self, manual):
+        index = self._load()
+        now = int(self.clock())
+        if manual and now - index["manual"].get("drill", 0) < MANUAL_DRILL_EVERY:
+            return {"ok": False, "error": "rate_limited", "retry_after": MANUAL_DRILL_EVERY - (now - index["manual"]["drill"])}
+        if manual:
+            index["manual"]["drill"] = now
+        verified = sorted((info["created"], name) for name, info in index["backups"].items() if info.get("verified_at"))
+        result = {"at": now, "ok": False, "backup": verified[-1][1] if verified else None}
+        try:
+            if not verified:
+                raise VaultError("no_verified_backup_to_drill")
+            header, files, blobs = self._verify(verified[-1][1], index)
+            with tempfile.TemporaryDirectory(dir=str(self.work)) as tmp:
+                target = Path(tmp) / "restored"
+                work = (self.folder / ".work").resolve()
+                if target.resolve() == self.state_dir.resolve() or work not in target.resolve().parents or target.exists():
+                    raise VaultError("drill_target_is_live_state")       # only ever a NEW folder inside the vault's scratch area
+                archive = Path(tmp) / "state.tar"
+                archive.write_bytes(blobs["state.tar"])
+                manifest = backup.restore_backup(str(archive), target, kind=self.side)
+                for name, data in files.items():                      # every restored state file equals the backup
+                    restored = (target / name).read_bytes()
+                    if name == "passkeys.sqlite3":
+                        if not _passkeys_all_quarantined(restored):    # intentionally changed: must be quarantined, fail closed
+                            raise VaultError("drill_passkeys_were_not_quarantined")
+                    elif _sha(restored) != _sha(data):
+                        raise VaultError("drill_restored_file_differs_" + name.split("/")[-1][:40])
+                    if name.endswith(".sqlite3") and not _sqlite_ok(restored):
+                        raise VaultError("drill_database_failed_integrity_check")
+                extras = _private_folder(Path(tmp) / "extras")       # every extra recovered too, then checked
+                count = 0
+                for name, data in blobs.items():
+                    if not name.startswith("extra/"):
+                        continue
+                    flat = name[len("extra/"):].replace("/", "__")
+                    if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", flat) or flat.startswith("."):
+                        raise VaultError("drill_extra_name_unsafe")
+                    _write_atomic(extras, flat, data)
+                    back = _read_private(extras / flat, self.limits["extra"] + 1)
+                    if _sha(back) != _sha(data):
+                        raise VaultError("drill_extra_differs")
+                    if name.endswith(".sqlite3") and not _sqlite_ok(back):
+                        raise VaultError("drill_extra_database_damaged")
+                    if name.endswith(".json"):
+                        json.loads(back.decode("utf-8"))
+                    count += 1
+                result.update(ok=True, files=len(manifest["files"]), extras=count)
+        except Exception as error:
+            code = getattr(error, "code", None) or (str(error) if isinstance(error, (backup.BackupError, ValueError)) else "") \
+                or type(error).__name__
+            result["error"] = str(code)[:120]
+        index["last_drill"] = result
+        self._save(index)
+        return result
+
+    def _op(self, op, manual=False):
+        return {"backup": lambda: self._op_backup(manual), "drill": lambda: self._op_drill(manual),
+                "recheck": self._op_recheck}[op]()
+
+    # .. public ...................................................................................................................
+    def _spec(self, op, manual):
+        return {"side": self.side, "state_dir": str(self.state_dir), "folder": str(self.folder), "extras": self._extra_list(),
+                "version": self.version, "retention": self.retention, "limits": self.limits, "op": op, "manual": manual}
+
+    def _run(self, op, manual=False):
+        if not self.isolate:
+            return self._guard(lambda: self._op(op, manual))
+        with self._mutex:
+            import subprocess
+            import sys
+            paths = [p for p in sys.path if p and os.path.isdir(p)]
+            code = ("import sys,json;sys.path[:0]=json.loads(sys.argv[1]);from stynpilot.vault import _child;_child()")
             try:
-                name = self._create(index)
-                self._verify(name, index)
-                index["backups"][name]["verified_at"] = int(self.clock())
-                index["last_success"], index["last_error"] = int(self.clock()), None
-                removed = self._retain(index, protect=name)
-                self._save(index)
-                return {"ok": True, "backup": name, "removed": len(removed), "excluded": index["backups"][name]["excluded"]}
-            except (VaultError, backup.BackupError, OSError) as error:
-                code = getattr(error, "code", None) or (str(error) if isinstance(error, backup.BackupError) else type(error).__name__)
-                index["last_error"] = {"at": now, "code": str(code)[:120]}
-                try:
-                    self._save(index)
-                except OSError:
-                    pass
-                return {"ok": False, "error": str(code)[:120]}
-        return self._guard(run)
+                done = subprocess.run([sys.executable, "-I", "-c", code, json.dumps(paths)], input=json.dumps(self._spec(op, manual)).encode(),
+                                      capture_output=True, timeout=CHILD_TIMEOUT, close_fds=True)
+                lines = done.stdout.decode("utf-8", "replace").strip().splitlines()
+                if done.returncode == 0 and lines:
+                    result = json.loads(lines[-1][-65536:])
+                    if isinstance(result, dict):
+                        return result
+                error = "backup_process_failed_exit_%d" % done.returncode
+            except subprocess.TimeoutExpired:
+                error = "backup_process_timed_out"
+            except (OSError, ValueError):
+                error = "backup_process_unavailable"
+        # the child died (memory limit, crash, timeout): record it from here; the service itself is unaffected
+        self._guard(lambda: self._failed(self._index(), int(self.clock()), VaultError(error)) if op == "backup" else None)
+        return {"ok": False, "error": error}
+
+    def backup_now(self, *, manual=False):
+        return self._run("backup", manual)
 
     def drill(self, *, manual=False):
-        """Restore the newest verified backup into a fresh private folder, check it, delete it. Live state is never touched."""
-        def run():
-            index = self._index()
-            now = int(self.clock())
-            if manual and now - index["manual"].get("drill", 0) < MANUAL_DRILL_EVERY:
-                return {"ok": False, "error": "rate_limited", "retry_after": MANUAL_DRILL_EVERY - (now - index["manual"]["drill"])}
-            if manual:
-                index["manual"]["drill"] = now
-            verified = sorted((info["created"], name) for name, info in index["backups"].items() if info.get("verified_at"))
-            result = {"at": now, "ok": False, "backup": verified[-1][1] if verified else None}
-            try:
-                if not verified:
-                    raise VaultError("no_verified_backup_to_drill")
-                header, files, blobs = self._verify(verified[-1][1], index)
-                with tempfile.TemporaryDirectory(dir=str(self.work)) as tmp:
-                    target = Path(tmp) / "restored"
-                    work = (self.folder / ".work").resolve()
-                    if target.resolve() == self.state_dir.resolve() or work not in target.resolve().parents or target.exists():
-                        raise VaultError("drill_target_is_live_state")       # only ever a NEW folder inside the vault's scratch area
-                    archive = Path(tmp) / "state.tar"
-                    archive.write_bytes(blobs["state.tar"])
-                    manifest = backup.restore_backup(str(archive), target, kind=self.side)
-                    restored = {p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()}
-                    missing = set(manifest["files"]) - restored
-                    if missing:
-                        raise VaultError("drill_restore_incomplete")
-                    for name in manifest["files"]:
-                        if name.endswith(".sqlite3") and not _sqlite_ok((target / name).read_bytes()):
-                            raise VaultError("drill_database_failed_integrity_check")
-                    if self.side == "root" and "passkeys.sqlite3" in manifest["files"]:
-                        db = sqlite3.connect("file:%s?mode=ro" % (target / "passkeys.sqlite3"), uri=True)
-                        try:
-                            live = db.execute("SELECT COUNT(*) FROM passkeys WHERE quarantined = 0 AND revoked IS NULL").fetchone()[0]
-                        except sqlite3.Error:
-                            live = None
-                        finally:
-                            db.close()
-                        if live not in (0, None):
-                            raise VaultError("drill_passkeys_were_not_quarantined")
-                    result.update(ok=True, files=len(manifest["files"]), extras=sum(1 for n in blobs if n.startswith("extra/")))
-            except (VaultError, backup.BackupError, OSError) as error:
-                code = getattr(error, "code", None) or str(error) or type(error).__name__
-                result["error"] = str(code)[:120]
-            index["last_drill"] = result
-            self._save(index)
-            return result
-        return self._guard(run)
+        return self._run("drill", manual)
+
+    def recheck(self):
+        return self._run("recheck")
 
     def tick(self):
-        """Run what is due: the first backup at once, a missed one after any downtime, a weekly drill. Called hourly and at start."""
+        """What is due: re-check the newest verified backup (presence hourly, full check daily), the first backup at once, a missed
+        or replacement one, and a weekly drill. Called hourly and at start."""
         index = self._index()
         now = int(self.clock())
-        newest = max((i["verified_at"] or 0 for i in index["backups"].values()), default=0)
         done = {}
+        verified = sorted((i["created"], n, i) for n, i in index["backups"].items() if i.get("verified_at"))
+        if verified:
+            _, name, info = verified[-1]
+            if not (self.folder / name).is_file() or now - (info.get("checked_at") or info["verified_at"]) >= DAY:
+                done["recheck"] = self.recheck()
+                index = self._index()
+        newest = max((i["verified_at"] or 0 for i in index["backups"].values()), default=0)
         if now - newest >= DUE_AFTER:
             last = index.get("last_attempt") or 0
-            if not index.get("last_error") or now - last >= 3600:   # a failing backup is retried hourly, not in a tight loop
+            failed_recheck = str((index.get("last_error") or {}).get("code", "")).startswith("newest_backup_failed_recheck")
+            if not index.get("last_error") or failed_recheck or now - last >= 3600:
                 done["backup"] = self.backup_now()
         last_drill = (index.get("last_drill") or {}).get("at") or 0
         if now - last_drill >= DRILL_EVERY and (newest or done.get("backup", {}).get("ok")):
@@ -549,7 +795,8 @@ class Vault:
             now = int(self.clock())
             present = {p.name for p in self._files()} if self.folder.is_dir() else set()
             backups = sorted(({"name": n, "created": i["created"], "size": i["size"], "verified": bool(i.get("verified_at")),
-                               "present": n in present} for n, i in index["backups"].items()), key=lambda b: b["created"])
+                               "present": n in present, "complete": not i.get("incomplete")} for n, i in index["backups"].items()),
+                             key=lambda b: b["created"])
             verified = [b for b in backups if b["verified"] and b["present"]]
             problems = []
             if index.get("damaged"):
@@ -562,6 +809,8 @@ class Vault:
                 problems.append("backup_overdue")
             if any(b["verified"] and not b["present"] for b in backups):
                 problems.append("verified_backup_file_missing")
+            if verified and not verified[-1]["complete"]:
+                problems.append("incomplete_backup:" + ",".join(index["backups"][verified[-1]["name"]].get("incomplete", [])))
             if index.get("last_error"):
                 problems.append("last_backup_failed:" + index["last_error"]["code"])
             drill = index.get("last_drill")
@@ -582,6 +831,19 @@ class Vault:
             return {"side": self.side, "healthy": False, "problems": ["status_unreadable_" + type(error).__name__]}
 
 
+def _child():
+    """The separate process: memory-limited, does ONE operation, prints one JSON line. Its death cannot harm the service."""
+    import resource
+    import sys
+    spec = json.loads(sys.stdin.read(1 << 20))
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (spec["limits"]["memory"], spec["limits"]["memory"]))
+    except (ValueError, OSError):
+        pass
+    v = Vault(side=spec["side"], state_dir=spec["state_dir"], folder=spec["folder"], extras=[tuple(e) for e in spec["extras"]],
+              version=spec["version"], retention=spec["retention"], limits=spec["limits"])
+    result = v._guard(lambda: v._op(spec["op"], spec["manual"]))
+    sys.stdout.write(json.dumps(result) + "\n")
 def start_scheduler(vault, *, interval=3600, first_delay=30, stop=None):
     """Background thread: tick at start (after a short delay) and then every ``interval`` seconds. Never raises."""
     stop = stop or threading.Event()

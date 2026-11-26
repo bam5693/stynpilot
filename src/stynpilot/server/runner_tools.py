@@ -39,7 +39,8 @@ def _error(code):
     return {"ok": False, "error": code}
 
 
-def register(server, *, router, clients, store, bearer, broker, projects_dir, approval_url=None, clock=None, limiter=None):
+def register(server, *, router, clients, store, bearer, broker, projects_dir, approval_url=None, clock=None, limiter=None,
+             vault=None):
     gate = ProposeGate(router=router, clients=clients)
     limiter = limiter or RateLimit(per_minute=120)
     now = clock or (lambda: datetime.now(timezone.utc))
@@ -142,6 +143,33 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
     def request_workspace_removal(device_id: str, name: str) -> dict:
         return request("commander_request_workspace_removal", device_id, "unenroll", name)
 
+
+    # -- backups (dev22): GREEN, but they write (a new encrypted backup / a scratch restore), so they need the WRITE gate ------------
+    safe_write = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
+
+    def both(owner_call, root_call):
+        result = {"owner": owner_call() if vault is not None else {"ok": False, "error": "owner_vault_not_running"}}
+        try:
+            result["root"] = root_call()
+        except Exception:
+            result["root"] = {"ok": False, "error": "installer_unreachable"}
+        return result
+
+    @server.tool(name="commander_backup_now", title="Make a verified backup now", annotations=safe_write,
+                 description=("Make a new encrypted backup of the owner side and then the root side, and verify each. Old backups are "
+                              "thinned by the retention rule; the newest verified one is never deleted. Rate limited (one per 10 minutes). "
+                              "Returns names, sizes and results only, never contents."))
+    def backup_now(device_id: str) -> dict:
+        return run("commander_backup_now", device_id,
+                   lambda owner: both(lambda: vault.backup_now(manual=True), broker.vault_backup), write=True)
+
+    @server.tool(name="commander_backup_drill", title="Test-restore the newest backup", annotations=safe_write,
+                 description=("Recovery drill: restore the newest verified backup of each side into a fresh private scratch folder, "
+                              "check every file, database and settings file, then delete the scratch copy. Live state is never touched. "
+                              "One per hour."))
+    def backup_drill(device_id: str) -> dict:
+        return run("commander_backup_drill", device_id,
+                   lambda owner: both(lambda: vault.drill(manual=True), broker.vault_drill), write=True)
 
     # -- releases (dev16): prepare a verified build (GREEN), then ask for ONE approval that signs, publishes and installs ------------
     _COMMIT = re.compile(r"[0-9a-f]{40}\Z")

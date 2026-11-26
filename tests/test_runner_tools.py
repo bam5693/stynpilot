@@ -105,6 +105,7 @@ class RunnerToolTests(unittest.TestCase):
         (self.projects / "other").mkdir()
         self.broker = FakeBroker()
         self.limiter = RateLimit(per_minute=1000)
+        self.router, self.clients = router, clients
         self.server = create_server(router=router, resource_url=AUDIENCE,
                                     propose=dict(clients=clients, store=self.store, approval_url="https://ryzen.example.test/app",
                                                  clock=lambda: self.now[0]),

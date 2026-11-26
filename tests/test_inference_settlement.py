@@ -96,3 +96,30 @@ class SettlementTests(unittest.TestCase):
                 verify()
             data[name] = old
         self.assertNotIn("stop",self.calls)
+
+    def test_fixed_unprivileged_helper_contract(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with patch("stynpilot.inference_settlement.pwd.getpwuid",return_value=SimpleNamespace(pw_uid=1000,pw_gid=1000)), \
+             patch("stynpilot.inference_settlement.subprocess.run",return_value=SimpleNamespace(stdout=b"ok")) as run:
+            self.assertEqual(s.owner_command(1000,"stop"),"ok")
+            argv=run.call_args.args[0]
+            self.assertEqual(argv[0],"/usr/bin/systemd-run")
+            self.assertIn("--uid=1000",argv)
+            self.assertIn("--gid=1000",argv)
+            self.assertIn("CapabilityBoundingSet=",argv)
+            self.assertIn("NoNewPrivileges=yes",argv)
+            self.assertIn("RestrictAddressFamilies=AF_UNIX",argv)
+            self.assertIn("RuntimeMaxSec=30",argv)
+            self.assertEqual(argv[argv.index("--")+1:],["/usr/bin/systemctl","--user","stop",s.UNIT])
+            self.assertEqual(run.call_args.kwargs["env"],{"PATH":"/usr/bin:/bin","LC_ALL":"C"})
+            with self.assertRaises(ActivityError):
+                s.owner_command(1000,"restart")
+            run.assert_called_once()
+
+    def test_missing_cgroup_is_not_permission_denial(self):
+        from unittest.mock import patch
+        def missing(path,limit):
+            raise FileNotFoundError()
+        with patch("stynpilot.inference_settlement.os.lstat",side_effect=PermissionError()):
+            self.assertFalse(s.empty_group(self.group,read=missing))

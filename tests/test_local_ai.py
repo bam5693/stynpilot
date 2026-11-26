@@ -135,3 +135,43 @@ class LocalAITests(unittest.TestCase):
         self.wait(jobs,jid,"failed")
         self.assertEqual(claims,[jid])
         self.assertEqual(finished,[])
+
+
+    def test_withdrawal_before_transport_retains_claim(self):
+        claims, finished = [], []
+        with patch("stynpilot.local_ai.infer") as transport:
+            jobs = ai.Jobs(transport, reserve=claims.append, finish=finished.append)
+            jid = jobs.submit(CALLER,"test",authorize=lambda _:False)["job_id"]
+            self.assertNotIn("output",self.wait(jobs,jid,"cancelled"))
+            transport.assert_not_called()
+            self.assertEqual(claims,[jid])
+            self.assertEqual(finished,[])
+
+    def test_active_authorization_withdrawal_discards_output(self):
+        entered, withdrawn, observed = threading.Event(), threading.Event(), threading.Event()
+        finished=[]
+        def transport(body,stop):
+            entered.set()
+            if stop.wait(3):
+                observed.set()
+            return "must not disclose"
+        jobs=ai.Jobs(transport,reserve=lambda _:None,finish=finished.append)
+        jid=jobs.submit(CALLER,"test",authorize=lambda _:not withdrawn.is_set())["job_id"]
+        self.assertTrue(entered.wait(2))
+        withdrawn.set()
+        self.assertTrue(observed.wait(2))
+        self.assertNotIn("output",self.wait(jobs,jid,"cancelled"))
+        self.assertEqual(finished,[])
+
+    def test_authority_check_failure_after_response_retains_claim(self):
+        checks=[]
+        finished=[]
+        def authorize(jid):
+            checks.append(jid)
+            if len(checks)>1:
+                raise OSError("unavailable")
+            return True
+        jobs=ai.Jobs(lambda body,stop:"late result",reserve=lambda _:None,finish=finished.append)
+        jid=jobs.submit(CALLER,"test",authorize=authorize)["job_id"]
+        self.assertNotIn("output",self.wait(jobs,jid,"cancelled"))
+        self.assertEqual(finished,[])

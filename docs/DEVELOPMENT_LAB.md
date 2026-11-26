@@ -12,6 +12,12 @@ The guest uses two vCPUs, 3 GiB of guest RAM, a 16 GiB virtual drive, serial log
 
 The launcher requires each marker on its own complete serial line. A final pass also requires QEMU to exit successfully. Both boots share the configured wall-clock deadline after overlay setup. The host caps serial logs at 8 MiB per boot and QEMU diagnostics at 8 MiB total. Exit 124 records a deadline and exit 125 records an output cap. Both stop QEMU and preserve the captured evidence. Serial markers are guest assertions. Candidate identity and the host-observed exit must accompany them in a review.
 
+### Restricted executor development
+
+The offline worker implements the fixed `offline_normal` recipe. It requires an unprivileged worker with verified cgroup v2 limits (up to 2 GiB RAM, zero swap, 64 tasks, and two CPUs). It stages only a bounded uncompressed Git archive with the expected commit comment and SHA-256. Extraction rejects linked, special, duplicate and traversing entries. The executor runs the recipe from a read-only snapshot under networkless Bubblewrap with private temporary storage and nested user namespaces disabled. It caps console output and wall time, redacts complete results before returning them, and discards output on cancellation or overflow.
+
+The module's CLI is an owner-side verification entry point. A future installer worker must supply trusted paths and obtain enrolled commit and artifact identity from the broker. The CLI accepts operator-supplied inputs for testing and carries no enrollment or MCP authority. Keep KVM and release-sandbox scenarios disabled on this surface until their trusted assets and executor are available.
+
 Docker and Compose can be reused where a scoped runtime already exists. This repository has no Node dependency or Compose project. Keep runner, daemon and user privileges unchanged when adding project-specific environments. Git remains the source of revision identity. A local Forgejo service can be used where the project already has an authorized remote.
 
 The packaged Stage 3 operation restores selected installer records using a verified archive, existing authority, vault keys, and a fresh verified safety copy. It preserves settings and owner-side state. Complete system restore, lost vault keys and lost installer authority require separate procedures.

@@ -807,6 +807,17 @@ class Executor:
             except managed_activity.ActivityError as error:
                 raise ExecutionDenied(error.code) from None
             return {"claim": claim if claim and claim["kind"] == "inference" else None}
+        if call == "inference_validate":
+            if set(args) != {"job_id"} or type(args["job_id"]) is not str or not managed_activity.ID.fullmatch(args["job_id"]):
+                raise ExecutionDenied("activity_claim_invalid")
+            from ..local_ai import require_workspace, LocalAIError
+            try:
+                require_workspace(self._runner_green("status", {}))
+                if managed_activity.current(self.dir) != {"kind": "inference", "job_id": args["job_id"]}:
+                    raise ExecutionDenied("activity_claim_changed")
+            except (LocalAIError, managed_activity.ActivityError) as error:
+                raise ExecutionDenied(error.code) from None
+            return {"ok": True}
         if call in ("inference_claim", "inference_finish"):
             if set(args) != {"job_id"}:
                 raise ExecutionDenied("activity_claim_invalid")

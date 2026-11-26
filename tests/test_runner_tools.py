@@ -80,6 +80,8 @@ class FakeBroker:
                     "selftest": {"ran": self.gate, "ok": self.gate}}
         if call == "workspaces":
             return {"workspaces": [{"name": w, "enrolled_at": 1} for w in self.workspaces]}
+        if call == "inference_claim_status":
+            return {"claim": getattr(self, "inference_claim", None)}
         if call in ("inference_claim", "inference_finish"):
             return {"ok": True}
         if call == "run":
@@ -361,6 +363,20 @@ class RunnerToolTests(unittest.TestCase):
             self.assertEqual(out["error"], "local_ai_containment_required")
             transport.assert_not_called()
         self.assertFalse(self.call("local_ai_readiness", self.d(), "stranger")["ok"])
+
+    def test_settlement_only_requests_owner_approval(self):
+        tool = "commander_request_local_ai_settlement"
+        self.assertTrue(self.call(tool, self.d())["result"]["already_idle"])
+        self.broker.inference_claim = {"kind": "inference", "job_id": "a"*32}
+        self.assertFalse(self.call(tool, self.d(), "readonly")["ok"])
+        self.assertFalse(self.call(tool, self.d(), "stranger")["ok"])
+        result = self.call(tool, self.d())
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["result"]["state"], "pending")
+        payload = self.store.payload(result["result"]["request_id"])
+        self.assertEqual((payload["kind"], payload["action"], payload["name"]),
+                         ("runner", "settle_inference", "a"*32))
+        self.assertTrue(all(call == "inference_claim_status" for call, args in self.broker.calls))
 
 
 if __name__ == "__main__":

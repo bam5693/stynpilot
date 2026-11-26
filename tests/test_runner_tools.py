@@ -247,5 +247,104 @@ class RunnerToolTests(unittest.TestCase):
         self.assertEqual(outs[-1]["error"], "rate_limited_try_again_in_a_minute")
 
 
+    # -- local inference: real MCP handlers, synthetic identity and model transport -------------------------------
+    def test_local_ai_requires_propose_scope_device_and_open_authorized_workspace(self):
+        from unittest.mock import patch
+        from stynpilot.server.propose_tools import PROPOSE_ONLY_TOOLS
+        tools = {"local_ai_submit", "local_ai_status", "local_ai_cancel"}
+        self.assertLessEqual(tools, {t.name for t in asyncio.run(self.server.list_tools())})
+        self.assertLessEqual(tools, PROPOSE_ONLY_TOOLS)
+        with patch("stynpilot.local_ai.http.client.HTTPConnection") as transport:
+            self.authorize("local-ai-pilot")
+            for token in ("readonly", "stranger"):
+                for tool, args in (("local_ai_submit", {"prompt": "test"}),
+                                   ("local_ai_status", {"job_id": "x"}),
+                                   ("local_ai_cancel", {"job_id": "x"})):
+                    self.assertFalse(self.call(tool, self.d(**args), token)["ok"])
+            self.assertFalse(self.call("local_ai_submit",
+                                       dict(device_id="dtdev_OTHER", prompt="test"))["ok"])
+            self.broker.gate = False
+            self.assertEqual(self.call("local_ai_submit", self.d(prompt="test"))["error"],
+                             "local_ai_workspace_or_gate_required")
+            self.authorize("app")
+            self.assertEqual(self.call("local_ai_submit", self.d(prompt="test"))["error"],
+                             "local_ai_workspace_or_gate_required")
+            self.authorize("local-ai-pilot")
+            self.clients.revoke("chatgpt-connector")
+            self.assertFalse(self.call("local_ai_submit", self.d(prompt="test"))["ok"])
+            transport.assert_not_called()
+
+    def test_local_ai_job_result_private_and_rechecks_revocation_and_workspace(self):
+        from unittest.mock import patch
+        from stynpilot.local_ai import MODEL
+        self.authorize("local-ai-pilot")
+        with patch("stynpilot.local_ai.http.client.HTTPConnection") as transport:
+            reply = transport.return_value.getresponse.return_value.__enter__.return_value
+            reply.status = 200
+            reply.read.return_value = json.dumps(dict(done=True, model=MODEL, response="untrusted text")).encode()
+            submitted = self.call("local_ai_submit", self.d(prompt="test"))
+            self.assertTrue(submitted["ok"], submitted)
+            jid = submitted["result"]["job_id"]
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                out = self.call("local_ai_status", self.d(job_id=jid))
+                self.assertTrue(out["ok"], out)
+                if out["result"]["state"] != "running":
+                    break
+                time.sleep(.01)
+            self.assertEqual(out["result"]["state"], "done", out)
+            self.assertEqual(out["result"]["output"], "untrusted text")
+            transport.assert_called_once_with("127.0.0.1", 11435, timeout=5)
+            for tool in ("local_ai_status", "local_ai_cancel"):
+                self.assertEqual(self.call(tool, self.d(job_id=jid), "claude")["error"],
+                                 "local_ai_unknown_job")
+                self.assertFalse(self.call(tool, self.d(job_id=jid), "readonly")["ok"])
+            self.broker.gate = False
+            self.assertFalse(self.call("local_ai_status", self.d(job_id=jid))["ok"])
+            self.authorize("app")
+            self.assertFalse(self.call("local_ai_status", self.d(job_id=jid))["ok"])
+            self.authorize("local-ai-pilot")
+            self.clients.revoke("chatgpt-connector")
+            for tool in ("local_ai_status", "local_ai_cancel"):
+                self.assertFalse(self.call(tool, self.d(job_id=jid))["ok"])
+
+    def test_local_ai_cancel_while_workspace_removed(self):
+        import threading
+        from unittest.mock import patch
+        self.authorize("local-ai-pilot")
+        entered, release = threading.Event(), threading.Event()
+        with patch("stynpilot.local_ai.http.client.HTTPConnection") as transport:
+            reply = transport.return_value.getresponse.return_value.__enter__.return_value
+            reply.status = 200
+            def read(_):
+                entered.set()
+                release.wait(5)
+                from stynpilot.local_ai import MODEL
+                return json.dumps(dict(done=True, model=MODEL, response="late text")).encode()
+            reply.read.side_effect = read
+            submitted = self.call("local_ai_submit", self.d(prompt="test"))
+            self.assertTrue(submitted["ok"], submitted)
+            jid = submitted["result"]["job_id"]
+            try:
+                self.assertTrue(entered.wait(3))
+                self.authorize("app")
+                self.assertFalse(self.call("local_ai_status", self.d(job_id=jid))["ok"])
+                self.assertFalse(self.call("local_ai_cancel", self.d(job_id=jid), "claude")["ok"])
+                cancelled = self.call("local_ai_cancel", self.d(job_id=jid))
+                self.assertEqual(cancelled["result"]["state"], "cancelling")
+            finally:
+                release.set()
+            self.authorize("local-ai-pilot")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                out = self.call("local_ai_status", self.d(job_id=jid))
+                self.assertTrue(out["ok"], out)
+                if out["result"]["state"] == "cancelled":
+                    break
+                time.sleep(.01)
+            self.assertEqual(out["result"]["state"], "cancelled", out)
+            self.assertNotIn("output", out["result"])
+
+
 if __name__ == "__main__":
     unittest.main()

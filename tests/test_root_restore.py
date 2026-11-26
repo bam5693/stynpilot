@@ -333,7 +333,14 @@ class ApprovalBoundaryTests(unittest.TestCase):
         self.assertFalse(rr.held(self.ex.dir))
         self.door = BrokerService(socket_path=self.door.path, executor=self.ex, allowed_uid=os.getuid())
         self.assertEqual(self.decide()["error"], "restore_requires_idle_managed_activity")
-        self.assertTrue(self.inference_call("inference_finish")["ok"])
+        from stynpilot import managed_activity
+        with mock.patch("stynpilot.inference_settlement.verify_idle",
+                        side_effect=managed_activity.ActivityError("inference_quiescence_unverified")):
+            self.assertEqual(self.inference_call("inference_finish")["error"], "inference_quiescence_unverified")
+        self.assertTrue(managed_activity.held(self.ex.dir))
+        with mock.patch("stynpilot.inference_settlement.verify_idle") as idle:
+            self.assertTrue(self.inference_call("inference_finish")["ok"])
+            idle.assert_called_once_with(self.ex.owner_uid)
         self.assertTrue(self.decide()["result"]["pending"])
         self.assertFalse(self.inference_call("inference_claim")["ok"])
 

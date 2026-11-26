@@ -344,7 +344,7 @@ class BrokerClient:
 
     def runner(self, call, args=None):
         """GREEN runner operations on the owner-only socket (no approval): status, self-test, run, jobs, output, cancel."""
-        return self._ask({"op": "runner", "call": call, "args": args or {}}, 120)["result"]
+        return self._ask({"op": "runner", "call": call, "args": args or {}}, 5 if call == "inference_validate" else 120)["result"]
 
     def passkey_admin(self, payload, proof, challenge):
         return self._ask({"op": "passkey_admin", "payload": payload, "proof": proof, "challenge": challenge}, 60)["result"]

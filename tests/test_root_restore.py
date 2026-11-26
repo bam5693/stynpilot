@@ -313,6 +313,54 @@ class ApprovalBoundaryTests(unittest.TestCase):
         self.assertEqual(self.decide()["error"], "restore_requires_idle_installer_and_runner")
         self.assertFalse(rr.held(self.ex.dir))
 
+    def enable_inference_fixture(self):
+        self.ex.jobs.projects_dir = str(self.ex.dir / "projects")
+        self.ex.jobs.version = "test"
+        self.ex.jobs.selftest_state = lambda: {"ran": True, "ok": True, "version": "test"}
+        self.ex.jobs.workspaces = lambda: [{"path": self.ex.jobs.projects_dir + "/local-ai-pilot"}]
+
+    def inference_call(self, name, job="a"*32):
+        return self.door.handle({"op": "runner", "call": name, "args": {"job_id": job}})
+
+    def test_managed_inference_claim_blocks_restore_before_proof_is_spent(self):
+        from stynpilot.broker.service import BrokerService
+        self.enable_inference_fixture()
+        self.assertTrue(self.inference_call("inference_claim")["ok"])
+        self.assertFalse(self.inference_call("inference_claim", "b"*32)["ok"])
+        self.assertFalse(self.inference_call("inference_finish", "b"*32)["ok"])
+        self.assertEqual(self.decide()["error"], "restore_requires_idle_managed_activity")
+        self.assertEqual(self.ex.status(self.rid)["state"], "not_started")
+        self.assertFalse(rr.held(self.ex.dir))
+        self.door = BrokerService(socket_path=self.door.path, executor=self.ex, allowed_uid=os.getuid())
+        self.assertEqual(self.decide()["error"], "restore_requires_idle_managed_activity")
+        self.assertTrue(self.inference_call("inference_finish")["ok"])
+        self.assertTrue(self.decide()["result"]["pending"])
+        self.assertFalse(self.inference_call("inference_claim")["ok"])
+
+    def test_inference_and_recovery_admission_race(self):
+        import threading
+        from test_passkey_integration import proof_for
+        self.enable_inference_fixture()
+        proof = proof_for(self.phone, self.payload, self.challenge)
+        barrier = threading.Barrier(3)
+        replies = {}
+        def inference():
+            barrier.wait()
+            replies["inference"] = self.inference_call("inference_claim")
+        def restore():
+            barrier.wait()
+            replies["restore"] = self.decide(proof=proof)
+        threads = [threading.Thread(target=fn) for fn in (inference, restore)]
+        for t in threads:
+            t.start()
+        barrier.wait()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(set(replies), {"inference", "restore"})
+        self.assertEqual(sum(x["ok"] for x in replies.values()), 1, replies)
+        from stynpilot import managed_activity
+        self.assertNotEqual(managed_activity.held(self.ex.dir), rr.held(self.ex.dir))
+
     def test_unspent_intent_recovers_without_stopping_installer(self):
         with mock.patch.object(self.ex.runs, "consume", side_effect=PowerLoss()), self.assertRaises(PowerLoss):
             self.decide()

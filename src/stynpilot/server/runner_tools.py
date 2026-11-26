@@ -160,6 +160,20 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
                                  payload=payload, summary=render_summary(payload), expires=expires.timestamp())
         return receipt(result)
 
+    @server.tool(name="commander_request_local_ai_settlement", title="Ask owner to settle interrupted inference", annotations=FILES_A_REQUEST,
+                 description="Ask for a separate owner passkey approval to stop only the fixed Ollama pilot service and clear its exact durable inference reservation after quiescence checks. Does not approve, restart or stop the service itself.")
+    def request_inference_settlement(device_id: str) -> dict:
+        def work(owner):
+            claim = broker.runner("inference_claim_status", {}).get("claim")
+            if claim is None:
+                return {"already_idle": True}
+            if (type(claim) is not dict or claim.get("kind") != "inference"
+                    or type(claim.get("job_id")) is not str or not re.fullmatch(r"[a-f0-9]{32}", claim["job_id"])):
+                raise local_ai.LocalAIError("activity_claim_unverified")
+            return file_request(owner, device_id, action="settle_inference",
+                                name=claim["job_id"], software="stynpilot-local-ai-settlement")
+        return run("commander_request_local_ai_settlement", device_id, work, write=True)
+
     def request(tool, device_id, action, name):
         def work(owner):
             state = broker.runner("status")

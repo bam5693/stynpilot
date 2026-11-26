@@ -47,7 +47,11 @@ fixture=(/usr/bin/python3 -IB /mnt/stynpilot-fixture/guest-restore.py)
 if [[ -e /mnt/stynpilot-fixture/fault-cases ]]; then fixture+=(--fault-cases); fi
 if [[ -e /mnt/stynpilot-fixture/power-case ]]; then fixture+=(--power-case); fi
 if ! "${fixture[@]}"; then
-    journalctl -b -u stynpilot-installer.service -u stynpilot-restore.service -u stynpilot-restore.path --no-pager -n 140
+    journalctl -b -u stynpilot-installer.service -u stynpilot-restore.service -u stynpilot-restore.path -u 'run-*.service' --no-pager -n 160
+    journalctl -b _SYSTEMD_USER_UNIT=stynpilot-owner.service --no-pager -n 40
+    if [[ -r /var/lib/stynpilot-installer/runner-selftest.json ]]; then
+        cat /var/lib/stynpilot-installer/runner-selftest.json
+    fi
     exit 1
 fi
 EOF

@@ -24,13 +24,14 @@ from legacy_pairing import make_pairing_db
 from softauth import SoftAuthenticator
 from stynpilot.broker.passkeys import PasskeyStore
 from stynpilot.broker.proof import decision_nonce
+from stynpilot.identity import account_id
 from stynpilot.requests import request_id
 from stynpilot.service import InstallerConfig, root_vault
 
-OWNER = "synthetic-owner"
 DEVICE = "dtdev_SYNTHETIC900"
 HOST = "issuer.example.test"
 ISSUER = "https://" + HOST + "/"
+OWNER = account_id(verified_issuer=ISSUER, verified_subject="fixture|test-owner")
 STATE = Path("/var/lib/stynpilot-installer")
 ETC = Path("/etc/stynpilot")
 SOCKET = "/run/stynpilot/installer.sock"
@@ -140,6 +141,18 @@ def setup():
     command("systemctl", "daemon-reload")
     command("systemctl", "start", "stynpilot-installer.service")
     until(lambda: broker("runner", "status"), 30)
+    try:
+        until(lambda: as_owner("systemctl", "--user", "is-active", "--quiet", "stynpilot-owner.service"), 12)
+        from stynpilot.upgrade_worker import endpoint_answers
+        until(lambda: endpoint_answers({"port": 18443, "host": "owner.example.test"}), 12)
+    except RuntimeError:
+        result = subprocess.run(["/usr/bin/systemctl", "--user", "status", "stynpilot-owner.service", "--no-pager"],
+                                user=UID, group=GID, extra_groups=[], check=False,
+                                env={**os.environ, "HOME": str(HOME), "XDG_RUNTIME_DIR": f"/run/user/{UID}"},
+                                text=True, capture_output=True, timeout=10)
+        print(result.stdout + result.stderr, flush=True)
+        subprocess.run(["journalctl", "-b", "_SYSTEMD_USER_UNIT=stynpilot-owner.service", "--no-pager", "-n", "60"], check=False)
+        raise
     write(STATE / "runner-enabled.json", {"enabled": True})
     # Confirm real packaged path dispatch independently from the approved run.
     control = STATE / "restore-control"
@@ -252,6 +265,7 @@ def arm_power_recovery(rid, archive_marker):
 Description=Resume the synthetic Stage 3 power interruption test
 ConditionPathExists=/var/lib/stynpilot-lab/power-resume.json
 After=local-fs.target
+Conflicts=serial-getty@ttyS0.service
 
 [Service]
 Type=oneshot
@@ -310,6 +324,9 @@ def resume_power_test():
         assert runner["gate_open"] and len(runner["selftest"]["passed"]) == 21, runner
         print("STYNPILOT_POWER_RECOVERY_OK", flush=True)
     finally:
+        for argv in (["journalctl", "-b", "-u", "stynpilot-restore.service", "-u", "run-*.service", "--no-pager", "-n", "80"],
+                     ["journalctl", "-b", "_SYSTEMD_USER_UNIT=stynpilot-owner.service", "--no-pager", "-n", "30"]):
+            subprocess.run(argv, check=False)
         command("systemctl", "poweroff", "--no-block")
 
 

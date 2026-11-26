@@ -85,8 +85,26 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
         return {"ok": True, "device_id": device_id, "result": result}
 
     # A narrow, owner-side inference bridge, not a network exception for the project runner.
-    from .. import local_ai
+    from .. import local_ai, local_ai_readiness
     inference = local_ai.Jobs()
+
+    @server.tool(name="local_ai_readiness", title="Inspect fixed local AI resource controls", annotations=READ_ONLY,
+                 description="Read-only bounded evidence for the owner-managed Ollama service. Reports effective cgroup limits, process identity, fixed environment checks and listener. Not proof of model availability, egress isolation or recovery readiness.")
+    def inference_readiness(device_id: str) -> dict:
+        return run("local_ai_readiness", device_id, lambda owner: local_ai_readiness.inspect(), write=False)
+
+    def submit_inference(owner, device_id, prompt):
+        caller = inference_caller(owner, device_id)
+        if local_ai_readiness.inspect().get("resource_checks_passed") is not True:
+            raise local_ai.LocalAIError("local_ai_containment_required")
+        # Recheck after sampling; cross-process recovery exclusion still required before release.
+        inference_caller(owner, device_id)
+        return inference.submit(caller, prompt)
+
+    def read_inference(owner, device_id, job_id):
+        result = inference.status(inference_caller(owner, device_id), job_id)
+        inference_caller(owner, device_id)
+        return result
 
     def inference_caller(owner, device_id, *, require_workspace=True):
         if require_workspace:
@@ -97,13 +115,13 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
                  description="Use the fixed local Ollama coding model. Requires the enrolled pilot workspace and an open runner gate. One active job; returns a job ID. No files, tools, shell or cloud fallback.")
     def local_ai_submit(device_id: str, prompt: str) -> dict:
         return run("local_ai_submit", device_id,
-                   lambda owner: inference.submit(inference_caller(owner, device_id), prompt), write=True)
+                   lambda owner: submit_inference(owner, device_id, prompt), write=True)
 
     @server.tool(name="local_ai_status", title="Read your local inference job", annotations=READ_ONLY,
                  description="Read the state and, if complete, untrusted text result of your own local inference job. Results are volatile and expire after ten minutes. Requires workspace.propose.")
     def local_ai_status(device_id: str, job_id: str) -> dict:
         return run("local_ai_status", device_id,
-                   lambda owner: inference.status(inference_caller(owner, device_id), job_id), write=True)
+                   lambda owner: read_inference(owner, device_id, job_id), write=True)
 
     @server.tool(name="local_ai_cancel", title="Cancel your local inference request", annotations=WORKS,
                  description="Cancel your own inference request and discard its output. The connection is interrupted on a best-effort basis; this does not guarantee that the model server stops immediately.")

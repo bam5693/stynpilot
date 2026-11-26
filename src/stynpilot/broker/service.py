@@ -78,7 +78,7 @@ class BrokerService:
         payload = msg.get("payload")
         approving = msg.get("op") == "backup_admin" and isinstance(payload, dict) and payload.get("action") == "restore_root"
         try:
-            with root_restore.admission(state, exclusive=approving):
+            with root_restore.admission(state, exclusive=approving or (msg.get("op") == "runner" and msg.get("call") in ("inference_claim", "inference_finish"))):
                 if (root_restore.control(state) / "safe.json").exists():
                     return root_restore.safe_reply(state, msg)
                 if root_restore.held(state):

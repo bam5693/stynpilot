@@ -90,10 +90,8 @@ def inspect(*, run=command, read=read_bounded, uid=None):
         if pid <= 1 or pid > 2**31-1:
             raise ValueError("invalid pid")
         cgroup = info["ControlGroup"]
-        prefix = f"/user.slice/user-{uid}.slice/user@{uid}.service/"
-        if (not cgroup.startswith(prefix) or cgroup.split("/")[-1] != UNIT
-                or any(part in ("", ".", "..") for part in cgroup[1:].split("/"))
-                or not re.fullmatch(r"/[A-Za-z0-9_@.\-/]+", cgroup)):
+        expected = f"/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{UNIT}"
+        if cgroup != expected:
             raise ValueError("unexpected service cgroup")
         proc = Path("/proc") / str(pid)
         if read(proc / "comm", 128).strip() != b"ollama":

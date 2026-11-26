@@ -105,3 +105,33 @@ class LocalAITests(unittest.TestCase):
         response.status = 302
         with self.assertRaises(ai.LocalAIError):
             ai.infer(ai.request_body("test"),threading.Event())
+
+    def test_durable_claim_required_before_transport(self):
+        calls = []
+        def transport(body,stop):
+            calls.append("transport")
+            return "done"
+        jobs = ai.Jobs(transport, reserve=lambda jid: calls.append(("claim", jid)),
+                       finish=lambda jid: calls.append(("finish", jid)))
+        jid = jobs.submit(CALLER, "test")["job_id"]
+        self.wait(jobs,jid,"done")
+        self.assertEqual(calls,[("claim",jid),"transport",("finish",jid)])
+
+    def test_refused_claim_never_starts_transport(self):
+        def refuse(jid):
+            raise ai.LocalAIError("managed_activity_busy")
+        with patch("stynpilot.local_ai.infer") as transport:
+            jobs=ai.Jobs(transport, reserve=refuse, finish=lambda jid:None)
+            with self.assertRaises(ai.LocalAIError):
+                jobs.submit(CALLER,"test")
+            transport.assert_not_called()
+
+    def test_uncertain_completion_does_not_clear_claim(self):
+        claims, finished = [], []
+        def fail(body,stop):
+            raise OSError("ambiguous transport")
+        jobs=ai.Jobs(fail,reserve=claims.append,finish=finished.append)
+        jid=jobs.submit(CALLER,"test")["job_id"]
+        self.wait(jobs,jid,"failed")
+        self.assertEqual(claims,[jid])
+        self.assertEqual(finished,[])

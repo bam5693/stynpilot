@@ -22,39 +22,32 @@ disposable environments, never live security-critical state. Do not weaken any s
 
 ## Where things live
 - Code: GitHub `bam5693/stynpilot` (public). Branches: `claude/dev20-first-automated`, `claude/dev21-tar-free`,
-  `claude/dev22-backups` (= installed baseline), `claude/dev23-stage1-retention` (current work).
+  `claude/dev22-backups`, `claude/dev23-stage1-retention` (= installed, a611385), `claude/dev23-stage2-keys` (current work).
 - Master plan (canonical, private, newest entries at the top of its log) and the Ideas Vault (`MASTER_IDEAS.md`, never recreate
   it) live in the owner's PRIVATE GitLab knowledge branch. Machine identifiers, key fingerprints, repository/project IDs and other
   private operational details are kept there, not in this public file. Ask ChatGPT or the owner for access if you do not have it.
-- Docs per release: `docs/DEV16_RELEASE_AUTHORITY.md` ... `docs/DEV22_BACKUPS.md`, `docs/DEV23_STAGE1_RETENTION_AND_VERIFICATION.md`.
+- Docs per release: `docs/DEV16_RELEASE_AUTHORITY.md` ... `docs/DEV22_BACKUPS.md`, `docs/DEV23_STAGE1_RETENTION_AND_VERIFICATION.md`, `docs/DEV23_STAGE2_KEY_ROTATION.md`.
 
 ## Installed / stable
-- Live on the Ryzen: Dev22, package 0.1.0~dev22, source `ca24e68a3eab3078d30e892b3139c88cdc3d57bd`. Stable baseline and
-  rollback target. Older rollbacks kept: Dev21 (f55cda4), Dev20 (471fc77), Dev19, Dev18, Dev17.
-- Dev22 live verification: 846 passed / 0 failed / 95 skipped; 21/21 confinement checks; runner gate open; owner vault and root
-  vault complete+verified, drills passed.
+- Live on the Ryzen: Dev23 stage 1, package 0.1.0~dev23, source `a611385` (live: 862 passed / 0 failed / 95 skipped).
+  Rollback targets kept: Dev22 (ca24e68, package 0.1.0~dev22), Dev21 (f55cda4), Dev20 (471fc77), Dev19, Dev18, Dev17.
+  Exact hashes and package SHA-256 are in the private plan.
 - PRESERVE: Codex's two encrypted precautionary Dev21 archives (20,592,730 bytes total) and their separate recovery credentials;
   never include them in any retention/cleanup. All existing backups and Pi backups.
 
-## Current work: Dev23 stage 1 (retention settings + periodic re-verification)
-- Branch `claude/dev23-stage1-retention`. First reviewed commit `9cc6a50` (version 0.1.0.dev23). ChatGPT review: architecture,
-  payload validation, single-use approval, write gate and daily verification PASSED. The findings below are FIXED in commit
-  `d2366356` and the second review's findings in the following commit (see the branch head and the private plan for exact
-  hashes and test numbers): settings are trusted only if they exactly match the latest durable `policy.log` entry (missing,
-  inconsistent or damaged evidence holds pruning), and owner-side pruning is DISABLED for this stage (reported as a hold;
-  owner backups and checks continue). REQUIRED FOLLOW-UP: safe owner-side pruning with coordination that survives concurrent
-  installer connections and restarts (no timeout-based leases).
-  **Exact next action:** ChatGPT focused review of the branch head -> if PASS, automated release as 0.1.0~dev23 -> live checks
-  -> start Dev23 stage 2 (secure key rotation) on a NEW branch from the released commit, package version 0.1.0.dev24.
-- Findings (now fixed):
-  1. BLOCKER: a damaged/unreadable/invalid approved settings file must NOT fall back to 7+4 for pruning: prune nothing, keep
-     backing up and verifying, report `retention_settings_untrusted`. Owner side: no pruning unless the installer's current
-     policy was confirmed in this run. No pruning when the newest complete verified backup's check is stale (> 1 day).
-  2. SHOULD-FIX: monthly full re-check must use a durable timestamp independent of the oldest retained backup (it could never
-     come due under normal retention); test >60 days of daily backups.
-  3. Release versions: do not reuse a published version for later Dev23 stages. Proposal (awaiting ChatGPT): the PACKAGE version
-     simply increments per release (stage 1 = 0.1.0.dev23, stage 2 = 0.1.0.dev24, ...) while milestone names (Dev23 stage N,
-     Dev24 off-machine, Dev25 repositories) stay as labels. dev numbers must keep increasing or the upgrader refuses the release.
+## Current work: Dev23 stage 2 (secure key rotation), package 0.1.0.dev24
+- Branch `claude/dev23-stage2-keys` from the released commit a611385. See `docs/DEV23_STAGE2_KEY_ROTATION.md`.
+- Also on this branch: the retention approval summary now says plainly that owner-side automatic deletion is temporarily off.
+  **Exact next action:** ChatGPT review of the branch head -> if PASS, automated release as 0.1.0~dev24 -> live checks (no live
+  rotation is needed to verify the release; rotation is exercised in tests/disposable environments only during vacation)
+  -> Dev23 stage 3 (root restore) on a new branch from the released commit.
+
+## Tracked follow-ups from the Dev23 stage 1 release
+- Dev22 self-test reports a stale version label (cosmetic; fix with the next touch of the self-test).
+- Fresh Dev23 backup verification on the live machine (confirm a new backup made by 0.1.0~dev23 is complete + verified).
+- Independent verification of published release assets (download + verify signature/SHA-256 from a second path).
+- Safe owner-side pruning: needs coordination that survives concurrent installer connections and restarts; NO timeout leases.
+  Until then owner-side pruning stays disabled (owner backups are all kept and keep being made and checked).
 
 ## Milestone -> package version (approved: the package number increments per release; milestone names stay labels)
 | Milestone | Package version |
@@ -92,7 +85,7 @@ Never reuse a published version; the upgrader refuses anything not newer than wh
 
 ## Approved Dev23 architecture (stages in order, each reviewed separately)
 1. Retention settings (YELLOW, daily 1-30 / weekly 0-12) + periodic verification (daily newest complete, monthly all) - in progress.
-2. Secure key rotation: identified key generations and nonce logs; durable resumable rotation progress; every re-encrypted backup
+2. Secure key rotation (implemented on claude/dev23-stage2-keys): identified key generations and nonce logs; durable resumable rotation progress; every re-encrypted backup
    verified before replacing the original; never destroy a key any retained backup needs; missing key keeps unreadable archives
    (moved aside, never auto-deleted); Dev24 export-compatible. Lost nonce log -> owner-approved new key (no re-encryption).
 3. Root restore, 4. Owner restore - one side at a time; YELLOW approval bound to backup SHA-256 + scope + current security state;

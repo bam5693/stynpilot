@@ -539,14 +539,22 @@ class Executor:
 
     # -- backup settings (dev23 stage 1): YELLOW, owner-approved ---------------------------------------
     _BACKUP_KEYS = {"kind", "action", "daily", "weekly", "owner", "device", "expires_at"}
+    _ROTATE_KEYS = {"kind", "action", "side", "mode", "owner", "device", "expires_at"}
 
     def _check_backup_payload(self, payload):
         from .. import vault as _vault
         if getattr(self, "vault", None) is None:
             raise ExecutionDenied("backups_not_available")
-        if (set(payload) != self._BACKUP_KEYS or payload.get("kind") != "backup" or payload.get("action") != "retention"
-                or payload.get("owner") != self.owner or payload.get("device") != self.device
-                or not _vault.valid_retention(payload.get("daily"), payload.get("weekly"))):
+        action = payload.get("action")
+        if action == "retention":
+            ok = set(payload) == self._BACKUP_KEYS and _vault.valid_retention(payload.get("daily"), payload.get("weekly"))
+        elif action == "rotate_key":
+            ok = (set(payload) == self._ROTATE_KEYS and payload.get("side") in ("root", "owner")
+                  and payload.get("mode") in _vault.ROTATION_MODES)
+        else:
+            ok = False
+        if (not ok or payload.get("kind") != "backup" or payload.get("owner") != self.owner
+                or payload.get("device") != self.device):
             raise ExecutionDenied("backup_request_invalid")
         try:
             expires = datetime.strptime(payload["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -559,14 +567,27 @@ class Executor:
         return payload
 
     def backup_admin(self, payload, proof_token, challenge):
-        """Execute an owner-approved backup setting change. Synchronous; nothing is deleted at this moment."""
+        """Execute an owner-approved backup change (YELLOW). Retention: nothing is deleted at this moment. Key rotation, root side:
+        runs here, resumable; owner side: the approval is verified and spent here, the owner's service then rotates its own vault."""
         self._check_payload(payload)
         self._no_other_change()
         rid = self._decide(payload, proof_token, challenge, "approve", "backup")
+        action = payload["action"]
         try:
-            result = dict(self.vault.set_retention(payload["daily"], payload["weekly"], rid), action="retention")
+            if action == "retention":
+                result = dict(self.vault.set_retention(payload["daily"], payload["weekly"], rid), action=action)
+            elif payload["side"] == "root":
+                outcome = self.vault.rotate_key(payload["mode"], rid)
+                result = dict(outcome, action=action, side="root")
+                if not outcome.get("ok"):
+                    result["stopped"] = outcome.get("error", "key_rotation_failed")
+                    result["resumes_automatically"] = outcome.get("error") not in (
+                        "key_rotation_request_invalid", "key_rotation_request_already_used", "key_is_present_use_normal_mode",
+                        "backup_key_missing_use_lost_key_mode", "backup_key_does_not_match_the_vault")
+            else:
+                result = {"ok": True, "action": action, "side": "owner", "mode": payload["mode"], "owner_side_authorized": rid}
         except Exception as error:
-            result = {"ok": False, "stopped": getattr(error, "code", "unexpected_%s" % type(error).__name__), "action": "retention"}
+            result = {"ok": False, "stopped": getattr(error, "code", "unexpected_%s" % type(error).__name__), "action": action}
         self._record_result(rid, "done" if result.get("ok") else "failed", result)
         return result
 

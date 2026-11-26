@@ -274,6 +274,28 @@ def _owner_backup_before_upgrade(state):
     return before
 
 
+def _owner_after_approval(get_vault, *, sleep=time.sleep, attempts=20):
+    """After the installer verified and spent an owner-side key-rotation approval, rotate the owner's own vault with it."""
+    def after(payload, rid, result):
+        if (payload.get("kind") != "backup" or payload.get("action") != "rotate_key" or payload.get("side") != "owner"
+                or result.get("owner_side_authorized") != rid):
+            return None
+        vault_ = get_vault()
+        if vault_ is None:
+            return dict(result, ok=False, stopped="backups_not_available")
+        for _ in range(attempts):                       # a scheduled backup may hold the vault for a while: wait for it
+            outcome = vault_.rotate_key(payload["mode"], rid)
+            if outcome.get("error") != "another_backup_operation_is_running":
+                break
+            sleep(30)
+        merged = dict(result, **{k: v for k, v in outcome.items() if k != "ok"})
+        merged["ok"] = bool(outcome.get("ok"))
+        if not outcome.get("ok"):
+            merged["stopped"] = outcome.get("error", "key_rotation_failed")
+        return merged
+    return after
+
+
 def start_owner_service(config, *, broker=None, exchange=None, start_listener=None, start_mcp=None, tokens=None,
                         clock=time.time, monotonic=time.monotonic, reconcile_interval=5.0, give_up_after=600.0,
                         resolve_apt=None, vault=None, backups=True):
@@ -329,6 +351,7 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
         from .system_status import SystemStatus
         home = os.path.expanduser("~")
         service.vault = vault or owner_vault(config, retention_source=lambda: broker.vault_settings())
+        flow.after_run = _owner_after_approval(lambda: service.vault)
         diag = dict(policy=safefs.Policy(home=home,
                                          project_roots=safefs.load_project_roots(state / PROJECT_ROOTS_FILE, home),
                                          extra_deny=[config.state_dir, config.pairing_db, config.broker_socket]),

@@ -192,6 +192,26 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
             return receipt(result)
         return run("commander_request_backup_retention", device_id, work, write=True)
 
+    @server.tool(name="commander_request_backup_key_rotation", title="Ask the owner to replace a backup encryption key",
+                 annotations=FILES_A_REQUEST,
+                 description=("Ask the owner to approve a new backup encryption key for side 'root' (installer) or 'owner' (his own "
+                              "side). mode 'normal': every backup is re-encrypted and checked, resumable after any interruption; also "
+                              "the fix for nonce_log_missing. mode 'lost_key': only when backup_key_missing; unreadable backups are kept "
+                              "aside, never deleted. He approves on his phone; you cannot see or touch any key."))
+    def request_backup_key_rotation(device_id: str, side: str, mode: str = "normal") -> dict:
+        def work(owner):
+            from .. import vault as _vault
+            if side not in ("root", "owner") or mode not in _vault.ROTATION_MODES:
+                raise WorkspaceError("side_root_or_owner_and_mode_normal_or_lost_key")
+            expires = now() + timedelta(hours=1)
+            payload = {"kind": "backup", "action": "rotate_key", "side": side, "mode": mode, "owner": owner,
+                       "device": device_id, "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            result, _ = store.submit(kind="backup", software="stynpilot-backup-key-%s" % side, device=device_id, owner=owner,
+                                     proposer=ctx.proposer, payload=payload, summary=render_summary(payload),
+                                     expires=expires.timestamp())
+            return receipt(result)
+        return run("commander_request_backup_key_rotation", device_id, work, write=True)
+
     # -- releases (dev16): prepare a verified build (GREEN), then ask for ONE approval that signs, publishes and installs ------------
     _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 

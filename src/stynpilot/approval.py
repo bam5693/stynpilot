@@ -56,7 +56,7 @@ class ApprovalFlow:
     ``exchange``: callable(code, code_verifier) -> Auth0 ID token string.
     ``authorize``: dict(endpoint, client_id, redirect_uri)."""
 
-    def __init__(self, *, store, broker, exchange, authorize, clock=time.time, background=False, before_run=None):
+    def __init__(self, *, store, broker, exchange, authorize, clock=time.time, background=False, before_run=None, after_run=None):
         if (type(authorize) is not dict or type(authorize.get("endpoint")) is not str
                 or not authorize["endpoint"].startswith("https://")
                 or type(authorize.get("redirect_uri")) is not str
@@ -66,6 +66,7 @@ class ApprovalFlow:
         self.store, self.broker, self.exchange, self.authorize = store, broker, exchange, dict(authorize)
         self.clock, self._lock = clock, threading.Lock()
         self.before_run = before_run          # optional owner-side step (e.g. an owner-state backup) before an upgrade runs
+        self.after_run = after_run            # optional owner-side step after the installer approved (owner key rotation)
         # background=True: the install runs on ONE worker thread, so the approval page and its other requests
         # stay responsive during a long install. Progress is the request's durable state (running -> done...).
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stynpilot-approve") if background else None
@@ -334,6 +335,11 @@ class ApprovalFlow:
                 result = self._after_error(rid, error, payload.get("kind"))
             if result.get("pending"):
                 return {"state": "running", "request_id": rid, "ok": None}   # settled later from the installer's record
+            if self.after_run is not None and result.get("ok"):
+                try:
+                    result = self.after_run(payload, rid, result) or result
+                except Exception as error:
+                    result = dict(result, ok=False, stopped="owner_side_step_failed_%s" % type(error).__name__)
             state_ = self._state_for(result)
             self.store.transition(rid, "running", state_, result=result)
             return {"state": state_, "request_id": rid, "ok": bool(result.get("ok"))}

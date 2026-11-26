@@ -100,12 +100,26 @@ def render_summary(payload):
                     "Approve only if you just created this passkey yourself. If you did not, deny it.", expires]
         return ["Remove the passkey with short ID %s." % str(payload.get("kid")),
                 "It can no longer approve anything. Other passkeys and your Auth0 sign-in keep working.", expires]
+    if payload.get("kind") == "backup" and payload.get("action") == "rotate_key":
+        expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
+        where = "the root installer side" if payload.get("side") == "root" else "your own side"
+        if payload.get("mode") == "lost_key":
+            return ["Start a NEW encryption key for StyNpilot's backups on %s, because the old key is missing." % where,
+                    "Backups that needed the missing key can no longer be opened by StyNpilot. They are moved to a separate "
+                    "'unreadable' folder and kept; nothing is deleted. Backups made with an older key that is still present stay "
+                    "where they are and stay usable.",
+                    "Approve only if you know the key is really gone (for example after a disk problem).", expires]
+        return ["Replace the encryption key of StyNpilot's backups on %s with a new key." % where,
+                "Every backup is re-encrypted with the new key and checked before it replaces the old copy. If anything is "
+                "interrupted (even a power cut), it carries on safely from where it stopped. The old key is destroyed only when "
+                "no kept backup needs it any more; nothing is restored or deleted.", expires]
     if payload.get("kind") == "backup":
         expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
         return ["Change how many encrypted backups StyNpilot keeps: %s daily and %s weekly (for the root installer side and "
                 "your own side)." % (payload.get("daily"), payload.get("weekly")),
-                "Older backups beyond that are deleted when new ones are made. Whatever this says, the newest complete, verified "
-                "backup is always kept, and backups that failed a check are kept for inspection.",
+                "On the root installer side, older backups beyond that are deleted when new ones are made. On your own side, "
+                "automatic deletion is temporarily turned off, so all of your side's backups are kept for now. Whatever this says, "
+                "the newest complete, verified backup is always kept, and backups that failed a check are kept for inspection.",
                 "Nothing is backed up, restored or deleted right now by this approval.", expires]
     if payload.get("kind") == "runner":
         expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")

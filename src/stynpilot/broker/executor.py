@@ -689,12 +689,20 @@ class Executor:
         if self.jobs is None:
             raise ExecutionDenied("runner_not_available")
         action = payload.get("action")
-        if (set(payload) != self._RUNNER_KEYS or payload.get("kind") != "runner" or action not in ("setup", "enroll", "unenroll")
+        if (set(payload) != self._RUNNER_KEYS or payload.get("kind") != "runner" or action not in ("setup", "enroll", "unenroll", "settle_inference")
                 or payload.get("owner") != self.owner or payload.get("device") != self.device):
             raise ExecutionDenied("runner_request_invalid")
         name = payload.get("name")
         if type(name) is not str or (name != "" if action == "setup" else not self._NAME.fullmatch(name)):
             raise ExecutionDenied("runner_request_invalid")
+        if action == "settle_inference":
+            if not managed_activity.ID.fullmatch(name):
+                raise ExecutionDenied("activity_claim_invalid")
+            try:
+                if managed_activity.current(self.dir) != {"kind": "inference", "job_id": name}:
+                    raise ExecutionDenied("activity_claim_changed")
+            except managed_activity.ActivityError as error:
+                raise ExecutionDenied(error.code) from None
         try:
             expires = datetime.strptime(payload["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         except (KeyError, TypeError, ValueError):
@@ -713,10 +721,18 @@ class Executor:
         """Execute an owner-approved runner change (setup, authorize a workspace, remove one). Synchronous."""
         self._check_payload(payload)
         self._no_other_change()
-        rid = self._decide(payload, proof_token, challenge, "approve", "runner")
+        if payload["action"] == "settle_inference":
+            rid, _ = payload_hash(payload)
+            fingerprint, key = self._prove(rid, proof_token, challenge, "approve")
+            if key is None:
+                raise ExecutionDenied("inference_settlement_requires_passkey")
+            self._used_passkey(key, rid, "approve")
+            self.runs.consume(challenge=challenge, request_id=rid, decision="approve", proof=fingerprint, kind="runner")
+        else:
+            rid = self._decide(payload, proof_token, challenge, "approve", "runner")
         try:
             result = self._runner_do(payload)
-        except (JobError, runner_policy.RunnerError) as stopped:
+        except (JobError, runner_policy.RunnerError, managed_activity.ActivityError) as stopped:
             result = {"ok": False, "stopped": stopped.code, "changed_anything": None, "action": payload["action"]}
         except Exception as error:
             result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__, "changed_anything": None,
@@ -736,6 +752,14 @@ class Executor:
             test = self.jobs.selftest()
             return {"ok": True, "action": "setup", "runner_user": info["runner_user"], "enabled": True,
                     "selftest": self._safe_selftest(test)}
+        if action == "settle_inference":
+            from ..inference_settlement import stop_and_verify
+            # The exact claim and passkey were checked under exclusive admission.
+            if managed_activity.current(self.dir) != {"kind": "inference", "job_id": payload["name"]}:
+                raise managed_activity.ActivityError("activity_claim_changed")
+            stop_and_verify(self.owner_uid)
+            managed_activity.finish(self.dir, "inference", payload["name"])
+            return {"ok": True, "action": action, "service_stopped": True}
         path = self._workspace_path(payload["name"])
         if action == "enroll":
             done = self.jobs.enroll(path)           # the owner-side helper creates the folder if needed; root never touches the home
@@ -775,6 +799,14 @@ class Executor:
                     "gate_open": not root_restore.held(self.dir) and enabled and test.get("ok") is True and test.get("version") == jobs.version,
                     "workspaces": [name_of(w["path"]) for w in jobs.workspaces()],
                     "recipes": {rid: r.title for rid, r in sorted(runner_policy.RECIPES.items())}}
+        if call == "inference_claim_status":
+            if args:
+                raise ExecutionDenied("activity_claim_invalid")
+            try:
+                claim = managed_activity.current(self.dir)
+            except managed_activity.ActivityError as error:
+                raise ExecutionDenied(error.code) from None
+            return {"claim": claim if claim and claim["kind"] == "inference" else None}
         if call in ("inference_claim", "inference_finish"):
             if set(args) != {"job_id"}:
                 raise ExecutionDenied("activity_claim_invalid")

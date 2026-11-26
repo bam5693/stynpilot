@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import os
 import pwd
+import re
 import subprocess
+import time
 from pathlib import Path
 
 from .local_ai_readiness import UNIT, LISTEN, read_bounded
@@ -36,7 +38,7 @@ def owner_command(uid, operation):
              "XDG_RUNTIME_DIR": f"/run/user/{uid}",
              "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus"},
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, timeout=30, check=True)
+        stderr=subprocess.DEVNULL, timeout=5 if operation == "show" else 30, check=True)
     if len(result.stdout) > 16384:
         raise ActivityError("inference_unit_evidence_invalid")
     return result.stdout.decode("utf-8")
@@ -104,3 +106,56 @@ def stop_and_verify(uid, *, command=owner_command, scan=listeners, empty=empty_g
         raise
     except (OSError, KeyError, ValueError, subprocess.SubprocessError, UnicodeError):
         raise ActivityError("inference_quiescence_unverified") from None
+
+
+def verify_idle(uid, *, command=owner_command, scan=listeners, read=read_bounded,
+                clock=time.monotonic, sleep=time.sleep):
+    """Bounded residual-service observation after a successful managed request.
+
+    This is not a proof against direct manual traffic from the trusted owner.
+    Keep the claim if the model worker, subgroup or more than 1 GiB of memory
+    remains, or if evidence is ambiguous. Never stop a service here.
+    """
+    group = service_cgroup(uid)
+    deadline = clock() + 10
+    def sample():
+        info = unit_info(uid, command)
+        if inactive(info):
+            return (info, "stopped") if empty_group(group, read=read) and not scan() else None
+        if info["ActiveState"] != "active" or not re.fullmatch(r"[1-9][0-9]{0,9}", info["MainPID"]):
+            return None
+        pid = info["MainPID"]
+        if pid == "1":
+            return None
+        # The service must be the sole listener and have no model child process
+        # or descendant cgroup. memory.current is deliberately conservative.
+        raw = scan()
+        lines = raw.decode("utf-8").splitlines()
+        if len(lines) != 1:
+            return None
+        fields = lines[0].split()
+        if len(fields) < 6 or fields[0] != "LISTEN" or fields[3] != "127.0.0.1:11435":
+            return None
+        if re.findall(r"\bpid=([0-9]+)\b", lines[0]) != [pid]:
+            return None
+        if read(group / "cgroup.procs", 4096).split() != [pid.encode()]:
+            return None
+        stats = dict(line.split() for line in read(group / "cgroup.stat", 4096).decode("ascii").splitlines())
+        if stats.get("nr_descendants") != "0" or stats.get("nr_dying_descendants") != "0":
+            return None
+        if int(read(group / "memory.current", 128)) > 1024**3 or int(read(group / "memory.swap.current", 128)) != 0:
+            return None
+        return (info, "idle")
+    try:
+        while True:
+            a = sample()
+            if a is not None and sample() == a:
+                return
+            if clock() >= deadline:
+                break
+            sleep(0.25)
+    except ActivityError:
+        raise
+    except (OSError, KeyError, ValueError, subprocess.SubprocessError, UnicodeError):
+        pass
+    raise ActivityError("inference_quiescence_unverified")

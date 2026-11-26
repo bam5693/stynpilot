@@ -819,6 +819,10 @@ class Executor:
                         raise ExecutionDenied(error.code) from None
                     managed_activity.claim(self.dir, "inference", args["job_id"])
                 else:
+                    if managed_activity.current(self.dir) != {"kind": "inference", "job_id": args["job_id"]}:
+                        raise ExecutionDenied("activity_claim_changed")
+                    from ..inference_settlement import verify_idle
+                    verify_idle(self.owner_uid)
                     managed_activity.finish(self.dir, "inference", args["job_id"])
             except managed_activity.ActivityError as error:
                 raise ExecutionDenied(error.code) from None

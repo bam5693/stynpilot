@@ -47,7 +47,7 @@ import sys
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -439,6 +439,9 @@ class Executor:
     def _decide(self, payload, proof_token, challenge, decision, kind):
         rid, _ = payload_hash(payload)
         fingerprint, passkey = self._prove(rid, proof_token, challenge, decision)
+        if (decision == "approve" and payload.get("kind") == "runner"
+                and payload.get("action") == "settle_inference" and passkey is None):
+            raise ExecutionDenied("inference_settlement_requires_passkey")
         self._used_passkey(passkey, rid, decision)
         self.runs.consume(challenge=challenge, request_id=rid, decision=decision, proof=fingerprint, kind=kind)
         return rid
@@ -719,38 +722,28 @@ class Executor:
         return payload
 
     def runner_admin(self, payload, proof_token, challenge):
-        """Execute an owner-approved runner change. Settlement requires an exclusive worker fence."""
+        """Execute owner-approved runner changes through the single proof gate."""
+        fence = nullcontext()
         if type(payload) is dict and payload.get("action") == "settle_inference":
             if self.inference_settlement_fence is None:
                 raise ExecutionDenied("inference_fence_unavailable")
-            try:
-                with self.inference_settlement_fence():
-                    return self._runner_admin(payload, proof_token, challenge)
-            except managed_activity.ActivityError as error:
-                raise ExecutionDenied(error.code) from None
-        return self._runner_admin(payload, proof_token, challenge)
-
-    def _runner_admin(self, payload, proof_token, challenge):
-        self._check_payload(payload)
-        self._no_other_change()
-        if payload["action"] == "settle_inference":
-            rid, _ = payload_hash(payload)
-            fingerprint, key = self._prove(rid, proof_token, challenge, "approve")
-            if key is None:
-                raise ExecutionDenied("inference_settlement_requires_passkey")
-            self._used_passkey(key, rid, "approve")
-            self.runs.consume(challenge=challenge, request_id=rid, decision="approve", proof=fingerprint, kind="runner")
-        else:
-            rid = self._decide(payload, proof_token, challenge, "approve", "runner")
+            fence = self.inference_settlement_fence()
         try:
-            result = self._runner_do(payload)
-        except (JobError, runner_policy.RunnerError, managed_activity.ActivityError) as stopped:
-            result = {"ok": False, "stopped": stopped.code, "changed_anything": None, "action": payload["action"]}
-        except Exception as error:
-            result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__, "changed_anything": None,
-                      "action": payload["action"]}
-        self._record_result(rid, "done" if result.get("ok") else "failed", result)
-        return result
+            with fence:
+                self._check_payload(payload)
+                self._no_other_change()
+                rid = self._decide(payload, proof_token, challenge, "approve", "runner")
+                try:
+                    result = self._runner_do(payload)
+                except (JobError, runner_policy.RunnerError, managed_activity.ActivityError) as stopped:
+                    result = {"ok": False, "stopped": stopped.code, "changed_anything": None, "action": payload["action"]}
+                except Exception as error:
+                    result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__, "changed_anything": None,
+                              "action": payload["action"]}
+                self._record_result(rid, "done" if result.get("ok") else "failed", result)
+                return result
+        except managed_activity.ActivityError as error:
+            raise ExecutionDenied(error.code) from None
 
     def _workspace_path(self, name):
         if type(name) is not str or not self._NAME.fullmatch(name) or self.jobs.projects_dir is None:

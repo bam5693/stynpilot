@@ -104,13 +104,15 @@ class RunnerToolTests(unittest.TestCase):
         (self.projects / "app").mkdir(parents=True)
         (self.projects / "other").mkdir()
         self.broker = FakeBroker()
+        from unittest.mock import Mock
+        self.lab_probe = Mock(return_value={"launch_enabled": False, "preflight_checks_passed": True})
         self.limiter = RateLimit(per_minute=1000)
         self.router, self.clients = router, clients
         self.server = create_server(router=router, resource_url=AUDIENCE,
                                     propose=dict(clients=clients, store=self.store, approval_url="https://ryzen.example.test/app",
                                                  clock=lambda: self.now[0]),
                                     runner=dict(broker=self.broker, projects_dir=str(self.projects), clock=lambda: self.now[0],
-                                                limiter=self.limiter))
+                                                limiter=self.limiter, lab_probe=self.lab_probe))
 
     def call(self, name, arguments, token="chatgpt"):
         who = Tokens.valid[token]
@@ -245,6 +247,18 @@ class RunnerToolTests(unittest.TestCase):
         outs = [self.call("runner_status", self.d()) for _ in range(5)]
         self.assertEqual([o["ok"] for o in outs], [True, True, True, False, False])
         self.assertEqual(outs[-1]["error"], "rate_limited_try_again_in_a_minute")
+
+    def test_lab_status_is_read_only_and_not_launch_authority(self):
+        names = {t.name for t in asyncio.run(self.server.list_tools())}
+        self.assertIn("dev_lab_status", names)
+        self.assertNotIn("dev_lab_start", names)
+        out = self.call("dev_lab_status", self.d(), "readonly")
+        self.assertTrue(out["ok"], out)
+        self.assertFalse(out["result"]["launch_enabled"])
+        self.assertFalse(self.call("dev_lab_status", self.d(), "stranger")["ok"])
+        self.assertFalse(self.call("dev_lab_status", {"device_id": "dtdev_OTHER"})["ok"])
+        self.lab_probe.assert_called_once_with()
+        self.assertEqual(self.broker.calls, [])
 
 
 if __name__ == "__main__":

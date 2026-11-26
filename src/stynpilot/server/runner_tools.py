@@ -40,7 +40,7 @@ def _error(code):
 
 
 def register(server, *, router, clients, store, bearer, broker, projects_dir, approval_url=None, clock=None, limiter=None,
-             vault=None, inference_readiness_probe=None):
+             vault=None, inference_readiness_probe=None, inference_worker_lease=None):
     gate = ProposeGate(router=router, clients=clients)
     limiter = limiter or RateLimit(per_minute=120)
     now = clock or (lambda: datetime.now(timezone.utc))
@@ -85,7 +85,7 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
         return {"ok": True, "device_id": device_id, "result": result}
 
     # A narrow, owner-side inference bridge, not a network exception for the project runner.
-    from .. import local_ai, local_ai_readiness
+    from .. import local_ai, local_ai_readiness, inference_fence
     def activity_call(call, jid):
         result = broker.runner(call, {"job_id": jid})
         if type(result) is not dict or result.get("ok") is not True:
@@ -93,7 +93,8 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
 
     inference = local_ai.Jobs(
         reserve=lambda jid: activity_call("inference_claim", jid),
-        finish=lambda jid: activity_call("inference_finish", jid))
+        finish=lambda jid: activity_call("inference_finish", jid),
+        worker_lease=inference_worker_lease or inference_fence.worker)
     readiness_probe = inference_readiness_probe or local_ai_readiness.inspect
 
     @server.tool(name="local_ai_readiness", title="Inspect fixed local AI resource controls", annotations=READ_ONLY,

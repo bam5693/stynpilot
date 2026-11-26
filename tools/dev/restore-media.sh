@@ -2,7 +2,10 @@
 # Prepare synthetic guest media from the local, verified package cache.
 set -eu
 umask 077
-test "$#" -eq 1
+test "$#" -ge 1 && test "$#" -le 2
+if [ "$#" -eq 2 ]; then
+    case "$2" in --fault-cases|--power-case) ;; *) exit 2;; esac
+fi
 package=$(realpath "$1")
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 dev_dir=${STYNPILOT_DEV_DIR:-"$HOME/.local/share/stynpilot-dev"}
@@ -28,6 +31,7 @@ bootcmd:
 runcmd:
   - [sh, -c, 'mkdir -p /mnt/stynpilot-fixture; systemctl stop serial-getty@ttyS0.service; mount -o ro /dev/sr1 /mnt/stynpilot-fixture && bash /mnt/stynpilot-fixture/run.sh >/var/log/stynpilot-fixture.log 2>&1; result=$?; cat /var/log/stynpilot-fixture.log >/dev/ttyS0; echo FIXTURE_EXIT=$result >/dev/ttyS0; systemctl poweroff --no-block']
 EOF
+if [ "$#" -eq 2 ]; then touch "$run/payload/${2#--}"; fi
 cat > "$run/payload/run.sh" <<'EOF'
 #!/bin/bash
 set -euxo pipefail
@@ -39,7 +43,10 @@ apt_local=(apt-get -o Dir::Etc::sourcelist=/tmp/stynpilot.list -o Dir::Etc::sour
 "${apt_local[@]}" -y --no-install-recommends install stynpilot acl
 dpkg-query -W stynpilot
 /usr/bin/stynpilot version
-if ! /usr/bin/python3 -IB /mnt/stynpilot-fixture/guest-restore.py; then
+fixture=(/usr/bin/python3 -IB /mnt/stynpilot-fixture/guest-restore.py)
+if [[ -e /mnt/stynpilot-fixture/fault-cases ]]; then fixture+=(--fault-cases); fi
+if [[ -e /mnt/stynpilot-fixture/power-case ]]; then fixture+=(--power-case); fi
+if ! "${fixture[@]}"; then
     journalctl -b -u stynpilot-installer.service -u stynpilot-restore.service -u stynpilot-restore.path --no-pager -n 140
     exit 1
 fi

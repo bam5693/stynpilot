@@ -15,3 +15,5 @@ Docker and Compose can be reused where a scoped runtime already exists. This rep
 The packaged Stage 3 operation restores selected installer records using a verified archive, existing authority, vault keys, and a fresh verified safety copy. It preserves settings and owner-side state. Complete system restore, lost vault keys and lost installer authority require separate procedures.
 
 For a scoped source review, run ShellCheck on `tools/dev/*.sh`, Pyflakes on the modified Python files, and Bandit with Python 3.14 support on the privileged code paths. Keep the findings with the candidate logs. These checks complement the package, runtime and confinement tests.
+
+For recovery fault scenarios, build media with `tools/dev/restore-media.sh PACKAGE --fault-cases` and require the serial marker `STYNPILOT_RESTORE_FAULT_CASES_OK`. This exercises a temporary owner endpoint outage and a persistent outage in the disposable guest. For a power interruption, build media with `--power-case` and launch with `--power-cycle-marker STYNPILOT_CUT_POWER_NOW --marker STYNPILOT_POWER_RECOVERY_OK`. Preserve both serial logs. A missing marker is a failed or incomplete run.

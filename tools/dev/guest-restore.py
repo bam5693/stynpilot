@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import signal
 import ssl
 import subprocess
 import sys
@@ -29,7 +30,7 @@ from stynpilot.service import InstallerConfig, root_vault
 OWNER = "synthetic-owner"
 DEVICE = "dtdev_SYNTHETIC900"
 HOST = "issuer.example.test"
-ISSUER = "https://" + HOST + ":24443/"
+ISSUER = "https://" + HOST + "/"
 STATE = Path("/var/lib/stynpilot-installer")
 ETC = Path("/etc/stynpilot")
 SOCKET = "/run/stynpilot/installer.sock"
@@ -38,6 +39,8 @@ UID, GID = OWNER_USER.pw_uid, OWNER_USER.pw_gid
 HOME = Path(OWNER_USER.pw_dir)
 CONFIG = HOME / ".config/stynpilot/owner.json"
 PYTHON = sys.executable
+LAB = Path("/var/lib/stynpilot-lab")
+RESUME = LAB / "power-resume.json"
 
 
 def trim():
@@ -87,7 +90,11 @@ def issuer():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             body = {"keys": [public]} if self.path == "/jwks" else {
-                "issuer": ISSUER, "jwks_uri": ISSUER + "jwks"}
+                "issuer": ISSUER, "jwks_uri": ISSUER + "jwks",
+                "authorization_endpoint": ISSUER + "authorize", "token_endpoint": ISSUER + "token",
+                "revocation_endpoint": ISSUER + "revoke", "response_types_supported": ["code"],
+                "code_challenge_methods_supported": ["S256"], "grant_types_supported": ["authorization_code", "refresh_token"],
+                "scopes_supported": ["openid", "offline_access"]}
             raw = json.dumps(body).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -102,7 +109,7 @@ def issuer():
         hosts.write(f"\n127.0.0.1 {HOST}\n")
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
-    server = ThreadingHTTPServer(("127.0.0.1", 24443), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", 443), Handler)
     server.socket = context.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
@@ -150,6 +157,7 @@ def setup():
 
 def run():
     keys = setup()
+    fault_cases = "--fault-cases" in sys.argv[1:]
     auth = SoftAuthenticator("https://owner.example.test", "owner.example.test")
     enrollment = "e" * 64
     keys.open_window(enrollment, "Guest passkey", "fixture")
@@ -163,7 +171,17 @@ def run():
     backup = vault.backup_now()
     assert backup["ok"] and backup["complete"], backup
     archive_marker.unlink()
-    details = broker("restore_preview", backup["backup"])
+    power_case = "--power-case" in sys.argv[1:]
+    approved_restore(auth, backup["backup"], archive_marker, "power" if power_case else "success")
+    if fault_cases:
+        archive_marker.unlink()
+        approved_restore(auth, backup["backup"], archive_marker, "rollback")
+        approved_restore(auth, backup["backup"], archive_marker, "safe")
+        print("STYNPILOT_RESTORE_FAULT_CASES_OK", flush=True)
+
+
+def approved_restore(auth, archive, archive_marker, scenario):
+    details = broker("restore_preview", archive)
     expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5)
     payload = {**details, "action": "restore_root", "kind": "backup", "side": "root", "owner": OWNER, "device": DEVICE,
                "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
@@ -171,6 +189,10 @@ def run():
     challenge = broker("challenge", payload, "approve")["challenge"]
     nonce = bytes.fromhex(decision_nonce("approve", rid, rid, challenge))
     pid = command("systemctl", "show", "stynpilot-installer.service", "-p", "MainPID", "--value")
+    if scenario in ("rollback", "safe"):
+        as_owner("systemctl", "--user", "stop", "stynpilot-owner.service")
+    if scenario == "power":
+        arm_power_recovery(rid, archive_marker)
     try:
         result = broker("backup_admin", payload, json.dumps(auth.assert_(nonce)), challenge)
         assert result["pending"], result
@@ -182,8 +204,16 @@ def run():
     held = False
     deadline = time.monotonic() + 210
     state = None
+    owner_restarted = False
     while time.monotonic() < deadline and state is None:
         try:
+            journal = STATE / "restore-control/pending.json"
+            if scenario == "power" and journal.exists() and json.loads(journal.read_text())["phase"] == "verify":
+                await_power_cut(journal)
+            if scenario == "rollback" and not owner_restarted and journal.exists():
+                if json.loads(journal.read_text())["phase"] == "verify_original":
+                    as_owner("systemctl", "--user", "start", "stynpilot-owner.service")
+                    owner_restarted = True
             state = result()
             if state is None and (STATE / "restore-control/pending.json").exists():
                 held |= not broker("runner", "status")["gate_open"]
@@ -191,16 +221,100 @@ def run():
             pass
         time.sleep(0.2)
     assert state is not None, "no durable terminal restore outcome"
+    assert scenario != "power", "restoration finished before the power interruption"
     print("RUNNER_GATE_OBSERVED_CLOSED=" + str(held), flush=True)
     print(json.dumps(state), flush=True)
-    assert state["state"] == "done", state
-    assert archive_marker.is_file()
+    verdict = state["result"]
+    runner = broker("runner", "status")
+    if scenario == "safe":
+        assert state["state"] == "needs_owner_intervention" and verdict["restore"] == "safe_recovery" and not runner["gate_open"]
+        assert (STATE / "restore-control/safe.json").is_file()
+        assert not archive_marker.exists()
+        print("STYNPILOT_SAFE_RECOVERY_OK", flush=True)
+        return
     trim()
     assert pid != command("systemctl", "show", "stynpilot-installer.service", "-p", "MainPID", "--value")
-    runner = broker("runner", "status")
-    assert runner["gate_open"] and len(runner["selftest"]["passed"]) == 21, runner
-    print("STYNPILOT_APPROVED_RESTORE_OK", flush=True)
+    assert held and runner["gate_open"] and len(runner["selftest"]["passed"]) == 21, runner
+    if scenario == "rollback":
+        assert owner_restarted and state["state"] == "failed" and verdict["restore"] == "rolled_back", state
+        assert not archive_marker.exists()
+        print("STYNPILOT_AUTOMATIC_ROLLBACK_OK", flush=True)
+    else:
+        assert state["state"] == "done" and archive_marker.is_file(), state
+        print("STYNPILOT_APPROVED_RESTORE_OK", flush=True)
+
+
+def arm_power_recovery(rid, archive_marker):
+    LAB.mkdir(mode=0o700)
+    write(RESUME, {"rid": rid, "marker": str(archive_marker)})
+    unit = Path("/etc/systemd/system/stynpilot-lab-resume.service")
+    unit.write_text("""[Unit]
+Description=Resume the synthetic Stage 3 power interruption test
+ConditionPathExists=/var/lib/stynpilot-lab/power-resume.json
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/mkdir -p /mnt/stynpilot-fixture
+ExecStartPre=/usr/bin/mount -o ro /dev/sr1 /mnt/stynpilot-fixture
+ExecStart=/usr/bin/python3 -IB /mnt/stynpilot-fixture/guest-restore.py --after-power-cut
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/ttyS0
+TimeoutStartSec=360
+
+[Install]
+WantedBy=multi-user.target
+""")
+    command("systemctl", "enable", "stynpilot-lab-resume.service")
+    # The next boot uses loopback services only.
+    command("systemctl", "mask", "systemd-networkd-wait-online.service")
+    Path("/etc/cloud/cloud-init.disabled").touch()
+    os.sync()
+
+
+def await_power_cut(journal):
+    pid = int(command("systemctl", "show", "stynpilot-restore.service", "-p", "MainPID", "--value"))
+    if not pid:
+        return
+    os.kill(pid, signal.SIGSTOP)
+    try:
+        if not journal.exists() or json.loads(journal.read_text())["phase"] != "verify":
+            return
+        assert not broker("runner", "status")["gate_open"]
+        with Path("/dev/ttyS0").open("w") as output:
+            print("STYNPILOT_CUT_POWER_NOW", file=output, flush=True)
+        time.sleep(30)
+        raise RuntimeError("host did not cut power")
+    finally:
+        os.kill(pid, signal.SIGCONT)
+
+
+def resume_power_test():
+    try:
+        expected = json.loads(RESUME.read_text())
+        issuer()
+        command("systemctl", "start", f"user@{UID}.service")
+        as_owner("systemctl", "--user", "start", "stynpilot-owner.service")
+        command("systemctl", "start", "stynpilot-installer.service")
+
+        def completed():
+            record = broker("status", expected["rid"])
+            return record if record["state"] in ("done", "failed", "needs_owner_intervention") else None
+
+        result = until(completed)
+        assert result["state"] == "done", result
+        assert Path(expected["marker"]).is_file()
+        trim()
+        runner = broker("runner", "status")
+        assert runner["gate_open"] and len(runner["selftest"]["passed"]) == 21, runner
+        print("STYNPILOT_POWER_RECOVERY_OK", flush=True)
+    finally:
+        command("systemctl", "poweroff", "--no-block")
 
 
 if __name__ == "__main__":
-    run()
+    if "--after-power-cut" in sys.argv[1:]:
+        resume_power_test()
+    else:
+        run()

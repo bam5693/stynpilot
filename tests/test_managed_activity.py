@@ -71,3 +71,12 @@ class ActivityTests(unittest.TestCase):
             with self.assertRaises(activity.ActivityError):
                 activity.claim(self.state,kind,job)
         self.assertFalse(activity.held(self.state))
+
+    def test_current_claim_is_exact_and_corruption_is_not_absence(self):
+        self.assertIsNone(activity.current(self.state))
+        activity.claim(self.state,"inference",self.job)
+        self.assertEqual(activity.current(self.state),{"kind":"inference","job_id":self.job})
+        activity.path(self.state).write_text("inference:"+self.job+"\n\n")
+        with self.assertRaises(activity.ActivityError):
+            activity.current(self.state)
+        self.assertTrue(activity.held(self.state))

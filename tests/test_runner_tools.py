@@ -117,6 +117,7 @@ class RunnerToolTests(unittest.TestCase):
         (self.projects / "app").mkdir(parents=True)
         (self.projects / "other").mkdir()
         self.broker = FakeBroker()
+        from contextlib import nullcontext
         from unittest.mock import Mock
         self.readiness = Mock(return_value={"resource_checks_passed": True})
         self.limiter = RateLimit(per_minute=1000)
@@ -125,7 +126,8 @@ class RunnerToolTests(unittest.TestCase):
                                     propose=dict(clients=clients, store=self.store, approval_url="https://ryzen.example.test/app",
                                                  clock=lambda: self.now[0]),
                                     runner=dict(broker=self.broker, projects_dir=str(self.projects), clock=lambda: self.now[0],
-                                                limiter=self.limiter, inference_readiness_probe=self.readiness))
+                                                limiter=self.limiter, inference_readiness_probe=self.readiness,
+                                                inference_worker_lease=nullcontext))
 
     def call(self, name, arguments, token="chatgpt"):
         who = Tokens.valid[token]

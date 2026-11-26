@@ -314,6 +314,8 @@ class ApprovalBoundaryTests(unittest.TestCase):
         self.assertFalse(rr.held(self.ex.dir))
 
     def enable_inference_fixture(self):
+        from contextlib import nullcontext
+        self.ex.inference_settlement_fence = nullcontext
         self.ex.jobs.projects_dir = str(self.ex.dir / "projects")
         self.ex.jobs.version = "test"
         self.ex.jobs.selftest_state = lambda: {"ran": True, "ok": True, "version": "test"}
@@ -403,6 +405,28 @@ class ApprovalBoundaryTests(unittest.TestCase):
             stop.assert_called_once_with(1000)
             self.assertFalse(managed_activity.held(self.ex.dir))
             self.assertFalse(self.door.handle(request)["ok"])
+
+    def test_settlement_busy_worker_refuses_before_spending_proof(self):
+        from stynpilot import managed_activity
+        self.enable_inference_fixture()
+        self.ex.owner_uid = 1000
+        self.assertTrue(self.inference_call("inference_claim")["ok"])
+        request = self.settlement_request()
+        from contextlib import contextmanager, nullcontext
+        @contextmanager
+        def busy():
+            raise managed_activity.ActivityError("inference_worker_busy")
+            yield
+        self.ex.inference_settlement_fence = busy
+        with mock.patch("stynpilot.inference_settlement.stop_and_verify") as stop:
+            self.assertEqual(self.door.handle(request)["error"], "inference_worker_busy")
+            stop.assert_not_called()
+            self.assertTrue(managed_activity.held(self.ex.dir))
+            self.assertEqual(self.ex.status(request_id(request["payload"])[0])["state"], "not_started")
+            self.ex.inference_settlement_fence = nullcontext
+            result = self.door.handle(request)
+            self.assertTrue(result["ok"] and result["result"]["ok"], result)
+            stop.assert_called_once_with(1000)
 
     def test_settlement_failure_retains_claim_and_recovery_gate(self):
         from stynpilot import managed_activity

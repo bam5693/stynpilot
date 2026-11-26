@@ -374,8 +374,11 @@ def _owner_rotation_reconciler(store, flow, vault_, broker):
             except Exception:
                 continue
             result = record.get("result") or {}
-            if record.get("state") in ("done", "failed") and result.get("rotation") in ("completed", "failed"):
-                store.settle_rotation(rid, "done" if record["state"] == "done" else "failed", result)
+            if result.get("action") != "rotate_key" or result.get("side") != "root":
+                continue
+            state = record.get("state")
+            if (state, result.get("rotation"), result.get("ok")) in (("done", "completed", True), ("failed", "failed", False)):
+                store.settle_rotation(rid, state, result)
     return reconcile
 
 
@@ -682,10 +685,10 @@ def main(argv=None):                                       # pragma: no cover - 
     args = parser.parse_args(argv)
     if args.role == "installer":
         config = InstallerConfig.from_file(args.config)
-        service = build_installer(config, jwks=fetch_jwks(config.issuer),
+        service = build_installer(config, jwks=fetch_jwks(config.issuer), root_vault=root_vault(args.config, config),
                                   jwks_loader=lambda: fetch_jwks(config.issuer))     # rotation: only on an unknown key ID
         from . import vault as _vault
-        service.vault = service.executor.attach_vault(root_vault(args.config, config))
+        service.vault = service.executor.vault
         _vault.start_scheduler(service.vault)                 # first backup shortly after start, then hourly checks; never raises
         service.serve_forever()
         return 0

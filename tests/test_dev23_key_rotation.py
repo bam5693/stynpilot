@@ -1,5 +1,6 @@
 """Dev23 stage 2: owner-approved backup key rotation (vault.py), interrupted at every durable step."""
 import json
+import multiprocessing
 import os
 import sys
 import unittest
@@ -924,6 +925,19 @@ class OwnerRotationBlocksPackageChangesTests(unittest.TestCase):
         self.assertEqual(out["error"], "owner_key_rotation_in_progress")
 
 
+def _exit_during_root_approval(state_dir, folder, payload, jwks, proof, challenge, method):
+    """A fresh installer process opens the fixture's durable state and exits at a selected write boundary."""
+    from stynpilot.broker.executor import Executor
+    from stynpilot.broker.proof import ProofVerifier
+    verifier = ProofVerifier(issuer=door.ISS, approval_client_id=door.APP, jwks=jwks)
+    root_vault = vault.Vault(side="root", state_dir=state_dir, folder=folder)
+    executor = Executor(state_dir=state_dir, owner=door.OWNER, device=door.DEVICE, verifier=verifier,
+                        require_root=False, root_vault=root_vault)
+    target = executor if method == "_record_result" else root_vault
+    with mock.patch.object(target, method, side_effect=lambda *args, **kw: os._exit(73)):
+        executor.backup_admin(payload, proof, challenge)
+
+
 @unittest.skipIf(door is None or tv is None, "needs PyJWT, cryptography")
 class RootOutcomeTests(unittest.TestCase):
     def setUp(self):
@@ -931,8 +945,103 @@ class RootOutcomeTests(unittest.TestCase):
         self.r = RotationApprovalTests("test_root_rotation_runs_once_with_the_owners_proof")
         self.r.setUp()
         self.addCleanup(self.r.doCleanups)
+        self.r.v = vault.Vault(side="root", state_dir=self.r.executor.dir, folder=self.r.v.folder)
         self.r.executor.attach_vault(self.r.v)
         self.assertTrue(self.r.v.backup_now()["ok"])
+
+    def crash(self, method):
+        payload = self.r.rpayload()
+        challenge = self.r.executor.challenge(payload, "approve")["challenge"]
+        proof = self.r.a.proof(payload, challenge)
+        child = multiprocessing.get_context("spawn").Process(
+            target=_exit_during_root_approval,
+            args=(self.r.executor.dir, self.r.v.folder, payload, door.Door.jwks, proof, challenge, method))
+        child.start()
+        try:
+            child.join(20)
+            self.assertEqual(child.exitcode, 73)
+        finally:
+            if child.is_alive():
+                child.kill()
+                child.join()
+            child.close()
+        rid = door.request_id(payload)[0]
+        self.assertEqual(self.r.executor.status(rid)["state"], "running")
+        return payload, rid
+
+    def restart(self):
+        from stynpilot.broker.executor import Executor
+        old = self.r.executor
+        fresh = vault.Vault(side="root", state_dir=self.r.v.state_dir, folder=self.r.v.folder)
+        return Executor(state_dir=old.dir, owner=old.owner, device=old.device, verifier=old.verifier,
+                        require_root=False, root_vault=fresh)
+
+    def test_restart_before_rotation_journal_keeps_attention_and_does_not_replay_approval(self):
+        payload, rid = self.crash("_save_journal")
+        restarted = self.restart()
+        self.assertEqual(restarted.needs_attention(), [rid + ".json"])
+        self.assertEqual(restarted.status(rid)["state"], "needs_owner_intervention")
+        self.assertIsNone(restarted.vault.journal_request())
+        self.assertNotIn("rotate", restarted.vault.tick())
+        self.assertIsNone(restarted.vault.rotation_outcome(rid))
+        self.r.a.denied("already_decided_or_used", restarted.challenge, payload, "approve")
+
+    def test_restart_during_root_rotation_resumes_and_corrects_the_owner_receipt(self):
+        from types import SimpleNamespace
+        from stynpilot import service
+        from stynpilot.requests import RequestStore
+        payload, rid = self.crash("_reencrypt_one")
+        store = RequestStore(self.r.a.tmp / "owner-requests.sqlite3")
+        receipt, _ = store.submit(kind="backup", software="stynpilot-backup-key-root", device=door.DEVICE,
+                                  owner=door.OWNER, proposer=SimpleNamespace(client="c", name="c"),
+                                  payload=payload, summary=[], expires=10 ** 10)
+        self.assertEqual(receipt["request_id"], rid)
+        store.transition(rid, "pending", "approved")
+        store.transition(rid, "approved", "running")
+        store.transition(rid, "running", "needs_owner_intervention",
+                         result={"ok": False, "stopped": "installer_unreachable_owner_must_verify"})
+        restarted = self.restart()
+        self.assertEqual(restarted.status(rid)["result"]["rotation"], "in_progress")
+        self.assertEqual(restarted.needs_attention(), [])
+        owner_vault = vault.Vault(side="owner", state_dir=self.r.a.tmp, folder=self.r.a.tmp / "owner-vault")
+        reconcile = service._owner_rotation_reconciler(store, None, owner_vault, restarted)
+        reconcile()
+        self.assertEqual(store.interrupted_rotations(), [rid])
+        self.assertTrue(restarted.vault.tick()["rotate"]["ok"])
+        reconcile()
+        self.assertEqual(store.status(rid, owner=door.OWNER, device=door.DEVICE)["state"], "done")
+        self.assertEqual(self.restart().status(rid)["result"]["rotation"], "completed")
+
+    def test_restart_after_completion_uses_exact_result_and_preserves_other_attention(self):
+        _, rid = self.crash("_record_result")
+        other = "cd" * 32
+        self.r.executor._attention(other, None, "rollback_restore_incomplete", None)
+        attention = self.r.executor.dir / "attention" / (other + ".json")
+        original = attention.read_bytes()
+        restarted = self.restart()
+        self.assertEqual(restarted.needs_attention(), [attention.name])
+        self.assertEqual(attention.read_bytes(), original)
+        self.assertEqual(restarted.status(rid)["state"], "done")
+        self.assertTrue(restarted.status(rid)["result"]["finished_later"])
+        self.assertNotIn("rotate", restarted.vault.tick())
+
+    def test_restart_with_different_journal_request_keeps_attention_and_holds_resume(self):
+        _, rid = self.crash("_reencrypt_one")
+        journal = self.r.v._journal()
+        journal["request_id"] = "cd" * 32
+        self.r.v._save_journal(journal)
+        restarted = self.restart()
+        self.assertEqual(restarted.status(rid)["state"], "needs_owner_intervention")
+        self.assertFalse(restarted.vault.tick()["rotate"]["ok"])
+        self.assertEqual(restarted.vault._journal(), journal)
+
+    def test_restart_with_another_approvals_completion_cannot_report_success(self):
+        _, rid = self.crash("_record_result")
+        log = self.r.v.folder / vault.ROTATION_RESULTS
+        log.write_text(log.read_text().replace(rid, "cd" * 32))
+        restarted = self.restart()
+        self.assertEqual(restarted.needs_attention(), [rid + ".json"])
+        self.assertEqual(restarted.status(rid)["state"], "needs_owner_intervention")
 
     def interrupted(self):
         payload = self.r.rpayload()

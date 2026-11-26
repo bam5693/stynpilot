@@ -166,32 +166,44 @@ class RequestStore:
                        "WHERE request_id=?", (to_state, self.clock(), safe, request_id_value))
             return True
 
+    @staticmethod
+    def _interrupted_root_rotation(row):
+        try:
+            payload = json.loads(row["payload"])
+            result = json.loads(row["result"] or "{}")
+        except (ValueError, TypeError):
+            return False
+        if not isinstance(payload, dict) or not isinstance(result, dict):
+            return False
+        if payload.get("action") != "rotate_key" or payload.get("side") != "root" or payload.get("kind") != "backup":
+            return False
+        if row["state"] == "failed":
+            return result.get("action") == "rotate_key" and result.get("side") == "root" and result.get("rotation") == "in_progress"
+        return row["state"] == "needs_owner_intervention" and result.get("stopped") in (
+            "unexpected_error_owner_must_verify", "installer_unreachable_owner_must_verify",
+            "installer_state_unknown_owner_must_verify", "interrupted_by_restart_or_crash")
+
     def interrupted_rotations(self):
-        """Requests recorded as failed while their installer-side rotation was still in progress (it resumes by itself)."""
+        """Include uncertain owner receipts when the installer connection died mid-rotation."""
         with self._tx() as db:
-            rows = db.execute("SELECT request_id, result FROM requests WHERE kind='backup' AND state='failed'").fetchall()
-        out = []
-        for row in rows:
-            try:
-                result = json.loads(row["result"] or "{}")
-            except ValueError:
-                continue
-            if result.get("action") == "rotate_key" and result.get("side") == "root" and result.get("rotation") == "in_progress":
-                out.append(row["request_id"])
-        return out
+            rows = db.execute("SELECT request_id, payload, state, result FROM requests "
+                              "WHERE kind='backup' AND state IN ('failed','needs_owner_intervention')")
+            return [row["request_id"] for row in rows if self._interrupted_root_rotation(row)]
 
     def settle_rotation(self, request_id_value, to_state, result):
-        """The ONE correction allowed after a final state: an interrupted installer-side rotation that later really finished
-        replaces its stale 'in progress' result with the installer's final one."""
-        if to_state not in ("done", "failed") or result.get("rotation") not in ("completed", "failed"):
+        """Correct only this interrupted root rotation, from the installer's verified terminal result."""
+        if (result.get("action") != "rotate_key" or result.get("side") != "root" or
+                (to_state, result.get("rotation"), result.get("ok")) not in
+                (("done", "completed", True), ("failed", "failed", False))):
             raise RequestError("illegal_transition")
-        if request_id_value not in self.interrupted_rotations():
-            return False
         safe = json.dumps({k: result[k] for k in _SAFE_RESULT if k in result}, sort_keys=True)
         with self._tx() as db:
-            db.execute("UPDATE requests SET state=?, result=? WHERE request_id=? AND state='failed' AND kind='backup'",
-                       (to_state, safe, request_id_value))
-        return True
+            row = db.execute("SELECT payload, state, result FROM requests WHERE kind='backup' AND request_id=?",
+                             (request_id_value,)).fetchone()
+            if row is None or not self._interrupted_root_rotation(row):
+                return False
+            db.execute("UPDATE requests SET state=?, result=? WHERE request_id=?", (to_state, safe, request_id_value))
+            return True
 
     def in_flight(self):
         with self._tx() as db:

@@ -87,10 +87,15 @@ this revision answers ChatGPT's review of it (3 blockers, the lost-nonce-log des
   journal is removed.
 - Owner side: at start and on every vault tick, an owner rotation request still in flight whose exact request id is recorded
   as completed/cancelled (and no journal for it) is settled from that record.
-- Installer side: a rotation interrupted while its approval was handled is first recorded as failed with
-  `rotation: in_progress` + durable progress; when it finishes (scheduler resume) the record is replaced with the real outcome
-  (`finished_later`); if the installer died before that, it is reconciled from the results log at the next start/tick. The
-  owner's request record follows the installer's final record (the one correction allowed after a final state).
+- Installer side: spending the verified approval atomically records the request ID and root rotation mode in the run ledger.
+  On startup, before serving requests or starting the scheduler, a running record for that operation can be matched to a
+  validated root journal with the same ID and mode. The scheduler resumes that journal under the existing operation lock.
+  With the journal removed, a durable completion record for exactly that ID settles the run as completed.
+- A crash before journal creation can leave staging files. The approval remains spent and the installer records a need for
+  owner intervention. Missing, damaged or mismatched evidence also keeps the attention gate in force. Existing attention
+  records are preserved. A rotation cannot start or resume through that gate.
+- The owner service reconciles a provisional failure or an uncertain response to a root rotation against the installer's
+  terminal result for that same request. Other interrupted approvals retain their normal recovery rules.
 - Lost-key preservation: an identical copy left by an interrupted move is fsynced (file and folder) again before the source is
   removed.
 
@@ -109,5 +114,10 @@ damaged journals; unbounded replay record; uncertain/torn/short nonce writes; sw
 identical earlier copy; owner hand-off end to end with the real approval flow and installer (normal, crash after authorization,
 crash before the installer received it); installer refusing other changes during a rotation; installer lock; isolated worker.
 
-## Not in this stage
-No live rotation during the vacation (not needed to verify the release). Key retirement, restore stages 3/4, Dev24 export later.
+Five installer restart regressions terminate a separate process before the journal write, during re-encryption or after the
+vault records completion. They cover owner receipt correction, unrelated attention, a mismatched journal and a different
+request's completion record.
+
+## Release scope
+
+Exercise rotation on disposable vaults. Key retirement, the two restore stages and key export have separate review gates.

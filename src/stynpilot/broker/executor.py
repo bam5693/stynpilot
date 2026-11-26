@@ -55,7 +55,7 @@ from .. import catalog, impact, statelock
 from ..ledger import InstallLedger, LedgerError
 from ..plan import PlanError, validate_plan
 from ..requests import request_id as payload_hash
-from .. import backup, release
+from .. import backup, release, vault
 from . import apt
 from .. import runner as runner_policy
 from .jobs import JobError
@@ -168,9 +168,12 @@ class Runs:
                     out.append(row["request_id"])
             return out
 
-    def running(self):
+    def running_operations(self):
         with self._tx() as db:
-            return [r["request_id"] for r in db.execute("SELECT request_id FROM runs WHERE state='running'")]
+            return db.execute("SELECT request_id, kind FROM runs WHERE state='running'").fetchall()
+
+    def running(self):
+        return [row["request_id"] for row in self.running_operations()]
 
     def status(self, request_id):
         with self._tx() as db:
@@ -188,7 +191,7 @@ class Executor:
     def __init__(self, *, state_dir, owner, device, verifier, run=apt.real_run, require_root=True,
                  sources_root="/etc/apt", file_root="/", owner_uid=None, release_keys=None, fetch_release=None,
                  launch_worker=None, upgrade_options=None, jobs=None, passkeys=None,
-                 allow_remote_activation=False, authority=None, sleep=time.sleep):
+                 allow_remote_activation=False, authority=None, sleep=time.sleep, root_vault=None):
         self.dir = Path(state_dir)
         self.vault = None                                      # the root backup vault (dev22), set by the installer at start
         if require_root and not apt.is_root():
@@ -224,15 +227,43 @@ class Executor:
         # the machine is in, so record that durably and refuse new installs until the owner looks.
         # An UPGRADE run is different: its worker runs on its own and outlives this installer's restart, so it is
         # settled from its job folder (or left running while its worker is alive), never blamed on this restart.
-        for rid in self.runs.running():
+        for rid, kind in self.runs.running_operations():
             if self.upgrader.is_job(rid):
                 self._settle(rid)
                 continue
             if self._release_pending(rid):
                 continue                      # a spent release approval waiting to be resumed: not damage, never "attention"
-            self._attention(rid, None, "interrupted_by_restart_or_crash", None)
+            if root_vault is not None and self._recover_root_rotation(root_vault, rid, kind):
+                continue
+            if not os.path.lexists(self.dir / "attention" / ("%s.json" % rid)):
+                self._attention(rid, None, "interrupted_by_restart_or_crash", None)
             self.runs.finish(rid, "needs_owner_intervention", {"ok": False, "stopped": "interrupted_by_restart_or_crash",
                                                                "needs_owner_intervention": True})
+
+        if root_vault is not None:
+            self.attach_vault(root_vault)
+
+    def _recover_root_rotation(self, root_vault, rid, kind):
+        """Classify the spent approval before generic crash recovery and before starting the scheduler."""
+        operation, _, mode = kind.rpartition(".")
+        if operation != "backup.rotate_key.root" or mode not in vault.ROTATION_MODES or root_vault.side != "root":
+            return False
+        result = {"action": "rotate_key", "side": "root", "mode": mode}
+        try:
+            journal = root_vault._journal()
+            if journal is None:
+                if root_vault.rotation_outcome(rid) != "completed":
+                    return False       # includes death before journal creation: never start again from approval alone
+                self.runs.finish(rid, "done", dict(result, ok=True, rotation="completed", finished_later=True))
+                return True
+            if journal["request_id"] != rid or journal["mode"] != mode or journal["state"] == "awaiting_authorization":
+                return False
+            progress = root_vault.rotation_progress()
+        except (vault.VaultError, OSError, ValueError, TypeError):
+            return False
+        self.runs.finish(rid, "failed", dict(result, ok=False, rotation="in_progress", progress=progress,
+                                             stopped="interrupted_by_restart_or_crash"))
+        return True
 
     def status(self, request_id):
         """What the installer's own durable record says about this request (reconciliation source)."""
@@ -585,8 +616,12 @@ class Executor:
         runs here, resumable; owner side: the approval is verified and spent here, the owner's service then rotates its own vault."""
         self._check_payload(payload)
         self._no_other_change()
-        rid = self._decide(payload, proof_token, challenge, "approve", "backup")
         action = payload["action"]
+        kind = "backup"
+        if action == "rotate_key" and payload["side"] == "root":
+            # Stored in the same transaction as the consumed proof, before any vault side effect.
+            kind = "backup.rotate_key.root." + payload["mode"]
+        rid = self._decide(payload, proof_token, challenge, "approve", kind)
         try:
             if action == "retention":
                 result = dict(self.vault.set_retention(payload["daily"], payload["weekly"], rid), action=action)
@@ -1203,7 +1238,8 @@ class Executor:
     def attach_vault(self, vault_):
         """Wire the installer's own vault: rotations see running changes, and report their real final outcome here."""
         self.vault = vault_
-        vault_.change_running = lambda own: bool([r for r in self.runs.running() if r != own]) or self._pending_release()
+        vault_.change_running = lambda own: (any(r != own for r in self.runs.running()) or self._pending_release()
+                                             or any((self.dir / "attention").glob("*.json")))
         vault_.on_rotation_finished = self._rotation_finished
         vault_.tick_hooks.append(self.reconcile_rotations)
         self.reconcile_rotations()
@@ -1230,7 +1266,7 @@ class Executor:
         if vault_ is None:
             return
         for rid in self.runs.unsettled_rotations():
-            if vault_.rotation_outcome(rid) == "completed" and (vault_.journal_request() or ("",))[0] != rid:
+            if vault_.rotation_outcome(rid) == "completed" and vault_.journal_request() is None:
                 self._rotation_finished(rid, {"ok": True, "rotation": "completed"})
 
     def _no_other_change(self):

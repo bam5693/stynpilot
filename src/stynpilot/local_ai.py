@@ -7,6 +7,7 @@ import secrets
 import socket
 import threading
 import time
+from contextlib import ExitStack
 
 MODEL = "qwen2.5-coder:7b"
 WORKSPACE = "local-ai-pilot"
@@ -100,9 +101,10 @@ def infer(body, stop):
 
 class Jobs:
     """One active request globally. Volatile, bounded, caller-scoped results."""
-    def __init__(self, transport=infer, clock=time.monotonic, *, reserve=None, finish=None):
+    def __init__(self, transport=infer, clock=time.monotonic, *, reserve=None, finish=None, worker_lease=None):
         if (reserve is None) != (finish is None):
             raise ValueError("paired activity callbacks required")
+        self._worker_lease = worker_lease
         self._reserve = reserve
         self._finish = finish
         self._transport = transport
@@ -126,23 +128,31 @@ class Jobs:
             if len(self._jobs) >= MAX_JOBS:
                 raise LocalAIError("local_ai_results_full")
             jid = secrets.token_hex(16)
-            # The installer persists the claim before the owner service starts inference.
-            if self._reserve is not None:
-                self._reserve(jid)
-            row = {"caller": caller, "state": "running", "stop": threading.Event(),
-                   "finished": None, "output": None, "error": None}
-            self._jobs[jid] = row
-            self._active = jid
-            worker = threading.Thread(target=self._run, args=(jid, row, body, authorize), daemon=True)
+            # Hold the kernel fence from before reservation through all
+            # transport, authorization checks and settlement.
+            lease = ExitStack()
             try:
-                worker.start()
-            except Exception:
-                del self._jobs[jid]
-                self._active = None
-                raise LocalAIError("local_ai_start_failed") from None
+                if self._worker_lease is not None:
+                    lease.enter_context(self._worker_lease())
+                if self._reserve is not None:
+                    self._reserve(jid)
+                row = {"caller": caller, "state": "running", "stop": threading.Event(),
+                       "finished": None, "output": None, "error": None}
+                self._jobs[jid] = row
+                self._active = jid
+                worker = threading.Thread(target=self._run, args=(jid, row, body, authorize, lease), daemon=True)
+                try:
+                    worker.start()
+                except Exception:
+                    del self._jobs[jid]
+                    self._active = None
+                    raise LocalAIError("local_ai_start_failed") from None
+            except BaseException:
+                lease.close()
+                raise
             return {"job_id": jid, "state": "running", "model": MODEL}
 
-    def _run(self, jid, row, body, authorize=None):
+    def _run(self, jid, row, body, authorize=None, lease=None):
         output, error = None, "local_ai_unavailable"
         completed = threading.Event()
         monitor = None
@@ -192,6 +202,8 @@ class Jobs:
                     self._finish(jid)
                 except Exception:
                     output, error = None, "local_ai_activity_unsettled"
+            if lease is not None:
+                lease.close()
             with self._lock:
                 if row["stop"].is_set():
                     row["state"] = "cancelled"

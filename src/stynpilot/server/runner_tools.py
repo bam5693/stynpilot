@@ -171,6 +171,27 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
         return run("commander_backup_drill", device_id,
                    lambda owner: both(lambda: vault.drill(manual=True), broker.vault_drill), write=True)
 
+    @server.tool(name="commander_request_backup_retention", title="Ask the owner to change how many backups are kept",
+                 annotations=FILES_A_REQUEST,
+                 description=("Ask the owner to approve a new backup retention: daily 1-30 and weekly 0-12 (applies to both sides). "
+                              "He approves on his phone. The newest complete, verified backup is always kept whatever the setting."))
+    def request_backup_retention(device_id: str, daily: int, weekly: int) -> dict:
+        def work(owner):
+            from .. import vault as _vault
+            if not _vault.valid_retention(daily, weekly):
+                raise WorkspaceError("retention_out_of_range_daily_1_to_30_weekly_0_to_12")
+            current = broker.vault_settings() or {}
+            if (current.get("daily"), current.get("weekly")) == (daily, weekly):
+                raise WorkspaceError("retention_already_set")
+            expires = now() + timedelta(hours=1)
+            payload = {"kind": "backup", "action": "retention", "daily": daily, "weekly": weekly, "owner": owner,
+                       "device": device_id, "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            result, _ = store.submit(kind="backup", software="stynpilot-backup-retention", device=device_id, owner=owner,
+                                     proposer=ctx.proposer, payload=payload, summary=render_summary(payload),
+                                     expires=expires.timestamp())
+            return receipt(result)
+        return run("commander_request_backup_retention", device_id, work, write=True)
+
     # -- releases (dev16): prepare a verified build (GREEN), then ask for ONE approval that signs, publishes and installs ------------
     _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 

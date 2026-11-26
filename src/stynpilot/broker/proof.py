@@ -100,6 +100,13 @@ def render_summary(payload):
                     "Approve only if you just created this passkey yourself. If you did not, deny it.", expires]
         return ["Remove the passkey with short ID %s." % str(payload.get("kid")),
                 "It can no longer approve anything. Other passkeys and your Auth0 sign-in keep working.", expires]
+    if payload.get("kind") == "backup":
+        expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
+        return ["Change how many encrypted backups StyNpilot keeps: %s daily and %s weekly (for the root installer side and "
+                "your own side)." % (payload.get("daily"), payload.get("weekly")),
+                "Older backups beyond that are deleted when new ones are made. Whatever this says, the newest complete, verified "
+                "backup is always kept, and backups that failed a check are kept for inspection.",
+                "Nothing is backed up, restored or deleted right now by this approval.", expires]
     if payload.get("kind") == "runner":
         expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
         name = str(payload.get("name"))

@@ -127,7 +127,10 @@ class BrokerService:
                 return {"ok": True, "result": call()}
             if op == "runner":
                 return {"ok": True, "result": self.executor.runner_call(message.get("call"), message.get("args"))}
-            if op in ("install", "rollback", "upgrade", "release", "deny", "runner_admin", "passkey_admin"):
+            if op == "vault_settings":
+                vault = getattr(self, "vault", None)
+                return {"ok": True, "result": vault.effective_retention() if vault is not None else None}
+            if op in ("install", "rollback", "upgrade", "release", "deny", "runner_admin", "passkey_admin", "backup_admin"):
                 if not self._busy.acquire(blocking=False):
                     return {"ok": False, "error": "busy"}          # one change at a time
                 try:
@@ -135,7 +138,8 @@ class BrokerService:
                               "upgrade": self.executor.upgrade, "release": self.executor.release,
                               "deny": self.executor.deny,
                               "runner_admin": self.executor.runner_admin,
-                              "passkey_admin": self.executor.passkey_admin}[op]
+                              "passkey_admin": self.executor.passkey_admin,
+                              "backup_admin": self.executor.backup_admin}[op]
                     result = method(message.get("payload"), message.get("proof"), message.get("challenge"))
                 finally:
                     self._busy.release()
@@ -278,6 +282,12 @@ class BrokerClient:
 
     def release_prepare(self, commit, version):
         return self._ask({"op": "release_prepare", "commit": commit, "version": version}, 30)["result"]
+
+    def vault_settings(self):
+        return self._ask({"op": "vault_settings"}, 30)["result"]
+
+    def backup_admin(self, payload, proof, challenge):
+        return self._ask({"op": "backup_admin", "payload": payload, "proof": proof, "challenge": challenge}, 60)["result"]
 
     def vault_status(self):
         return self._ask({"op": "vault_status"}, 30)["result"]

@@ -51,10 +51,21 @@ NAME = re.compile(r"(owner|root)-\d{8}-\d{6}-[0-9a-f]{8}\.stynvault\Z")
 DAY = 86400
 DUE_AFTER = DAY                        # a new backup is due when the newest verified one is older than this
 DRILL_EVERY = 7 * DAY
+FULL_CHECK_EVERY = 30 * DAY             # every retained backup is re-verified monthly
 MANUAL_BACKUP_EVERY = 600              # rate limits for requests from assistants
 MANUAL_DRILL_EVERY = 3600
 OVERDUE_AFTER = 2 * DAY
 DEFAULT_RETENTION = {"daily": 7, "weekly": 4}
+RETENTION_LIMITS = {"daily": (1, 30), "weekly": (0, 12)}      # changing it is YELLOW (owner approval); these bounds always hold
+SETTINGS = "settings.json"
+
+
+def valid_retention(daily, weekly):
+    for name, value in (("daily", daily), ("weekly", weekly)):
+        low, high = RETENTION_LIMITS[name]
+        if type(value) is not int or isinstance(value, bool) or not low <= value <= high:
+            return False
+    return True
 # Conservative limits, checked from file sizes BEFORE anything is read (the real state is a few MB).
 MAX_GATHER = 256 * 1024 * 1024          # everything one backup may read
 MAX_ONE_FILE = 128 * 1024 * 1024        # any single state or extra file
@@ -281,7 +292,7 @@ class Vault:
     its own memory limit, so running out of memory or a crash there can never take the owner service or the installer down."""
 
     def __init__(self, *, side, state_dir, folder, extras=(), version="", clock=time.time, retention=None, aesgcm=None,
-                 space=shutil.disk_usage, isolate=False, limits=None):
+                 space=shutil.disk_usage, isolate=False, limits=None, retention_source=None):
         if side not in ("owner", "root"):
             raise ValueError("side")
         self.side, self.state_dir, self.folder = side, Path(state_dir), Path(folder)
@@ -289,6 +300,7 @@ class Vault:
         self.retention = dict(DEFAULT_RETENTION, **(retention or {}))
         self.limits = dict({"gather": MAX_GATHER, "file": MAX_ONE_FILE, "extra": MAX_EXTRA, "memory": CHILD_MEMORY}, **(limits or {}))
         self.isolate = isolate
+        self.retention_source = retention_source              # owner side: the installer's approved setting is the authority
         self._aesgcm = aesgcm
         self._mutex = threading.Lock()
         self.key_file = self.folder / "backup-key"
@@ -304,6 +316,34 @@ class Vault:
             allowed = (sorted(item[4]) if item[4] is not None else None) if len(item) > 4 else None
             out.append((name, str(path), kind, required, allowed))
         return out
+
+    # .. retention settings (changed only through an owner-approved request) .....................................................
+    def effective_retention(self):
+        """The approved setting in the vault (settings.json, private, ours), else the built-in default (self.retention)."""
+        try:
+            data = json.loads(_read_private(self.folder / SETTINGS, 4096).decode())
+            if (type(data) is dict and data.get("schema") == 1 and valid_retention(data.get("daily"), data.get("weekly"))):
+                return {"daily": data["daily"], "weekly": data["weekly"], "approved": data.get("request_id"), "at": data.get("at")}
+        except (OSError, VaultError, ValueError, UnicodeError):
+            pass
+        return dict(self.retention, approved=None, at=None)
+
+    def set_retention(self, daily, weekly, request_id):
+        """Store an approved retention setting atomically. Bounds are enforced here too, whatever the caller checked."""
+        if not valid_retention(daily, weekly) or type(request_id) is not str or not re.fullmatch(r"[0-9a-f]{64}", request_id):
+            raise VaultError("retention_invalid")
+        def write():
+            _write_atomic(self.folder, SETTINGS, json.dumps({"schema": 1, "daily": daily, "weekly": weekly, "request_id": request_id,
+                                                              "at": int(self.clock())}, sort_keys=True).encode())
+            return {"ok": True, "daily": daily, "weekly": weekly}
+        with self._mutex:
+            _private_folder(self.folder)
+            lock = os.open(str(self.folder / ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX)              # waits for a running backup; never changes the rule under it
+                return write()
+            finally:
+                os.close(lock)
 
     # .. index ..................................................................................................................
     def _valid_index(self, index):
@@ -586,14 +626,15 @@ class Vault:
         for created, name in (complete or verified):            # the daily/weekly windows are filled with complete backups only
             days[time.strftime("%Y%m%d", time.gmtime(created))] = name
             weeks[time.strftime("%G%V", time.gmtime(created))] = name
-        for groups, count in ((days, self.retention["daily"]), (weeks, self.retention["weekly"])):
+        retention = self.effective_retention()
+        for groups, count in ((days, retention["daily"]), (weeks, retention["weekly"])):
             if count > 0:
                 keep |= {name for _, name in sorted(groups.items())[-count:]}
         removed = []
         for name in list(index["backups"]):
             info = index["backups"][name]
-            if name in keep or not NAME.fullmatch(name) or not name.startswith(self.side + "-"):
-                continue
+            if name in keep or not NAME.fullmatch(name) or not name.startswith(self.side + "-") or info.get("check_failed"):
+                continue                                        # a backup that failed a re-check is kept for inspection, never pruned
             if not info.get("verified_at") and not info.get("failed") and info["created"] >= verified[-1][0]:
                 continue                                        # a newer, not-yet-verified backup is kept
             path = self.folder / name
@@ -659,26 +700,38 @@ class Vault:
             pass
         return {"ok": False, "error": str(code)[:120]}
 
-    def _op_recheck(self):
-        """Is the newest verified backup still present and intact? If not it stops counting, and a new backup is due at once."""
+    def _op_recheck(self, scope="daily"):
+        """Re-verify backups that count. daily: the newest verified AND the newest COMPLETE verified one (independently of any newer
+        incomplete backup); all: every retained backup (monthly). A backup that fails stops counting and is KEPT and reported
+        (check_failed): a failed check never leads to cleanup. If the newest complete one failed, a new backup is due at once."""
         index = self._load()
+        now = int(self.clock())
         verified = sorted((info["created"], name) for name, info in index["backups"].items() if info.get("verified_at"))
-        if not verified:
-            return {"ok": True, "checked": None}
-        name = verified[-1][1]
-        try:
-            if not (self.folder / name).is_file():
-                raise VaultError("verified_backup_file_missing")
-            self._verify(name, index)
-            index["backups"][name]["checked_at"] = int(self.clock())
-            self._save(index)
-            return {"ok": True, "checked": name}
-        except Exception as error:
+        if scope == "all":
+            names = [n for _, n in verified]
+        else:
+            complete = [n for _, n in verified if not index["backups"][n].get("incomplete")]
+            names = sorted({n for n in ([verified[-1][1]] if verified else []) + complete[-1:]})
+        checked, failed = [], []
+        for name in names:
             entry = index["backups"][name]
-            entry["verified_at"], entry["failed"] = None, True
-            index["last_error"] = {"at": int(self.clock()), "code": "newest_backup_failed_recheck_" + str(getattr(error, "code", type(error).__name__))[:80]}
-            self._save(index)
-            return {"ok": False, "error": index["last_error"]["code"]}
+            try:
+                if not (self.folder / name).is_file():
+                    raise VaultError("verified_backup_file_missing")
+                self._verify(name, index)
+                entry["checked_at"] = now
+                checked.append(name)
+            except Exception as error:
+                entry["verified_at"], entry["check_failed"] = None, True
+                entry["check_error"] = str(getattr(error, "code", type(error).__name__))[:80]
+                failed.append(name)
+        if scope == "all":
+            index["full_check_at"] = now
+        if failed:
+            index["last_error"] = {"at": now, "code": "newest_backup_failed_recheck_" + index["backups"][failed[-1]]["check_error"]}
+        self._save(index)
+        return {"ok": not failed, "checked": checked, "failed": failed} if not failed else \
+            {"ok": False, "error": index["last_error"]["code"], "checked": checked, "failed": failed}
 
     def _op_drill(self, manual):
         index = self._load()
@@ -738,14 +791,27 @@ class Vault:
 
     def _op(self, op, manual=False):
         return {"backup": lambda: self._op_backup(manual), "drill": lambda: self._op_drill(manual),
-                "recheck": self._op_recheck}[op]()
+                "recheck": lambda: self._op_recheck("daily"), "recheck_all": lambda: self._op_recheck("all")}[op]()
 
     # .. public ...................................................................................................................
     def _spec(self, op, manual):
         return {"side": self.side, "state_dir": str(self.state_dir), "folder": str(self.folder), "extras": self._extra_list(),
                 "version": self.version, "retention": self.retention, "limits": self.limits, "op": op, "manual": manual}
 
+    def _sync_retention(self):
+        if self.retention_source is None:
+            return
+        try:
+            theirs = self.retention_source()
+            mine = self.effective_retention()
+            if (isinstance(theirs, dict) and theirs.get("approved") and valid_retention(theirs.get("daily"), theirs.get("weekly"))
+                    and (theirs["daily"], theirs["weekly"], theirs["approved"]) != (mine["daily"], mine["weekly"], mine["approved"])):
+                self.set_retention(theirs["daily"], theirs["weekly"], theirs["approved"])
+        except Exception:
+            pass                                               # unreachable installer: keep the last setting we had
+
     def _run(self, op, manual=False):
+        self._sync_retention()
         if not self.isolate:
             return self._guard(lambda: self._op(op, manual))
         with self._mutex:
@@ -793,23 +859,29 @@ class Vault:
     def recheck(self):
         return self._run("recheck")
 
+    def recheck_all(self):
+        return self._run("recheck_all")
+
     def tick(self):
-        """What is due: re-check the newest verified backup (presence hourly, full check daily), the first backup at once, a missed
-        or replacement one, and a weekly drill. Called hourly and at start."""
+        """What is due: re-check what counts (presence hourly; full daily check of the newest verified AND the newest complete
+        verified backup; every retained backup monthly), the first backup at once, a missed or replacement one, a weekly drill."""
         index = self._index()
         now = int(self.clock())
         done = {}
         verified = sorted((i["created"], n, i) for n, i in index["backups"].items() if i.get("verified_at"))
-        if verified:
-            _, name, info = verified[-1]
-            if not (self.folder / name).is_file() or now - (info.get("checked_at") or info["verified_at"]) >= DAY:
-                done["recheck"] = self.recheck()
-                index = self._index()
+        complete = [v for v in verified if not v[2].get("incomplete")]
+        watched = {v[1]: v[2] for v in verified[-1:] + complete[-1:]}
+        if any(not (self.folder / n).is_file() or now - (i.get("checked_at") or i["verified_at"]) >= DAY for n, i in watched.items()):
+            done["recheck"] = self.recheck()
+            index = self._index()
+        if verified and now - (index.get("full_check_at") or verified[0][2]["verified_at"]) >= FULL_CHECK_EVERY:
+            done["recheck_all"] = self.recheck_all()
+            index = self._index()
         newest = max((i["verified_at"] or 0 for i in index["backups"].values()), default=0)
-        if now - newest >= DUE_AFTER:
+        if now - newest >= DUE_AFTER or str((index.get("last_error") or {}).get("code", "")).startswith("newest_backup_failed_recheck"):
             last = index.get("last_attempt") or 0
             failed_recheck = str((index.get("last_error") or {}).get("code", "")).startswith("newest_backup_failed_recheck")
-            if not index.get("last_error") or failed_recheck or now - last >= 3600:
+            if not index.get("last_error") or (failed_recheck and now - last >= 600) or now - last >= 3600:
                 done["backup"] = self.backup_now()
         last_drill = (index.get("last_drill") or {}).get("at") or 0
         if now - last_drill >= DRILL_EVERY and (newest or done.get("backup", {}).get("ok")):
@@ -847,8 +919,16 @@ class Vault:
                 problems.append("backup_overdue")
             if any(b["verified"] and not b["present"] for b in backups):
                 problems.append("verified_backup_file_missing")
+            complete = [b for b in verified if b["complete"]]
             if verified and not verified[-1]["complete"]:
                 problems.append("incomplete_backup:" + ",".join(index["backups"][verified[-1]["name"]].get("incomplete", [])))
+            if not complete:
+                problems.append("no_complete_verified_backup")
+            elif now - complete[-1]["created"] > OVERDUE_AFTER:
+                problems.append("complete_backup_overdue")
+            bad = [n for n, i in index["backups"].items() if i.get("check_failed")]
+            if bad:
+                problems.append("backups_failed_a_recheck:%d" % len(bad))
             if index.get("last_error"):
                 problems.append("last_backup_failed:" + index["last_error"]["code"])
             drill = index.get("last_drill")
@@ -861,8 +941,10 @@ class Vault:
             except OSError:
                 free = None
             return {"side": self.side, "healthy": not problems, "problems": problems, "count": len(backups),
-                    "newest_verified": verified[-1] if verified else None, "last_success": index.get("last_success"),
-                    "last_error": index.get("last_error"), "last_drill": drill, "retention": self.retention,
+                    "newest_verified": verified[-1] if verified else None,
+                    "newest_complete_verified": complete[-1] if complete else None,
+                    "last_full_check": index.get("full_check_at"), "last_success": index.get("last_success"),
+                    "last_error": index.get("last_error"), "last_drill": drill, "retention": self.effective_retention(),
                     "excluded_last_time": (index["backups"].get(verified[-1]["name"], {}).get("excluded") if verified else None),
                     "free_bytes": free, "encrypted": "AES-256-GCM"}
         except Exception as error:

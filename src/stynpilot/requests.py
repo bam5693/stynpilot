@@ -37,7 +37,7 @@ _SAFE_RESULT = ("ok", "stopped", "installed", "rollback_id", "restored", "restor
                 "pending", "started", "rolled_back", "from_version", "to_version", "notes", "config_preserved",
                 "action", "workspace", "entries", "skipped", "runner_user", "enabled", "selftest",
                 "enrollment_open", "label", "kid", "passkeys_active")
-KINDS = ("install", "rollback", "upgrade", "runner", "passkey", "release")
+KINDS = ("install", "rollback", "upgrade", "runner", "passkey", "release", "backup")
 MAX_PENDING_PER_CLIENT = 5
 _REQUEST_ID = re.compile(r"[a-f0-9]{64}\Z")
 

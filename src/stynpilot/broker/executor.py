@@ -176,6 +176,7 @@ class Executor:
                  launch_worker=None, upgrade_options=None, jobs=None, passkeys=None,
                  allow_remote_activation=False, authority=None, sleep=time.sleep):
         self.dir = Path(state_dir)
+        self.vault = None                                      # the root backup vault (dev22), set by the installer at start
         if require_root and not apt.is_root():
             raise ExecutionDenied("installer_must_run_as_root")
         self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -319,7 +320,7 @@ class Executor:
                     "nonce": decision_nonce(decision, rid, rid, challenge),
                     "summary": summary, "summary_sha256": summary_hash(summary), "expires_in": CHALLENGE_LIFETIME}
         summary = render_summary(payload)
-        if payload.get("kind") in ("runner", "passkey", "release"):
+        if payload.get("kind") in ("runner", "passkey", "release", "backup"):
             return {"request_id": rid, "decision": decision, "challenge": challenge,
                     "nonce": decision_nonce(decision, rid, rid, challenge),
                     "summary": summary, "summary_sha256": summary_hash(summary), "expires_in": CHALLENGE_LIFETIME}
@@ -350,6 +351,8 @@ class Executor:
             return self._check_release_payload(payload)
         if payload.get("kind") == "runner":
             return self._check_runner_payload(payload)
+        if payload.get("kind") == "backup":
+            return self._check_backup_payload(payload)
         if payload.get("kind") == "rollback":
             return self._check_rollback_payload(payload)
         return self._check_install_payload(payload)
@@ -533,6 +536,39 @@ class Executor:
         rid = self._decide(payload, proof_token, challenge, "deny", payload.get("kind", "install"))
         self.runs.finish(rid, "denied", {"ok": True, "denied_by_owner": True})
         return {"ok": True, "denied_by_owner": True}
+
+    # -- backup settings (dev23 stage 1): YELLOW, owner-approved ---------------------------------------
+    _BACKUP_KEYS = {"kind", "action", "daily", "weekly", "owner", "device", "expires_at"}
+
+    def _check_backup_payload(self, payload):
+        from .. import vault as _vault
+        if getattr(self, "vault", None) is None:
+            raise ExecutionDenied("backups_not_available")
+        if (set(payload) != self._BACKUP_KEYS or payload.get("kind") != "backup" or payload.get("action") != "retention"
+                or payload.get("owner") != self.owner or payload.get("device") != self.device
+                or not _vault.valid_retention(payload.get("daily"), payload.get("weekly"))):
+            raise ExecutionDenied("backup_request_invalid")
+        try:
+            expires = datetime.strptime(payload["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            raise ExecutionDenied("backup_request_invalid") from None
+        if expires <= datetime.now(timezone.utc):
+            raise ExecutionDenied("plan_invalid_or_expired")
+        if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
+            raise ExecutionDenied("already_decided_or_used")
+        return payload
+
+    def backup_admin(self, payload, proof_token, challenge):
+        """Execute an owner-approved backup setting change. Synchronous; nothing is deleted at this moment."""
+        self._check_payload(payload)
+        self._no_other_change()
+        rid = self._decide(payload, proof_token, challenge, "approve", "backup")
+        try:
+            result = dict(self.vault.set_retention(payload["daily"], payload["weekly"], rid), action="retention")
+        except Exception as error:
+            result = {"ok": False, "stopped": getattr(error, "code", "unexpected_%s" % type(error).__name__), "action": "retention"}
+        self._record_result(rid, "done" if result.get("ok") else "failed", result)
+        return result
 
     # -- sandboxed command runner ------------------------------------------------------------------
     _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}\Z")

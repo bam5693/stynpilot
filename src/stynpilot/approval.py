@@ -227,7 +227,7 @@ class ApprovalFlow:
             with self._lock:                 # only the browser that approved may then create the passkey
                 self._enroll_sessions[rid] = {"view": view, "expires": self.clock() + VIEW_LIFETIME}
         wanted = {"rollback": "rollback", "upgrade": "upgrade", "release": "release", "runner": "runner_admin",
-                  "passkey": "passkey_admin"}.get(payload.get("kind"), "install")
+                  "passkey": "passkey_admin", "backup": "backup_admin"}.get(payload.get("kind"), "install")
         method = getattr(self.broker, wanted, None)
         if method is None:
             return self._uncertain(rid)

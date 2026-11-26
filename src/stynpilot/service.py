@@ -325,7 +325,7 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
         from .diagnostics import Diagnostics
         from .system_status import SystemStatus
         home = os.path.expanduser("~")
-        service.vault = vault or owner_vault(config)
+        service.vault = vault or owner_vault(config, retention_source=lambda: broker.vault_settings())
         diag = dict(policy=safefs.Policy(home=home,
                                          project_roots=safefs.load_project_roots(state / PROJECT_ROOTS_FILE, home),
                                          extra_deny=[config.state_dir, config.pairing_db, config.broker_socket]),
@@ -566,7 +566,7 @@ def main(argv=None):                                       # pragma: no cover - 
         service = build_installer(config, jwks=fetch_jwks(config.issuer),
                                   jwks_loader=lambda: fetch_jwks(config.issuer))     # rotation: only on an unknown key ID
         from . import vault as _vault
-        service.vault = root_vault(args.config, config)
+        service.vault = service.executor.vault = root_vault(args.config, config)
         _vault.start_scheduler(service.vault)                 # first backup shortly after start, then hourly checks; never raises
         service.serve_forever()
         return 0

@@ -326,6 +326,12 @@ class ApprovalBoundaryTests(unittest.TestCase):
         from stynpilot.broker.service import BrokerService
         self.enable_inference_fixture()
         self.assertTrue(self.inference_call("inference_claim")["ok"])
+        self.assertTrue(self.inference_call("inference_validate")["ok"])
+        self.assertFalse(self.inference_call("inference_validate", "b"*32)["ok"])
+        enrolled = self.ex.jobs.workspaces
+        self.ex.jobs.workspaces = lambda: []
+        self.assertFalse(self.inference_call("inference_validate")["ok"])
+        self.ex.jobs.workspaces = enrolled
         self.assertFalse(self.inference_call("inference_claim", "b"*32)["ok"])
         self.assertFalse(self.inference_call("inference_finish", "b"*32)["ok"])
         self.assertEqual(self.decide()["error"], "restore_requires_idle_managed_activity")

@@ -113,9 +113,10 @@ class ApprovalFlow:
             self._sweep()
             if len(self._views) >= MAX_VIEWS:
                 raise ApprovalError("too_many_open_approval_pages")
-            self._views[view] = {"request_id": request_id, "csrf": csrf, "challenges": {"approve": approve, "deny": deny},
+            self._views[view] = {"request_id": request_id, "csrf": csrf, "passkey_required": payload.get("action") == "restore_root",
+                                 "challenges": {"approve": approve, "deny": deny},
                                  "used": False, "attempts": 0, "expires": self.clock() + VIEW_LIFETIME}
-        return {"passkey": passkey, "status_url": "/approve/status/" + request_id, "view": view, "csrf": csrf, "request_id": request_id, "kind": payload.get("kind", "install"),
+        return {"passkey_required": payload.get("action") == "restore_root", "passkey": passkey, "status_url": "/approve/status/" + request_id, "view": view, "csrf": csrf, "request_id": request_id, "kind": payload.get("kind", "install"),
                 "summary": list(approve["summary"]), "summary_sha256": approve["summary_sha256"],
                 "fingerprint": request_id[:12], "choices": ["approve", "deny"],
                 "expires_in": VIEW_LIFETIME}
@@ -184,6 +185,8 @@ class ApprovalFlow:
                 raise ApprovalError("csrf_check_failed")
             if item["used"]:
                 raise ApprovalError("already_chosen")
+            if decision == "approve" and item.get("passkey_required"):
+                raise ApprovalError("root_restore_requires_passkey")
             item["used"] = True
             state, verifier = secrets.token_urlsafe(24), secrets.token_urlsafe(48)
             challenge = item["challenges"][decision]
@@ -339,7 +342,8 @@ class ApprovalFlow:
             except _PreflightFailed as failed:
                 result = {"ok": False, "stopped": failed.code or "owner_state_backup_failed", "changed_anything": False}
             except Exception as error:
-                result = self._after_error(rid, error, payload.get("kind"))
+                kind = "restore_root" if payload.get("action") == "restore_root" else payload.get("kind")
+                result = self._after_error(rid, error, kind)
             if self.after_run is not None and result.get("ok"):
                 try:
                     result = self.after_run(payload, rid, result) or result
@@ -370,7 +374,12 @@ class ApprovalFlow:
         payload = self.store.payload(request_id)
         if payload is None:
             raise ApprovalError("unknown_request")
-        return self.store.status(request_id, owner=payload.get("owner"), device=payload.get("device"))
+        receipt = self.store.status(request_id, owner=payload.get("owner"), device=payload.get("device"))
+        if payload.get("action") == "restore_root" and receipt["state"] in ("running", "approved", "needs_owner_intervention"):
+            _, record = self._root_record(request_id)
+            if record and self.store.settle_restore(request_id, record):
+                return self.store.status(request_id, owner=payload.get("owner"), device=payload.get("device"))
+        return receipt
 
     @staticmethod
     def _state_for(result):
@@ -384,7 +393,7 @@ class ApprovalFlow:
         no run recorded -> verified nothing ran; a finished record -> its real result; anything else
         (still 'running', unreachable, unknown) -> the owner must verify."""
         code = getattr(error, "code", None)
-        if kind in ("upgrade", "release"):
+        if kind in ("upgrade", "release", "restore_root"):
             seen, record = self._root_record(rid)
             if seen == "record" and (record or {}).get("state") == "running":
                 return {"ok": None, "pending": True}       # the upgrade worker is running; its result settles this

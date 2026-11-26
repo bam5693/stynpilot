@@ -1,0 +1,6 @@
+[Unit]
+Description=Watch for an owner-authorized StyNpilot installer restoration
+
+[Path]
+PathExists=/var/lib/stynpilot-installer/restore-control/pending.json
+Unit=stynpilot-restore.service

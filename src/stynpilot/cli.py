@@ -16,7 +16,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="stynpilot")
     sub = parser.add_subparsers(dest="command", required=True)
     svc = sub.add_parser("service")
-    svc.add_argument("role", choices=("owner", "installer", "provision", "passkeys", "release"))
+    svc.add_argument("role", choices=("owner", "installer", "provision", "passkeys", "release", "restore-worker"))
     svc.add_argument("--config", required=True)
     svc.add_argument("--action", choices=("list", "activate", "confirm-restored", "init", "set-token", "status"), default="list")
     svc.add_argument("--kid", default="")

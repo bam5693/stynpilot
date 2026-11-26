@@ -3,7 +3,7 @@
 [Unit]
 Description=StyNpilot root installer (approved software changes only)
 After=network-online.target
-Wants=network-online.target
+Wants=network-online.target stynpilot-restore.path
 
 [Service]
 Type=simple

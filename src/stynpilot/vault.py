@@ -76,6 +76,7 @@ SPACE_MARGIN = 64 * 1024 * 1024
 CHILD_MEMORY = 1280 * 1024 * 1024       # address-space limit of the separate process that does the heavy work
 CHILD_TIMEOUT = 1800
 NONCE_LOG = "nonces.log"
+OWNER_RESTORE_INTENT = "root-restore-intent.json"
 ROTATION = "rotation.json"             # durable key-rotation journal (resumable at every step)
 ROTATION_REQUESTS = "rotation-requests.log"   # append-only, fsynced, unbounded: every approval id ever spent on a rotation
 ROTATION_RESULTS = "rotation-results.log"     # append-only, fsynced: '<request id> completed|cancelled', written BEFORE the journal ends
@@ -757,9 +758,43 @@ class Vault:
         return key_id
 
     # .. owner side: durable hand-off from the installer's authorization to the owner's own rotation ............................
+    def reserve_root_restore(self, rid, expires):
+        """On the owner side only. Serialize the root handoff with owner key-rotation preparation."""
+        def reserve():
+            if self.side != "owner" or not _RID.fullmatch(rid):
+                raise VaultError("invalid_restore_reservation")
+            if self._journal() is not None:
+                raise VaultError("owner_key_rotation_in_progress")
+            path = self.folder / OWNER_RESTORE_INTENT
+            intent = {"rid": rid, "expires": expires}
+            if os.path.lexists(path):
+                if json.loads(_read_private(path, 1024)) != intent:
+                    raise VaultError("root_restore_in_progress")
+            else:
+                _write_atomic(self.folder, OWNER_RESTORE_INTENT, json.dumps(intent).encode())
+        self._locked(reserve)
+
+    def reconcile_restore_intent(self, status):
+        path = self.folder / OWNER_RESTORE_INTENT
+        if self.side != "owner" or not os.path.lexists(path):
+            return
+        intent = _read_private(path, 1024)
+        data = json.loads(intent)
+        record = status(data["rid"])   # do not hold the owner vault lock during a socket call
+        finished = (record.get("state") in ("done", "failed") and
+                    (record.get("result") or {}).get("action") == "restore_root")
+        if finished or (record.get("state") == "not_started" and self.clock() >= data["expires"]):
+            def clear():
+                if os.path.lexists(path) and _read_private(path, 1024) == intent:
+                    path.unlink()
+                    _fsync_dir(self.folder)
+            self._locked(clear)
+
     def _op_prepare(self, mode, request_id, expires_at):
         """Before the installer is asked: a durable marker bound to the exact request, so a crash between the installer's
         authorization and the owner's rotation is found and finished (or dropped) later. Changes nothing else."""
+        if self.side == "owner" and os.path.lexists(self.folder / OWNER_RESTORE_INTENT):
+            raise VaultError("root_restore_in_progress")
         if mode not in ROTATION_MODES or not _RID.fullmatch(str(request_id)) or type(expires_at) is not int:
             raise VaultError("key_rotation_request_invalid")
         if request_id in self._spent():
@@ -1186,7 +1221,7 @@ class Vault:
             raise VaultError("backup_damaged")
         return header, meta, blobs
 
-    def _verify(self, name, index):
+    def _verify(self, name, index, *, with_metadata=False):
         header, meta, blobs = self.open_backup(name, index)
         with tempfile.TemporaryDirectory(dir=str(self.work)) as tmp:
             archive = Path(tmp) / "state.tar"
@@ -1198,7 +1233,7 @@ class Vault:
         for member, data in list(files.items()) + [(n, b) for n, b in blobs.items() if n.startswith("extra/")]:
             if member.endswith(".sqlite3") and not _sqlite_ok(data):
                 raise VaultError("database_failed_integrity_check")
-        return header, files, blobs
+        return (header, files, blobs, meta) if with_metadata else (header, files, blobs)
 
     # .. retention ..............................................................................................................
     def _retain(self, index, protect=None, allow_verify=True):
@@ -1407,6 +1442,16 @@ class Vault:
         return result
 
     def _op(self, op, manual=False, args=None):
+        if self.side == "owner" and op == "rotate" and os.path.lexists(self.folder / OWNER_RESTORE_INTENT):
+            raise VaultError("root_restore_in_progress")
+        if self.side == "root":
+            from . import root_restore
+            if root_restore.held(self.state_dir):
+                raise VaultError("root_restore_in_progress")
+            if op == "restore_preview":
+                if self._rotation_active():
+                    raise VaultError("key_rotation_in_progress")
+                return root_restore.preview(self, (args or {}).get("archive"))
         if op not in ("rotate", "rotate_prepare", "rotate_cancel") and self._rotation_active():
             raise VaultError("key_rotation_in_progress")           # nothing else runs until the rotation has finished or resumed
         args = args or {}

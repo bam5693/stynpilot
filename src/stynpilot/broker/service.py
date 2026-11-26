@@ -70,6 +70,31 @@ class BrokerService:
         self._sock = None
 
     def handle(self, message):
+        from .. import root_restore, statelock
+        state = getattr(self.executor, "dir", None)
+        if state is None:
+            return self._handle(message)
+        msg = message if isinstance(message, dict) else {}
+        payload = msg.get("payload")
+        approving = msg.get("op") == "backup_admin" and isinstance(payload, dict) and payload.get("action") == "restore_root"
+        try:
+            with root_restore.admission(state, exclusive=approving):
+                if (root_restore.control(state) / "safe.json").exists():
+                    return root_restore.safe_reply(state, msg)
+                if root_restore.held(state):
+                    read = msg.get("op") in ("status", "vault_status")
+                    if msg.get("op") == "restore_check":
+                        if root_restore.probe_allowed(state, msg.get("probe")):
+                            return self._handle({"op": "runner", "call": "selftest", "args": {}})
+                        return {"ok": False, "error": "recovery_probe_not_authorized"}
+                    runner = msg.get("op") == "runner" and msg.get("call") == "status"
+                    if not read and not runner:
+                        return {"ok": False, "error": "root_restore_in_progress"}
+                return self._handle(message)
+        except statelock.Busy as error:
+            return {"ok": False, "error": error.code}
+
+    def _handle(self, message):
         op = message.get("op") if isinstance(message, dict) else None
         try:
             if op == "status":
@@ -127,6 +152,11 @@ class BrokerService:
                 return {"ok": True, "result": call()}
             if op == "runner":
                 return {"ok": True, "result": self.executor.runner_call(message.get("call"), message.get("args"))}
+            if op == "restore_preview":
+                details = self.executor.vault._run("restore_preview", args={"archive": message.get("archive")})
+                if "error" in details:
+                    return {"ok": False, "error": details["error"]}
+                return {"ok": True, "result": details}
             if op == "vault_settings":
                 vault = getattr(self, "vault", None)
                 return {"ok": True, "result": vault.effective_retention() if vault is not None else None}
@@ -282,6 +312,9 @@ class BrokerClient:
 
     def release_prepare(self, commit, version):
         return self._ask({"op": "release_prepare", "commit": commit, "version": version}, 30)["result"]
+
+    def restore_preview(self, archive):
+        return self._ask({"op": "restore_preview", "archive": archive}, 120)["result"]
 
     def vault_settings(self):
         return self._ask({"op": "vault_settings"}, 30)["result"]

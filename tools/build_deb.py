@@ -63,6 +63,8 @@ def stage(dest, cache):
     files = {"usr/bin/stynpilot": ("packaging/stynpilot-launcher", 0o755),
              "usr/libexec/stynpilot/root-helper": ("packaging/stynpilot-root-helper", 0o755),
              "usr/lib/systemd/system/stynpilot-installer.service": ("deploy/systemd/stynpilot-installer.service", 0o644),
+             "usr/lib/systemd/system/stynpilot-restore.path": ("deploy/systemd/stynpilot-restore.path", 0o644),
+             "usr/lib/systemd/system/stynpilot-restore.service": ("deploy/systemd/stynpilot-restore.service", 0o644),
              "usr/lib/systemd/user/stynpilot-owner.service": ("deploy/systemd/stynpilot-owner.service", 0o644),
              "usr/share/stynpilot/owner.example.json": ("deploy/owner.example.json", 0o644),
              "usr/share/stynpilot/installer.example.json": ("deploy/installer.example.json", 0o644),

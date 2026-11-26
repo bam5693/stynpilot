@@ -51,7 +51,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import catalog, impact, statelock
+from .. import catalog, impact, root_restore, statelock
 from ..ledger import InstallLedger, LedgerError
 from ..plan import PlanError, validate_plan
 from ..requests import request_id as payload_hash
@@ -120,7 +120,7 @@ class Runs:
                        (challenge, request_id, decision, self.clock() + CHALLENGE_LIFETIME))
         return challenge
 
-    def consume(self, *, challenge, request_id, decision, proof, kind):
+    def consume(self, *, challenge, request_id, decision, proof, kind, restore_payload=None):
         """Atomically: the challenge is ours, fresh, unused and matches; record the run. Else refuse."""
         try:
             with self._tx() as db:
@@ -133,8 +133,11 @@ class Runs:
                 if row["expires"] <= self.clock():
                     raise ExecutionDenied("challenge_expired")
                 db.execute("UPDATE challenges SET used=? WHERE challenge=?", (self.clock(), challenge))
-                db.execute("INSERT INTO runs (request_id, proof, kind, state, started) VALUES (?,?,?,?,?)",
-                           (request_id, proof, kind, "denied" if decision == "deny" else "running", self.clock()))
+                state = "denied" if decision == "deny" else "running"
+                if restore_payload is not None:
+                    state = "restore_queued"
+                db.execute("INSERT INTO runs (request_id,proof,kind,state,started,result) VALUES (?,?,?,?,?,?)",
+                           (request_id, proof, kind, state, self.clock(), json.dumps(restore_payload) if restore_payload else None))
         except sqlite3.IntegrityError:
             raise ExecutionDenied("already_used") from None
 
@@ -204,9 +207,15 @@ class Executor:
             self._alive = statelock.hold_alive(self.dir)        # a restore of these records is refused while we live
         except statelock.Busy:
             raise ExecutionDenied("installer_records_are_being_restored") from None
+        self.restore_available = lambda: False
         self.owner, self.device, self.verifier, self.run = owner, device, verifier, run
         self.sources_root, self.file_root = sources_root, Path(file_root)
         self.runs = Runs(self.dir / "runs.sqlite3")
+        with self.runs._tx() as db:
+            queued = db.execute("SELECT request_id,result FROM runs WHERE kind=? AND state='restore_queued'",
+                                (root_restore.KIND,)).fetchall()
+        for rid, raw in queued:
+            root_restore.wake(self.dir, rid, json.loads(raw))
         self.ledger = InstallLedger(self.dir / "installs.sqlite3")
         for sub in ("snapshots", "downloads", "attention", "attention-resolved"):
             (self.dir / sub).mkdir(exist_ok=True, mode=0o700)
@@ -268,6 +277,8 @@ class Executor:
     def status(self, request_id):
         """What the installer's own durable record says about this request (reconciliation source)."""
         record = self.runs.status(request_id)
+        if record["state"] == "restore_queued":
+            return {"state": "running", "result": {"pending": True, "action": "restore_root", "side": "root"}}
         if record["state"] == "running" and self.upgrader.is_job(request_id):
             self._settle(request_id)
             record = self.runs.status(request_id)
@@ -593,6 +604,9 @@ class Executor:
         action = payload.get("action")
         if action == "retention":
             ok = set(payload) == self._BACKUP_KEYS and _vault.valid_retention(payload.get("daily"), payload.get("weekly"))
+        elif action == "restore_root":
+            details = self.vault._run("restore_preview", args={"archive": payload.get("archive")})
+            ok = root_restore.matches(payload, details)
         elif action == "rotate_key":
             ok = (set(payload) == self._ROTATE_KEYS and payload.get("side") in ("root", "owner")
                   and payload.get("mode") in _vault.ROTATION_MODES)
@@ -617,6 +631,29 @@ class Executor:
         self._check_payload(payload)
         self._no_other_change()
         action = payload["action"]
+        if action == "restore_root":
+            def authorize():
+                if not self.restore_available():
+                    raise ExecutionDenied("independent_restore_worker_unavailable")
+                if (root_restore.held(self.dir) or self.vault._rotation_active()
+                        or any(t.is_alive() for t in self._builds.values())
+                        or self.jobs is None or not self.jobs.enabled() or self.jobs._live):
+                    raise ExecutionDenied("restore_requires_idle_installer_and_runner")
+                if not root_restore.still_current(self.vault, payload):
+                    raise ExecutionDenied("approved_restore_changed")
+                rid, _ = payload_hash(payload)
+                fingerprint, key = self._prove(rid, proof_token, challenge, "approve")
+                if key is None:
+                    raise ExecutionDenied("root_restore_requires_passkey")
+                if payload["expires_at"] <= datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"):
+                    raise ExecutionDenied("plan_invalid_or_expired")
+                self._used_passkey(key, rid, "approve")
+                root_restore.wake(self.dir, rid, payload)
+                self.runs.consume(challenge=challenge, request_id=rid, decision="approve", proof=fingerprint,
+                                  kind=root_restore.KIND, restore_payload=payload)
+                return {"pending": True, "action": action, "side": "root"}
+            with statelock.operation(self.dir):
+                return self.vault._locked(authorize)
         kind = "backup"
         if action == "rotate_key" and payload["side"] == "root":
             # Stored in the same transaction as the consumed proof, before any vault side effect.
@@ -731,7 +768,7 @@ class Executor:
             enabled = jobs.enabled()
             test = jobs.selftest_state()
             return {"enabled": enabled, "selftest": self._safe_selftest(test) if test.get("ran") else {"ran": False, "ok": False},
-                    "gate_open": enabled and test.get("ok") is True and test.get("version") == jobs.version,
+                    "gate_open": not root_restore.held(self.dir) and enabled and test.get("ok") is True and test.get("version") == jobs.version,
                     "workspaces": [name_of(w["path"]) for w in jobs.workspaces()],
                     "recipes": {rid: r.title for rid, r in sorted(runner_policy.RECIPES.items())}}
         if call == "selftest":

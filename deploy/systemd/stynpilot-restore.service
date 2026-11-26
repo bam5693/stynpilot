@@ -1,0 +1,15 @@
+[Unit]
+Description=Resume an owner-authorized StyNpilot installer restoration
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/stynpilot service restore-worker --config /etc/stynpilot/installer.json
+UMask=0077
+ProtectSystem=strict
+ReadWritePaths=/var/lib/stynpilot-installer
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+NoNewPrivileges=yes
+MemoryMax=1536M
+TimeoutStartSec=20min

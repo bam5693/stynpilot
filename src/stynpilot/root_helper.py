@@ -16,7 +16,7 @@ import stat
 import sys
 from pathlib import Path
 
-from . import backup, service
+from . import backup, root_restore as recovery, service
 from .service import ConfigError
 from .setup_wizard import root_setup
 
@@ -48,7 +48,10 @@ def root_backup(out, *, state=INSTALLER_STATE, **kw):
     uid = _caller(**kw)
     out = Path(out)
     _folder_ok(out.parent, uid)
-    return backup.make_backup(state, out, kind="root", chown_to=uid)
+    with recovery.admission(state):
+        if recovery.held(state):
+            raise ConfigError("root_restore_in_progress")
+        return backup.make_backup(state, out, kind="root", chown_to=uid)
 
 
 def root_restore(archive, *, state=INSTALLER_STATE, **kw):

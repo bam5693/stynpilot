@@ -203,12 +203,14 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         lines = "".join("<li>%s</li>" % html.escape(line) for line in view["summary"])
         intro = ("<h1>Approve or deny</h1><p>This text was written by the installer on your computer, not by an "
                  "assistant. Request fingerprint: <code>%s</code></p><ul>%s</ul>" % (html.escape(view["fingerprint"]), lines))
+        approve = "<button name=decision value=approve>Approve</button>"
+        hint = "Either choice asks you to sign in again to confirm."
+        if view.get("passkey_required"):
+            approve, hint = "", "Approval requires an enrolled passkey. You can sign in to deny this request."
         auth0 = ("<form method=post action=/approve/choose>"
-                 "<input type=hidden name=view value='%s'><input type=hidden name=csrf value='%s'>"
-                 "<button name=decision value=approve>Approve</button>"
-                 "<button class=deny name=decision value=deny>Deny</button></form>"
-                 "<p>Either choice asks you to sign in again to confirm. Nothing happens until you do.</p>"
-                 % (html.escape(view["view"]), html.escape(view["csrf"])))
+                 "<input type=hidden name=view value='%s'><input type=hidden name=csrf value='%s'>%s"
+                 "<button class=deny name=decision value=deny>Deny</button></form><p>%s</p>"
+                 % (html.escape(view["view"]), html.escape(view["csrf"]), approve, hint))
         nonce = None
         passkey = view.get("passkey")
         if passkey:

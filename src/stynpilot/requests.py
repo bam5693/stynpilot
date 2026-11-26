@@ -37,7 +37,7 @@ _SAFE_RESULT = ("ok", "stopped", "installed", "rollback_id", "restored", "restor
                 "pending", "started", "rolled_back", "from_version", "to_version", "notes", "config_preserved",
                 "action", "workspace", "entries", "skipped", "runner_user", "enabled", "selftest",
                 "enrollment_open", "label", "kid", "passkeys_active",
-                "side", "mode", "rotation", "progress", "reencrypted", "left_with_old_key", "moved_unreadable",
+                "side", "mode", "restore", "generation", "rotation", "progress", "reencrypted", "left_with_old_key", "moved_unreadable",
                 "generations_kept", "owner_side_authorized", "finished_later")
 KINDS = ("install", "rollback", "upgrade", "runner", "passkey", "release", "backup")
 MAX_PENDING_PER_CLIENT = 5
@@ -114,6 +114,9 @@ class RequestStore:
             raise RequestError("expired")
         rid, canonical = request_id(payload)
         logical = "%s|%s|%s|%s" % (kind, software, owner, device)
+        if kind == "backup" and payload.get("action") == "restore_root":
+            # Different archives, security states and scopes must never return another pending request's receipt.
+            logical += "|" + request_id({k: v for k, v in payload.items() if k != "expires_at"})[0]
         with self._tx() as db:
             self._expire(db)
             same = db.execute("SELECT * FROM requests WHERE logical_key=? AND state='pending' "
@@ -203,6 +206,34 @@ class RequestStore:
             if row is None or not self._interrupted_root_rotation(row):
                 return False
             db.execute("UPDATE requests SET state=?, result=? WHERE request_id=?", (to_state, safe, request_id_value))
+            return True
+
+    def unsettled_restores(self):
+        with self._tx() as db:
+            rows = db.execute("SELECT request_id,payload FROM requests WHERE kind='backup' "
+                              "AND state IN ('approved','running','needs_owner_intervention')")
+            return [row["request_id"] for row in rows if json.loads(row["payload"]).get("action") == "restore_root"]
+
+    def settle_restore(self, rid, record):
+        """Only a matching terminal installer decision can correct an interrupted owner receipt."""
+        result = record.get("result") or {}
+        state = record.get("state")
+        if (result.get("action") != "restore_root" or result.get("side") != "root"
+                or (state, result.get("ok"), result.get("restore")) not in
+                   (("done", True, "done"), ("failed", False, "rolled_back"),
+                    ("needs_owner_intervention", False, "safe_recovery"))):
+            return False
+        with self._tx() as db:
+            row = db.execute("SELECT payload FROM requests WHERE request_id=? AND kind='backup' "
+                             "AND state IN ('approved','running','needs_owner_intervention')", (rid,)).fetchone()
+            if row is None:
+                return False
+            payload = json.loads(row["payload"])
+            if (request_id(payload)[0] != rid or payload.get("action") != "restore_root" or payload.get("side") != "root"
+                    or (state != "needs_owner_intervention" and result.get("generation") != payload["generation"])):
+                return False
+            safe = json.dumps({k: result[k] for k in _SAFE_RESULT if k in result}, sort_keys=True)
+            db.execute("UPDATE requests SET state=?, result=? WHERE request_id=?", (state, safe, rid))
             return True
 
     def in_flight(self):

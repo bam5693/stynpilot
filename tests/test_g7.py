@@ -1290,7 +1290,8 @@ class PackageTests(unittest.TestCase):
             self.assertNotIn(bad, text)
         launcher = files["usr/bin/stynpilot"][1].decode()
         self.assertTrue(launcher.startswith("#!/usr/bin/python3 -I"))
-        for unit in ("usr/lib/systemd/system/stynpilot-installer.service", "usr/lib/systemd/user/stynpilot-owner.service"):
+        for unit in ("usr/lib/systemd/system/stynpilot-installer.service", "usr/lib/systemd/user/stynpilot-owner.service",
+                     "usr/lib/systemd/system/stynpilot-restore.path", "usr/lib/systemd/system/stynpilot-restore.service"):
             self.assertTrue(files[unit][1] == (ROOT / "deploy/systemd" / Path(unit).name).read_bytes())
 
     def test_build_is_reproducible_and_the_vendored_wheel_is_hash_pinned(self):

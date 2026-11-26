@@ -300,11 +300,22 @@ def _owner_after_approval(get_vault, *, sleep=time.sleep, attempts=20):
     return after
 
 
-def _owner_before_run(state, get_vault):
+def _owner_before_run(state, get_vault, restore_status=None):
     """Owner-side steps before the installer is asked: the upgrade backup, and the durable rotation marker."""
     upgrade = _owner_backup_before_upgrade(state)
 
     def before(payload, rid):
+        if payload.get("action") in ("restore_root", "rotate_key") and restore_status is not None:
+            owner_vault = get_vault()
+            if owner_vault is not None:
+                owner_vault.reconcile_restore_intent(restore_status)
+        if payload.get("action") == "restore_root":
+            from datetime import datetime, timezone
+            owner_vault = get_vault()
+            if owner_vault is None:
+                raise _vault_error("backups_not_available")
+            expires = datetime.strptime(payload["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            owner_vault.reserve_root_restore(rid, int(expires.timestamp()))
         if payload.get("kind") in ("upgrade", "release"):
             vault_ = get_vault()
             if vault_ is not None and vault_.journal_request() is not None:
@@ -368,6 +379,13 @@ def _owner_rotation_reconciler(store, flow, vault_, broker):
                 elif outcome == "cancelled":
                     settle(rid, {"ok": False, "action": "rotate_key", "side": "owner", "rotation": "failed",
                                  "stopped": "installer_did_not_authorize_or_it_could_not_start", "changed_anything": False})
+        if hasattr(vault_, "reconcile_restore_intent"):
+            vault_.reconcile_restore_intent(broker.status)
+        for rid in store.unsettled_restores():
+            try:
+                store.settle_restore(rid, broker.status(rid))
+            except Exception:
+                continue
         for rid in store.interrupted_rotations():
             try:
                 record = broker.status(rid)
@@ -410,7 +428,7 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
                                                             redirect_uri=config.redirect_uri),
                         authorize={"endpoint": config.authorize_endpoint, "client_id": config.approval_client_id,
                                    "redirect_uri": config.redirect_uri},
-                        clock=clock, background=True, before_run=_owner_before_run(state, lambda: service_vault[0]))
+                        clock=clock, background=True, before_run=_owner_before_run(state, lambda: service_vault[0], broker.status))
     recovered, waiting = flow.recover(patient=True)        # settle what the installer already knows, BEFORE accepting anything
     service = OwnerService(flow, None, None, recovered, waiting)
     try:
@@ -678,24 +696,40 @@ def main(argv=None):                                       # pragma: no cover - 
     import signal
     import threading
     parser = argparse.ArgumentParser(prog="stynpilot-service")
-    parser.add_argument("role", choices=("owner", "installer", "provision", "passkeys", "release"))
+    parser.add_argument("role", choices=("owner", "installer", "provision", "passkeys", "release", "restore-worker"))
     parser.add_argument("--config", required=True)
     parser.add_argument("--action", choices=("list", "activate", "confirm-restored", "init", "set-token", "status"), default="list")
     parser.add_argument("--kid", default="")
     args = parser.parse_args(argv)
+    if args.role == "restore-worker":
+        from . import restore_service
+        return restore_service.run(args.config, InstallerConfig.from_file(args.config))
     if args.role == "installer":
         config = InstallerConfig.from_file(args.config)
+        from . import root_restore
+        if (root_restore.control(config.state_dir) / "safe.json").exists():
+            from .restore_service import serve_safe
+            return serve_safe(config)
+        if not root_restore.start_allowed(config.state_dir):
+            return 0  # the independent recovery worker starts the service when the tree is intact
         service = build_installer(config, jwks=fetch_jwks(config.issuer), root_vault=root_vault(args.config, config),
                                   jwks_loader=lambda: fetch_jwks(config.issuer))     # rotation: only on an unknown key ID
         from . import vault as _vault
+        from .restore_service import watcher_ready
+        service.executor.restore_available = lambda: watcher_ready(config, args.config)
         service.vault = service.executor.vault
         _vault.start_scheduler(service.vault)                 # first backup shortly after start, then hourly checks; never raises
         service.serve_forever()
         return 0
-    if args.role == "passkeys":
-        return passkeys_console(args.config, args.action, args.kid)
-    if args.role == "release":
-        return release_console_main(args.config, args.action)
+    if args.role in ("passkeys", "release"):
+        from . import root_restore
+        state = InstallerConfig.from_file(args.config).state_dir
+        with root_restore.admission(state):
+            if root_restore.held(state):
+                raise ConfigError("root_restore_in_progress")
+            if args.role == "passkeys":
+                return passkeys_console(args.config, args.action, args.kid)
+            return release_console_main(args.config, args.action)
     config = OwnerConfig.from_file(args.config)
     if args.role == "provision":
         print("created:", ", ".join(provision_owner_state(config)))

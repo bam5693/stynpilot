@@ -192,6 +192,19 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
             return receipt(result)
         return run("commander_request_backup_retention", device_id, work, write=True)
 
+    @server.tool(name="commander_request_root_restore", title="Ask the owner to recover installer records",
+                 annotations=FILES_A_REQUEST, description="Request a passkey approval for one complete root archive, keeping settings.")
+    def request_root_restore(device_id: str, archive: str) -> dict:
+        def work(owner):
+            details = broker.restore_preview(archive)
+            expires = now() + timedelta(hours=1)
+            payload = dict(details, kind="backup", action="restore_root", side="root", owner=owner, device=device_id,
+                           expires_at=expires.strftime("%Y-%m-%dT%H:%M:%SZ"))
+            result, _ = store.submit(kind="backup", software="stynpilot-root-restore", device=device_id, owner=owner,
+                                     proposer=ctx.proposer, payload=payload, summary=render_summary(payload), expires=expires.timestamp())
+            return receipt(result)
+        return run("commander_request_root_restore", device_id, work, write=True)
+
     @server.tool(name="commander_request_backup_key_rotation", title="Ask the owner to replace a backup encryption key",
                  annotations=FILES_A_REQUEST,
                  description=("Ask the owner to approve a new backup encryption key for side 'root' (installer) or 'owner' (his own "

@@ -1,12 +1,12 @@
 # StyNpilot development handoff
 
-## Current candidate
+## Current development
 
-Dev23 Stage 2 is secure backup key rotation, package `0.1.0~dev24`. Claude's reviewed application code is `015bb403f769002e3280de25c327684649031750`. The handoff-only commit `f0934ae3307eef474b09f588773f03b5ec53fcc7` is the base of `codex/dev23-stage2-final`. Dev23 Stage 1 at `a611385` is the prior release.
+Dev23 Stage 2 is released as `0.1.0~dev24` at `3a7aaf2c0c8e71af442803abf9c660942318f0c6`. Independent release verification recorded reproducible builds, 915 passing tests, 95 skips and all 21 confinement checks passing. The package SHA-256 is `4d23df45c1216354cd96dff0b77ef55b2a5abe12548f206f78c84dd00ad97d10` (352,632 bytes).
 
-The final correction covers an installer process dying before it records the result of root rotation. Startup now inspects the spent approval and its exact vault evidence before classifying the interrupted run. A matching journal resumes under the existing lock. An exact completed result settles the request. Ambiguous evidence, including a crash before the journal exists, requires owner intervention. The owner service can correct an uncertain receipt when the installer has a verified final result. See [the Stage 2 design and crash boundaries](DEV23_STAGE2_KEY_ROTATION.md).
+Dev23 Stage 3 targets `0.1.0~dev25` on `codex/dev23-stage3-root-restore`, based on that release. The new YELLOW request recovers installer records from one complete verified root archive. The owner confirms the archive fingerprint, settings-preserving scope and security-state binding with an enrolled passkey. See the [installer restoration design](DEV23_STAGE3_ROOT_RESTORE.md).
 
-**Next action.** ChatGPT independently reviews the exact candidate SHA recorded in the private master plan. ChatGPT handles preparation, owner approval and live release verification. Stage 3 starts from the verified released commit after that confirmation. Live key rotation is outside the release verification procedure.
+ChatGPT independently reviews the exact candidate recorded in the private master plan. A booted disposable guest is the next integration boundary for systemd, owner-endpoint health and the full confinement probe together. Live restoration is outside the review procedure.
 
 ## Milestones and versions
 
@@ -14,23 +14,15 @@ The final correction covers an installer process dying before it records the res
 | --- | --- | --- |
 | Dev22 | Encrypted backup vaults, verification and drills | `0.1.0~dev22` |
 | Dev23 Stage 1 | Retention policy and periodic verification | `0.1.0~dev23` |
-| Dev23 Stage 2 | Secure key rotation | `0.1.0~dev24` candidate |
-| Dev23 Stage 3 | Installer-side restoration | Next unused increment |
+| Dev23 Stage 2 | Secure key rotation | `0.1.0~dev24` released |
+| Dev23 Stage 3 | Installer-side restoration | `0.1.0~dev25` candidate |
 | Dev23 Stage 4 | Owner-side restoration | Following unused increment |
 
 Dev24 off-machine backup and Dev25 repository management are milestone labels. Every separately published package consumes a version increment.
 
 ## Test evidence
 
-| Final candidate check | Result |
-| --- | --- |
-| Normal pytest, unprivileged | 830 passed, 0 failed, 92 skipped |
-| Disposable release-sandbox emulation, full pytest suite | 915 passed, 0 failed, 95 skipped |
-| Offline unittest entry point | 1,010 run, 93 skipped, 0 failures or errors |
-
-The final emulation used disposable Bubblewrap namespaces and the repository's release seccomp filter on Ubuntu 26.04 with the pinned MCP wheel. It used the distribution's Python and GNU tar. Both pytest runs reported two dependency deprecation warnings.
-
-The input candidate's reported results were 912 passed / 5 skipped in the normal developer environment and 910 passed / 95 skipped in release-sandbox emulation. The new restart tests use synthetic vaults and terminate the installer process at durable write boundaries.
+The released Stage 2 baseline is 830 passed / 92 skipped in the unprivileged pytest profile and 915 passed / 95 skipped in the disposable release profile. The private review record ties each Stage 3 suite result to an exact Git commit.
 
 Run `./scripts/check.sh` for the full offline unittest entry point. The normal pytest comparison uses the following command. Record the executing UID and environment. Root-only cases skip under an unprivileged user.
 

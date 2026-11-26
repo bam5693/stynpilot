@@ -100,6 +100,14 @@ def render_summary(payload):
                     "Approve only if you just created this passkey yourself. If you did not, deny it.", expires]
         return ["Remove the passkey with short ID %s." % str(payload.get("kid")),
                 "It can no longer approve anything. Other passkeys and your Auth0 sign-in keep working.", expires]
+    if payload.get("kind") == "backup" and payload.get("action") == "restore_root":
+        return ["Restore installer records from the complete verified archive %s (version %s, Unix time %s)."
+                % (payload["archive"], payload["version"], payload["created"]),
+                "Archive SHA-256 " + payload["sha256"],
+                "Recover install ledger entries, snapshots and attention records. Preserve settings. Changed settings files: "
+                + (", ".join(payload["settings_differences"]) or "none") + ".",
+                "A verified safety backup precedes replacement. Jobs stay blocked until service and confinement checks pass.",
+                "Recovery generation %d. Expires %s." % (payload["generation"], payload["expires_at"])]
     if payload.get("kind") == "backup" and payload.get("action") == "rotate_key":
         expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
         where = "the root installer side" if payload.get("side") == "root" else "your own side"

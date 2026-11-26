@@ -353,6 +353,9 @@ class JobRunner:
         return data
 
     def require_ready(self):
+        from .. import root_restore
+        if root_restore.held(self.dir):
+            raise JobError("root_restore_in_progress")
         if not self.enabled():
             raise JobError("runner_not_set_up")
         if self.gate:

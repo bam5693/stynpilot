@@ -105,9 +105,20 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
         caller = inference_caller(owner, device_id)
         if readiness_probe().get("resource_checks_passed") is not True:
             raise local_ai.LocalAIError("local_ai_containment_required")
-        # Recheck after sampling; cross-process recovery exclusion still required before release.
         inference_caller(owner, device_id)
-        return inference.submit(caller, prompt)
+        # Keep the original verified bearer in this job's volatile closure
+        # only while work is active; never persist or log it or send to Ollama.
+        header = bearer()
+
+        def still_authorized(jid):
+            proposer, current_owner = gate.check(header, device_id)
+            if (current_owner, device_id, proposer.client) != caller:
+                return False
+            activity_call("inference_validate", jid)
+            proposer, current_owner = gate.check(header, device_id)
+            return (current_owner, device_id, proposer.client) == caller
+
+        return inference.submit(caller, prompt, authorize=still_authorized)
 
     def read_inference(owner, device_id, job_id):
         result = inference.status(inference_caller(owner, device_id), job_id)

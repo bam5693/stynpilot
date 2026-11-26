@@ -349,22 +349,31 @@ class Vault:
                 continue
             try:
                 header, _, _ = self._verify(path.name, index)
+                _, meta, _ = self.open_backup(path.name, index)          # completeness comes from the authenticated bundle itself
+                excluded, incomplete = meta.get("excluded"), meta.get("incomplete")
+                if not isinstance(excluded, list) or not isinstance(incomplete, list):
+                    raise VaultError("bundle_metadata_missing")
                 index["backups"][path.name] = {"created": int(header["created"]), "size": path.lstat().st_size,
-                                               "verified_at": int(self.clock()), "checked_at": int(self.clock()), "excluded": []}
+                                               "verified_at": int(self.clock()), "checked_at": int(self.clock()),
+                                               "excluded": [str(x)[:120] for x in excluded][:50],
+                                               "incomplete": [str(x)[:60] for x in incomplete][:50]}
             except Exception:
                 index["backups"][path.name] = {"created": int(path.lstat().st_mtime), "size": path.lstat().st_size,
-                                               "verified_at": None, "failed": True, "excluded": []}
+                                               "verified_at": None, "failed": True, "excluded": [], "incomplete": ["unknown"]}
         index["rebuilt_at"] = int(self.clock())
         self._skip_retention = True                            # no retention in the same run as a rebuild
 
     # .. nonces: an append-only log, fsynced before a nonce is used, independent of the index ..................................
-    def _nonces(self):
+    def _nonces(self, index=None):
         used = set()
         try:
             data = _read_private(self.folder / NONCE_LOG, 64 << 20)
             used |= {line for line in data.decode("ascii", "replace").split() if re.fullmatch(r"[0-9a-f]{24}", line)}
         except FileNotFoundError:
-            pass
+            # The log holds nonces of backups that retention already deleted; the surviving files cannot stand in for it. With a key
+            # already in use, a missing log stops new backups (a new key, owner-approved, is the way out: tracked for Dev23).
+            if self.key_file.exists() or self._files() or (index or {}).get("key_id") or (index or {}).get("backups"):
+                raise VaultError("nonce_log_missing") from None
         for path in self._files():                           # and every backup still present, in case the log was lost
             try:
                 with open(str(path), "rb") as handle:
@@ -397,11 +406,19 @@ class Vault:
         try:
             raw = _read_private(self.key_file, 64)
         except FileNotFoundError:
-            if index.get("key_id") or self._files() or index.get("damaged") or (self.folder / NONCE_LOG).exists():
+            log = self.folder / NONCE_LOG
+            used_log = log.exists() and (log.is_symlink() or log.stat().st_size > 0)
+            if index.get("key_id") or self._files() or index.get("damaged") or used_log:
                 raise VaultError("backup_key_missing")          # never silently replace a key that existing backups need
+            if log.exists():
+                os.unlink(str(log))                             # an EMPTY log left by an interrupted first start: nothing depended on it
             if not create:
                 raise VaultError("backup_key_missing")
             raw = KEY_MAGIC + secrets.token_bytes(8) + secrets.token_bytes(32)
+            # the nonce log is born with the key, so from now on a missing log always means a LOST log
+            log = os.open(str(self.folder / NONCE_LOG), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            os.fsync(log)
+            os.close(log)
             fd = os.open(str(self.key_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             try:
                 os.write(fd, raw)
@@ -437,6 +454,8 @@ class Vault:
         total += sum(sizes.values())
         if total > self.limits["gather"] or largest > self.limits["file"]:
             raise VaultError("backup_too_large_for_the_limits")
+        if self.space(str(self.folder)).free < 3 * total + SPACE_MARGIN:   # room for the temporary copies AND the backup, checked first
+            raise VaultError("insufficient_storage")
         with tempfile.TemporaryDirectory(dir=str(self.work)) as tmp:
             archive = Path(tmp) / "state.tar"
             backup.make_backup(self.state_dir, archive, kind=self.side, clock=self.clock)
@@ -475,8 +494,7 @@ class Vault:
         return _private_folder(self.folder / ".work")
 
     # .. create / verify ........................................................................................................
-    def _new_nonce(self):
-        used = self._nonces()
+    def _new_nonce(self, used):
         for _ in range(8):
             nonce = secrets.token_bytes(12).hex()
             if nonce not in used:
@@ -484,13 +502,14 @@ class Vault:
         raise VaultError("nonce_generation_failed")
 
     def _create(self, index):
+        used = self._nonces(index)                              # BEFORE a key exists: a missing log is only fine for the very first backup
         key_id, key = self._key(index, create=True)
         index["key_id"] = key_id
         bundle, excluded, incomplete = self._gather()
         free = self.space(str(self.folder)).free
         if free < 2 * len(bundle) + SPACE_MARGIN:
             raise VaultError("insufficient_storage")            # nothing is deleted to make room
-        nonce = self._new_nonce()
+        nonce = self._new_nonce(used)
         now = int(self.clock())
         header = json.dumps({"format": FORMAT, "side": self.side, "created": now, "version": self.version, "key_id": key_id,
                              "nonce": nonce, "size": len(bundle)}, sort_keys=True, separators=(",", ":")).encode()
@@ -559,9 +578,12 @@ class Vault:
                           if info.get("verified_at") and (self.folder / name).is_file())
         if not verified:
             return []
+        complete = [(c, n) for c, n in verified if not index["backups"][n].get("incomplete")]
         keep = {verified[-1][1], protect}                       # the newest VERIFIED backup (and the one just made) are never deleted
+        if complete:
+            keep.add(complete[-1][1])                           # ... nor the newest COMPLETE verified one, however many partial follow
         days, weeks = {}, {}
-        for created, name in verified:
+        for created, name in (complete or verified):            # the daily/weekly windows are filled with complete backups only
             days[time.strftime("%Y%m%d", time.gmtime(created))] = name
             weeks[time.strftime("%G%V", time.gmtime(created))] = name
         for groups, count in ((days, self.retention["daily"]), (weeks, self.retention["weekly"])):
@@ -731,22 +753,36 @@ class Vault:
             import sys
             paths = [p for p in sys.path if p and os.path.isdir(p)]
             code = ("import sys,json;sys.path[:0]=json.loads(sys.argv[1]);from stynpilot.vault import _child;_child()")
+            error = "backup_process_unavailable"
             try:
                 done = subprocess.run([sys.executable, "-I", "-c", code, json.dumps(paths)], input=json.dumps(self._spec(op, manual)).encode(),
                                       capture_output=True, timeout=CHILD_TIMEOUT, close_fds=True)
                 lines = done.stdout.decode("utf-8", "replace").strip().splitlines()
-                if done.returncode == 0 and lines:
-                    result = json.loads(lines[-1][-65536:])
-                    if isinstance(result, dict):
-                        return result
-                error = "backup_process_failed_exit_%d" % done.returncode
+                result = json.loads(lines[-1][-65536:]) if done.returncode == 0 and lines else None
+                if isinstance(result, dict) and result.get("error") != "backup_worker_memory_limit_unavailable":
+                    return result
+                error = result["error"] if isinstance(result, dict) else "backup_process_failed_exit_%d" % done.returncode
             except subprocess.TimeoutExpired:
                 error = "backup_process_timed_out"
             except (OSError, ValueError):
-                error = "backup_process_unavailable"
+                pass
         # the child died (memory limit, crash, timeout): record it from here; the service itself is unaffected
-        self._guard(lambda: self._failed(self._index(), int(self.clock()), VaultError(error)) if op == "backup" else None)
+        self._guard(lambda: self._record_worker_failure(op, error))
         return {"ok": False, "error": error}
+
+    def _record_worker_failure(self, op, error):
+        index = self._index()
+        if index.get("damaged"):
+            return None                                       # never overwrite a damaged index from here; the next run rebuilds it
+        now = int(self.clock())
+        if op == "drill":
+            index["last_drill"] = {"at": now, "ok": False, "backup": None, "error": error}
+        else:
+            index["last_error"] = {"at": now, "code": ("recheck_" if op == "recheck" else "") + error}
+            if op == "backup":
+                index["last_attempt"] = now
+        self._save(index)
+        return None
 
     def backup_now(self, *, manual=False):
         return self._run("backup", manual)
@@ -803,6 +839,8 @@ class Vault:
                 problems.append("vault_index_damaged")
             if (present or index.get("key_id")) and not self.key_file.exists():
                 problems.append("backup_key_missing")
+            if (present or index.get("key_id")) and not (self.folder / NONCE_LOG).exists():
+                problems.append("nonce_log_missing")
             if not verified:
                 problems.append("no_verified_backup")
             elif now - verified[-1]["created"] > OVERDUE_AFTER:
@@ -837,9 +875,13 @@ def _child():
     import sys
     spec = json.loads(sys.stdin.read(1 << 20))
     try:
-        resource.setrlimit(resource.RLIMIT_AS, (spec["limits"]["memory"], spec["limits"]["memory"]))
-    except (ValueError, OSError):
-        pass
+        limit = int(spec["limits"]["memory"])
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+        if resource.getrlimit(resource.RLIMIT_AS)[0] != limit:
+            raise OSError("limit not in force")
+    except (ValueError, OSError, KeyError, TypeError):
+        sys.stdout.write(json.dumps({"ok": False, "error": "backup_worker_memory_limit_unavailable"}) + "\n")
+        return                                                # fail closed: no heavy work without the limit
     v = Vault(side=spec["side"], state_dir=spec["state_dir"], folder=spec["folder"], extras=[tuple(e) for e in spec["extras"]],
               version=spec["version"], retention=spec["retention"], limits=spec["limits"])
     result = v._guard(lambda: v._op(spec["op"], spec["manual"]))

@@ -47,3 +47,15 @@ backs up the root side as root. Each side has its own key and can open only its 
   (including Codex's two precautionary Dev21 archives, wherever they are kept) is never touched.
 - commander_backup_now and commander_backup_drill go through the write gate (workspace.propose + an enrolled client), like the
   other tools that change something; backup_status stays a read tool.
+
+## Second focused review
+- Retention separates VERIFIED from COMPLETE: the newest complete verified backup is never deleted, and the daily/weekly windows
+  are filled with complete backups only, so any number of incomplete ones cannot displace the last complete recovery point
+  (test: one complete backup, then 60 incomplete daily ones).
+- A rebuilt index takes `excluded` / `incomplete` from each backup's authenticated bundle; an unreadable one counts as incomplete.
+- The worker refuses all work (`backup_worker_memory_limit_unavailable`) if its memory limit cannot be set and confirmed.
+- Free space (3x the measured size + 64 MiB) is checked before any temporary file is written.
+- Worker crashes and timeouts are recorded for drills and re-checks too; a crashed check never un-verifies a good backup.
+- The nonce log is created together with the key; if it later disappears, new backups stop (`nonce_log_missing`) instead of
+  trusting the surviving files. Recovery = an owner-approved new key (tracked for Dev23). An empty log left by an interrupted
+  first start does not block the first backup.

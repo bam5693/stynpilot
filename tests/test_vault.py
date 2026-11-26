@@ -532,11 +532,81 @@ class ReviewFindingTests(unittest.TestCase):
         self.assertTrue(set(made) <= set(index["backups"]))                  # every old backup re-learned and verified
         self.assertTrue(all(index["backups"][n]["verified_at"] for n in made))
 
-    def test_a_lost_nonce_log_is_rebuilt_from_the_backups_present(self):
+    def test_a_lost_nonce_log_stops_new_backups_instead_of_guessing(self):
         name = self.vault.backup_now()["backup"]
-        header, _, _ = self.vault.open_backup(name)
         os.unlink(self.tmp / "vault" / vault.NONCE_LOG)
-        self.assertIn(header["nonce"], self.vault._nonces())
+        self.o.clock.t += DAY
+        self.assertEqual(self.vault.backup_now()["error"], "nonce_log_missing")
+        self.assertIn("nonce_log_missing", self.vault.status()["problems"])
+        self.assertIn(name, {p.name for p in (self.tmp / "vault").iterdir()})   # nothing deleted, the old backup still opens
+        self.vault.open_backup(name)
+
+    def test_the_last_complete_backup_survives_any_number_of_incomplete_ones(self):
+        complete = self.vault.backup_now()
+        self.assertTrue(complete["complete"], complete)
+        self.o.settings.write_text(json.dumps({"mcp_port": 8000, "unexpected": 1}))   # from now on owner.json is refused
+        for _ in range(60):                                                  # far beyond 7 daily + 4 weekly
+            self.o.clock.t += DAY
+            made = self.vault.backup_now()
+            self.assertEqual((made["ok"], made["complete"]), (True, False), made)
+        names = {p.name for p in (self.tmp / "vault").glob("*.stynvault")}
+        self.assertIn(complete["backup"], names)
+        self.assertTrue(self.vault.status()["problems"])                     # and the partial ones are reported as incomplete
+        self.assertLessEqual(len(names), 2 + 7 + 4)
+
+    def test_a_rebuilt_index_takes_completeness_from_the_authenticated_backups(self):
+        good = self.vault.backup_now()["backup"]
+        self.o.settings.write_text(json.dumps({"mcp_port": 8000, "unexpected": 1}))
+        self.o.clock.t += DAY
+        partial = self.vault.backup_now()["backup"]
+        (self.tmp / "vault/index.json").write_text("{damaged")
+        os.chmod(self.tmp / "vault/index.json", 0o600)
+        self.vault._load()
+        index = self.vault._index()
+        rebuilt = self.vault._load()
+        self.assertEqual(rebuilt["backups"][good].get("incomplete"), [])
+        self.assertEqual(rebuilt["backups"][partial].get("incomplete"), ["owner.json"])
+        self.assertIn("owner.json:unexpected_fields", rebuilt["backups"][partial]["excluded"])
+        del index
+
+    def test_free_space_is_checked_before_any_temporary_file_is_written(self):
+        from stynpilot import backup
+        self.o.space.free = 1000
+        real = backup.make_backup
+        backup.make_backup = lambda *a, **k: self.fail("temporary files were written before the space check")
+        self.addCleanup(setattr, backup, "make_backup", real)
+        self.assertEqual(self.vault.backup_now()["error"], "insufficient_storage")
+
+    def test_the_worker_refuses_to_work_without_its_memory_limit(self):
+        import io
+        import resource
+        real_set, real_in, real_out = resource.setrlimit, sys.stdin, sys.stdout
+        resource.setrlimit = lambda *a: (_ for _ in ()).throw(ValueError("not allowed"))
+        sys.stdin = io.StringIO(json.dumps(self.vault._spec("backup", False)))
+        sys.stdout = out = io.StringIO()
+        try:
+            vault._child()
+        finally:
+            resource.setrlimit, sys.stdin, sys.stdout = real_set, real_in, real_out
+        self.assertEqual(json.loads(out.getvalue()), {"ok": False, "error": "backup_worker_memory_limit_unavailable"})
+        self.assertFalse(list((self.tmp / "vault").glob("*.stynvault")) if (self.tmp / "vault").exists() else [])
+
+    def test_worker_crashes_are_recorded_for_drills_and_rechecks_too(self):
+        import subprocess
+        isolated = Vault(side="owner", state_dir=self.o.config.state_dir, folder=self.tmp / "vault", extras=self.vault.extras,
+                         isolate=True)
+        self.assertTrue(isolated.backup_now()["ok"])
+        real = subprocess.run
+        subprocess.run = lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("x", 1))
+        try:
+            self.assertEqual(isolated.drill(), {"ok": False, "error": "backup_process_timed_out"})
+            self.assertEqual(isolated.recheck(), {"ok": False, "error": "backup_process_timed_out"})
+        finally:
+            subprocess.run = real
+        problems = isolated.status()["problems"]
+        self.assertIn("last_recovery_drill_failed:backup_process_timed_out", problems)
+        self.assertIn("last_backup_failed:recheck_backup_process_timed_out", problems)
+        self.assertTrue(isolated.status()["newest_verified"])               # a crashed CHECK does not un-verify a good backup
 
     def test_files_not_created_by_this_vault_are_never_deleted(self):
         self.vault.backup_now()

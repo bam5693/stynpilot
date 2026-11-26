@@ -37,10 +37,12 @@ disposable environments, never live security-critical state. Do not weaken any s
   never include them in any retention/cleanup. All existing backups and Pi backups.
 
 ## Current work: Dev23 stage 1 (retention settings + periodic re-verification)
-- Branch `claude/dev23-stage1-retention`. Reviewed commit `9cc6a50` (version 0.1.0.dev23). ChatGPT review: architecture,
-  payload validation, single-use approval, write gate and daily verification PASSED; findings below are being fixed in the next
-  commit on the same branch (see the git log / master plan for its hash).
-- Findings to fix (BLOCKER + SHOULD-FIX):
+- Branch `claude/dev23-stage1-retention`. First reviewed commit `9cc6a50` (version 0.1.0.dev23). ChatGPT review: architecture,
+  payload validation, single-use approval, write gate and daily verification PASSED. The findings below are FIXED in commit
+  `d2366356bf4f7be61489cb7f98959b30328933d6` (normal 861 passed/5 skipped; sandbox emulation 859 passed/95 skipped/0 failed).
+  **Exact next action:** ChatGPT focused review of d236635 -> if PASS, automated release as 0.1.0~dev23 -> live checks ->
+  start Dev23 stage 2 (secure key rotation) on a NEW branch from the released commit, with package version 0.1.0.dev24.
+- Findings (now fixed):
   1. BLOCKER: a damaged/unreadable/invalid approved settings file must NOT fall back to 7+4 for pruning: prune nothing, keep
      backing up and verifying, report `retention_settings_untrusted`. Owner side: no pruning unless the installer's current
      policy was confirmed in this run. No pruning when the newest complete verified backup's check is stale (> 1 day).

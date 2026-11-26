@@ -86,7 +86,14 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
 
     # A narrow, owner-side inference bridge, not a network exception for the project runner.
     from .. import local_ai, local_ai_readiness
-    inference = local_ai.Jobs()
+    def activity_call(call, jid):
+        result = broker.runner(call, {"job_id": jid})
+        if type(result) is not dict or result.get("ok") is not True:
+            raise local_ai.LocalAIError("local_ai_activity_unverified")
+
+    inference = local_ai.Jobs(
+        reserve=lambda jid: activity_call("inference_claim", jid),
+        finish=lambda jid: activity_call("inference_finish", jid))
     readiness_probe = inference_readiness_probe or local_ai_readiness.inspect
 
     @server.tool(name="local_ai_readiness", title="Inspect fixed local AI resource controls", annotations=READ_ONLY,

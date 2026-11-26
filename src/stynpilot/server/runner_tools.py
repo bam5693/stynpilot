@@ -164,7 +164,10 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
                  description="Ask for a separate owner passkey approval to stop only the fixed Ollama pilot service and clear its exact durable inference reservation after quiescence checks. Does not approve, restart or stop the service itself.")
     def request_inference_settlement(device_id: str) -> dict:
         def work(owner):
-            claim = broker.runner("inference_claim_status", {}).get("claim")
+            evidence = broker.runner("inference_claim_status", {})
+            if type(evidence) is not dict or "claim" not in evidence:
+                raise local_ai.LocalAIError("activity_claim_unverified")
+            claim = evidence["claim"]
             if claim is None:
                 return {"already_idle": True}
             if (type(claim) is not dict or claim.get("kind") != "inference"

@@ -40,7 +40,7 @@ def _error(code):
 
 
 def register(server, *, router, clients, store, bearer, broker, projects_dir, approval_url=None, clock=None, limiter=None,
-             vault=None):
+             vault=None, lab_probe=None):
     gate = ProposeGate(router=router, clients=clients)
     limiter = limiter or RateLimit(per_minute=120)
     now = clock or (lambda: datetime.now(timezone.utc))
@@ -83,6 +83,14 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
             return _error("temporarily_unavailable")
         _LOG.info("tool=%s client=%s outcome=ok", tool, who)
         return {"ok": True, "device_id": device_id, "result": result}
+
+    from .. import dev_lab_policy
+    lab_preflight = lab_probe or dev_lab_policy.inspect
+
+    @server.tool(name="dev_lab_status", title="Inspect development lab prerequisites", annotations=READ_ONLY,
+                 description="Report fixed local lab cache presence, KVM access and memory/disk headroom. No downloads, commands, VM launch, artifact trust verification or path disclosure. Launch capability is not yet implemented.")
+    def dev_lab_status(device_id: str) -> dict:
+        return run("dev_lab_status", device_id, lambda owner: lab_preflight(), write=False)
 
     def workspace(name):
         if type(name) is not str or not _NAME.fullmatch(name):

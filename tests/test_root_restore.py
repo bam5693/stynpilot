@@ -361,6 +361,51 @@ class ApprovalBoundaryTests(unittest.TestCase):
         from stynpilot import managed_activity
         self.assertNotEqual(managed_activity.held(self.ex.dir), rr.held(self.ex.dir))
 
+    def settlement_request(self, job="a"*32):
+        from test_passkey_integration import proof_for
+        payload = dict(kind="runner", action="settle_inference", name=job,
+                       owner=self.ex.owner, device=self.ex.device,
+                       expires_at="2099-01-01T00:00:00Z")
+        reply = self.door.handle({"op": "challenge", "payload": payload, "decision": "approve"})
+        self.assertTrue(reply["ok"], reply)
+        challenge = reply["challenge"]["challenge"]
+        proof = proof_for(self.phone, payload, challenge)
+        return {"op": "runner_admin", "payload": payload, "proof": proof, "challenge": challenge}
+
+    def test_settlement_exact_passkey_and_quiescence_required(self):
+        from stynpilot import managed_activity
+        self.enable_inference_fixture()
+        self.ex.owner_uid = 1000
+        self.assertTrue(self.inference_call("inference_claim")["ok"])
+        request = self.settlement_request()
+        with mock.patch("stynpilot.inference_settlement.stop_and_verify") as stop:
+            altered = dict(request, payload=dict(request["payload"], name="b"*32))
+            self.assertFalse(self.door.handle(altered)["ok"])
+            self.assertFalse(self.door.handle(dict(request, proof="invalid"))["ok"])
+            stop.assert_not_called()
+            self.assertTrue(managed_activity.held(self.ex.dir))
+            self.assertEqual(self.ex.status(request_id(request["payload"])[0])["state"], "not_started")
+            result = self.door.handle(request)
+            self.assertTrue(result["ok"] and result["result"]["ok"], result)
+            stop.assert_called_once_with(1000)
+            self.assertFalse(managed_activity.held(self.ex.dir))
+            self.assertFalse(self.door.handle(request)["ok"])
+
+    def test_settlement_failure_retains_claim_and_recovery_gate(self):
+        from stynpilot import managed_activity
+        self.enable_inference_fixture()
+        self.ex.owner_uid = 1000
+        self.assertTrue(self.inference_call("inference_claim")["ok"])
+        request = self.settlement_request()
+        with mock.patch("stynpilot.inference_settlement.stop_and_verify",
+                        side_effect=managed_activity.ActivityError("inference_quiescence_unverified")):
+            result = self.door.handle(request)
+            self.assertTrue(result["ok"], result)
+            self.assertFalse(result["result"]["ok"])
+            self.assertEqual(result["result"]["stopped"], "inference_quiescence_unverified")
+        self.assertTrue(managed_activity.held(self.ex.dir))
+        self.assertEqual(self.decide()["error"], "restore_requires_idle_managed_activity")
+
     def test_unspent_intent_recovers_without_stopping_installer(self):
         with mock.patch.object(self.ex.runs, "consume", side_effect=PowerLoss()), self.assertRaises(PowerLoss):
             self.decide()

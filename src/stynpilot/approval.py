@@ -33,8 +33,15 @@ VIEW_LIFETIME = 600
 MAX_VIEWS = 64
 
 
+def _owner_side_rotation(payload):
+    return (isinstance(payload, dict) and payload.get("kind") == "backup" and payload.get("action") == "rotate_key"
+            and payload.get("side") == "owner")
+
+
 class _PreflightFailed(Exception):
-    pass
+    def __init__(self, code=None):
+        super().__init__(code)
+        self.code = code
 
 
 class ApprovalError(Exception):
@@ -326,20 +333,20 @@ class ApprovalFlow:
                 if self.before_run is not None:
                     try:
                         self.before_run(payload, rid)
-                    except Exception:
-                        raise _PreflightFailed() from None
+                    except Exception as error:
+                        raise _PreflightFailed(getattr(error, "code", None)) from None
                 result = method(payload, id_token, challenge)
-            except _PreflightFailed:
-                result = {"ok": False, "stopped": "owner_state_backup_failed", "changed_anything": False}
+            except _PreflightFailed as failed:
+                result = {"ok": False, "stopped": failed.code or "owner_state_backup_failed", "changed_anything": False}
             except Exception as error:
                 result = self._after_error(rid, error, payload.get("kind"))
-            if result.get("pending"):
-                return {"state": "running", "request_id": rid, "ok": None}   # settled later from the installer's record
             if self.after_run is not None and result.get("ok"):
                 try:
                     result = self.after_run(payload, rid, result) or result
                 except Exception as error:
                     result = dict(result, ok=False, stopped="owner_side_step_failed_%s" % type(error).__name__)
+            if result.get("pending"):
+                return {"state": "running", "request_id": rid, "ok": None}   # settled later (installer record / owner vault)
             state_ = self._state_for(result)
             self.store.transition(rid, "running", state_, result=result)
             return {"state": state_, "request_id": rid, "ok": bool(result.get("ok"))}
@@ -422,6 +429,14 @@ class ApprovalFlow:
         returned in the second list to be tried again; nothing is marked for the owner on a mere delay."""
         settled, waiting = [], []
         for rid in self.store.in_flight():
+            if _owner_side_rotation(self.store.payload(rid)):
+                kind, record = self._root_record(rid)
+                result = (record or {}).get("result") or {}
+                if kind != "record" or (record.get("state") == "done" and result.get("owner_side_authorized") == rid):
+                    # authorized (or installer not reachable yet): the owner's own vault finishes it from its durable marker
+                    # and settles this request itself; never reported done from the installer's authorization alone
+                    self.store.transition(rid, "approved", "running")
+                    continue
             if patient:
                 kind, record = self._root_record(rid)
                 if kind == "unreachable" or (kind == "record" and (record or {}).get("state") == "running"):

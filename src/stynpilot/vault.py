@@ -40,7 +40,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import backup
+from . import backup, statelock
 
 MAGIC = b"STYNVLT1"
 KEY_MAGIC = b"STYNKEY1"
@@ -77,7 +77,13 @@ CHILD_MEMORY = 1280 * 1024 * 1024       # address-space limit of the separate pr
 CHILD_TIMEOUT = 1800
 NONCE_LOG = "nonces.log"
 ROTATION = "rotation.json"             # durable key-rotation journal (resumable at every step)
-ROTATION_MODES = ("normal", "lost_key")
+ROTATION_REQUESTS = "rotation-requests.log"   # append-only, fsynced, unbounded: every approval id ever spent on a rotation
+ROTATION_MODES = ("normal", "fresh_key", "lost_key")
+AWAIT_GRACE = 600                      # owner side: how long a fresh authorization marker is left to the approval flow itself
+_HEX16 = re.compile(r"[0-9a-f]{16}\Z")
+_RID = re.compile(r"[0-9a-f]{64}\Z")
+_NONCE = re.compile(r"[0-9a-f]{24}\Z")
+_CLOSED_TORN = re.compile(r"[0-9a-f]{0,63}!\Z")
 _SECRET_BYTES = (b"BEGIN PRIVATE KEY", b"BEGIN OPENSSH PRIVATE KEY", b"BEGIN RSA PRIVATE KEY", b"BEGIN EC PRIVATE KEY",
                  b"ghp_", b"github_pat_", b"gho_", b"ghs_")
 _SECRET_KEY = re.compile(r"(token|secret|password|passphrase|private|api[_-]?key|credential)", re.I)
@@ -136,6 +142,58 @@ def _read_private(path, limit, *, uid=None):
     finally:
         os.close(fd)
     return b"".join(chunks)
+
+
+def _write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _read_lines(path, pattern, limit):
+    """Lines of an append-only log, all of which must match ``pattern``. Only a final, unterminated, hex-only piece is tolerated:
+    a write that did not finish (it is fsynced before use, so it was never used). Anything else: the history is uncertain."""
+    data = _read_private(path, limit).decode("ascii", "replace")
+    *complete, tail = data.split("\n")
+    complete = [line for line in complete if not _CLOSED_TORN.fullmatch(line)]   # an unfinished write, closed later: never used
+    if any(not pattern.fullmatch(line) for line in complete):
+        raise VaultError("nonce_log_uncertain" if pattern is _NONCE else "log_uncertain")
+    if tail and not re.fullmatch(r"[0-9a-f]{1,63}", tail):
+        raise VaultError("nonce_log_uncertain" if pattern is _NONCE else "log_uncertain")
+    return complete
+
+
+def _append_line(path, line):
+    """Append one line durably and CHECK it all landed (a short or failed write raises). A torn earlier line is closed first."""
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise VaultError("file_not_private_or_not_ours")
+        data = (line + "\n").encode()
+        if info.st_size and os.pread(fd, 1, info.st_size - 1) != b"\n":
+            data = b"!\n" + data                        # close an unfinished earlier line, marked as such
+        _write_all(fd, data)
+        os.fsync(fd)
+        if os.fstat(fd).st_size != info.st_size + len(data):
+            raise VaultError("log_write_incomplete")
+    finally:
+        os.close(fd)
+    _fsync_dir(Path(path).parent)
+
+
+def _file_sha(path):
+    digest = hashlib.sha256()
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        while True:
+            block = os.read(fd, 1 << 20)
+            if not block:
+                break
+            digest.update(block)
+    finally:
+        os.close(fd)
+    return digest.hexdigest()
 
 
 def _private_folder(path):
@@ -305,6 +363,8 @@ class Vault:
         self.isolate = isolate
         self.retention_source = retention_source              # owner side: the installer's approved setting is the authority
         self.prune_allowed = prune_allowed                     # False on the owner side in Dev23 stage 1 (see service.owner_vault)
+        self.authorization_source = None                       # owner side: rid -> 'authorized' | 'refused' | 'unknown' (installer record)
+        self.on_rotation_finished = None                       # owner side: settles the owner's request record when a rotation ends
         self._aesgcm = aesgcm
         self._mutex = threading.Lock()
         self._held = threading.local()
@@ -452,35 +512,20 @@ class Vault:
     def _nonces(self, index=None):
         used = set()
         try:
-            data = _read_private(self.folder / NONCE_LOG, 64 << 20)
-            used |= {line for line in data.decode("ascii", "replace").split() if re.fullmatch(r"[0-9a-f]{24}", line)}
+            used |= set(_read_lines(self.folder / NONCE_LOG, _NONCE, 64 << 20))   # an uncertain history raises: no new nonces
         except FileNotFoundError:
             # The log holds nonces of backups that retention already deleted; the surviving files cannot stand in for it. With a key
-            # already in use, a missing log stops new backups (a new key, owner-approved, is the way out: tracked for Dev23).
+            # already in use, a missing log stops new backups; the way out is an owner-approved fresh_key rotation.
             if self.key_file.exists() or self._files() or (index or {}).get("key_id") or (index or {}).get("backups"):
                 raise VaultError("nonce_log_missing") from None
-        for path in self._files():                           # and every backup still present, in case the log was lost
-            try:
-                with open(str(path), "rb") as handle:
-                    head = handle.read(4096)
-                (size,) = struct.unpack(">H", head[8:10])
-                nonce = json.loads(head[10:10 + size].decode()).get("nonce")
-                if isinstance(nonce, str):
-                    used.add(nonce)
-            except Exception:
-                continue
+        for path in self._files():                           # and every backup still present
+            header = self._header_of(path.name)
+            if header is not None:
+                used.add(header["nonce"])
         return used
 
     def _record_nonce(self, nonce):
-        fd = os.open(str(self.folder / NONCE_LOG), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        try:
-            if os.fstat(fd).st_uid != os.geteuid() or os.fstat(fd).st_mode & 0o077:
-                raise VaultError("file_not_private_or_not_ours")
-            os.write(fd, (nonce + "\n").encode())
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        _fsync_dir(self.folder)
+        _append_line(self.folder / NONCE_LOG, nonce)
 
     # .. key ....................................................................................................................
     def _files(self):
@@ -528,6 +573,9 @@ class Vault:
         return key_id, raw[16:]
 
     # .. key generations (dev23 stage 2) ...........................................................................................
+    # Generations: the active key is backup-key + nonces.log; every earlier generation is KEPT in keys/<id>.key (+ <id>.nonces when
+    # its history exists). Kept generations are NEVER destroyed automatically in this stage (controlled retirement is a tracked
+    # follow-up after Dev24 external recovery); they only ever decrypt, never encrypt.
     @property
     def keys_dir(self):
         return _private_folder(self.folder / "keys")
@@ -539,12 +587,12 @@ class Vault:
         return raw[8:16].hex(), raw[16:]
 
     def _key_for(self, index, key_id):
-        """The key of generation ``key_id``: the active one, or one kept in keys/ (retired or being rotated to)."""
-        if not re.fullmatch(r"[0-9a-f]{16}", str(key_id)):
+        """The key of generation ``key_id``: the active one, or one kept in keys/."""
+        if not _HEX16.fullmatch(str(key_id)):
             raise VaultError("backup_damaged")
         try:
             active_id, active = self._read_key_file(self.key_file)
-            if index.get("key_id") not in (None, active_id) and not os.path.lexists(str(self.folder / ROTATION)):
+            if index.get("key_id") not in (None, active_id) and not self._rotation_active():
                 raise VaultError("backup_key_does_not_match_the_vault")   # a swapped-in key is never trusted
             if active_id == key_id:
                 return active
@@ -558,6 +606,46 @@ class Vault:
             raise VaultError("backup_key_damaged")
         return kept
 
+    def generations(self):
+        """Kept generations: ids and whether their nonce history exists. Never key material."""
+        out = []
+        folder = self.folder / "keys"
+        if folder.is_dir():
+            for path in sorted(folder.glob("*.key")):
+                kid = path.name[:-4]
+                if _HEX16.fullmatch(kid):
+                    out.append({"key_id": kid, "nonce_history": (folder / (kid + ".nonces")).exists()})
+        return out
+
+    # .. the rotation journal (rotation.json): validated completely before anything acts on it ................................
+    _JOURNAL_KEYS = {
+        "awaiting_authorization": {"schema", "mode", "request_id", "state", "created", "expires_at"},
+        "normal": {"schema", "mode", "request_id", "state", "started", "old_key_id", "new_key_id", "done", "kept_old"},
+        "fresh_key": {"schema", "mode", "request_id", "state", "started", "old_key_id", "new_key_id"},
+        "lost_key": {"schema", "mode", "request_id", "state", "started", "old_key_id", "moved"},
+    }
+    _JOURNAL_STATES = {"normal": ("reencrypt", "switch", "cleanup"), "fresh_key": ("switch", "cleanup"),
+                       "lost_key": ("move_unreadable", "new_key")}
+
+    def _valid_journal(self, j):
+        if type(j) is not dict or j.get("schema") != 1 or j.get("mode") not in ROTATION_MODES:
+            return False
+        if not _RID.fullmatch(str(j.get("request_id"))):
+            return False
+        if j.get("state") == "awaiting_authorization":
+            return (set(j) == self._JOURNAL_KEYS["awaiting_authorization"] and type(j["created"]) is int
+                    and type(j["expires_at"]) is int)
+        if set(j) != self._JOURNAL_KEYS[j["mode"]] or j["state"] not in self._JOURNAL_STATES[j["mode"]] or type(j["started"]) is not int:
+            return False
+        if j["mode"] == "lost_key":
+            return ((j["old_key_id"] is None or bool(_HEX16.fullmatch(str(j["old_key_id"])))) and type(j["moved"]) is list
+                    and all(type(n) is str and NAME.fullmatch(n) for n in j["moved"]))
+        if not _HEX16.fullmatch(str(j["old_key_id"])) or not _HEX16.fullmatch(str(j["new_key_id"])) or j["old_key_id"] == j["new_key_id"]:
+            return False
+        if j["mode"] == "normal":
+            return all(type(x) is list and all(type(n) is str and NAME.fullmatch(n) for n in x) for x in (j["done"], j["kept_old"]))
+        return True
+
     def _journal(self):
         try:
             data = json.loads(_read_private(self.folder / ROTATION, 1 << 20).decode())
@@ -565,66 +653,165 @@ class Vault:
             return None
         except (OSError, VaultError, ValueError, UnicodeError):
             raise VaultError("key_rotation_journal_damaged") from None
-        if type(data) is not dict or data.get("schema") != 1 or data.get("mode") not in ROTATION_MODES:
+        if not self._valid_journal(data):
             raise VaultError("key_rotation_journal_damaged")
         return data
 
+    def _rotation_active(self):
+        """A rotation that has started changing things (not merely awaiting the installer's authorization). Damaged = active."""
+        if not os.path.lexists(str(self.folder / ROTATION)):
+            return False
+        try:
+            return self._journal()["state"] != "awaiting_authorization"
+        except VaultError:
+            return True
+
+    def rotation_progress(self):
+        """Durable progress, read from the journal itself (never assumed)."""
+        try:
+            j = self._journal()
+        except VaultError:
+            return {"state": "journal_damaged"}
+        if j is None:
+            return None
+        out = {"mode": j["mode"], "state": j["state"]}
+        if j["state"] == "awaiting_authorization":
+            return out
+        if j["mode"] == "normal":
+            out.update(reencrypted=len(j["done"]), left_with_old_key=len(j["kept_old"]))
+        if j["mode"] == "lost_key":
+            out.update(moved_unreadable=len(j["moved"]))
+        return out
+
     def _save_journal(self, journal):
+        if not self._valid_journal(journal):
+            raise VaultError("key_rotation_journal_invalid")
         _write_atomic(self.folder, ROTATION, json.dumps(journal, sort_keys=True).encode())
 
-    def _new_key_files(self, folder, stem):
+    def _end_journal(self):
+        os.unlink(str(self.folder / ROTATION))
+        _fsync_dir(self.folder)
+
+    # .. spent approvals: an append-only, fsynced, UNBOUNDED log (never a bounded list) .......................................
+    def _spent(self):
+        try:
+            return set(_read_lines(self.folder / ROTATION_REQUESTS, _RID, 16 << 20))
+        except FileNotFoundError:
+            return set()
+
+    def _spend(self, request_id):
+        if request_id not in self._spent():
+            _append_line(self.folder / ROTATION_REQUESTS, request_id)
+
+    def _new_key_files(self, folder):
         """A fresh key + its EMPTY nonce log in ``folder`` (both exclusive, fsynced). Returns the key id."""
         raw = KEY_MAGIC + secrets.token_bytes(8) + secrets.token_bytes(32)
         key_id = raw[8:16].hex()
-        for name, data in ((stem.format(id=key_id) + ".nonces", b""), (stem.format(id=key_id) + ".key", raw)):
+        for name, data in ((key_id + ".nonces", b""), (key_id + ".key", raw)):
             fd = os.open(str(folder / name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             try:
-                os.write(fd, data)
+                _write_all(fd, data)
                 os.fsync(fd)
             finally:
                 os.close(fd)
         _fsync_dir(folder)
         return key_id
 
+    # .. owner side: durable hand-off from the installer's authorization to the owner's own rotation ............................
+    def _op_prepare(self, mode, request_id, expires_at):
+        """Before the installer is asked: a durable marker bound to the exact request, so a crash between the installer's
+        authorization and the owner's rotation is found and finished (or dropped) later. Changes nothing else."""
+        if mode not in ROTATION_MODES or not _RID.fullmatch(str(request_id)) or type(expires_at) is not int:
+            raise VaultError("key_rotation_request_invalid")
+        if request_id in self._spent():
+            raise VaultError("key_rotation_request_already_used")
+        journal = self._journal()
+        if journal is not None:
+            if journal["request_id"] == request_id:
+                return {"ok": True, "state": journal["state"]}
+            raise VaultError("another_key_rotation_is_in_progress")
+        self._save_journal({"schema": 1, "mode": mode, "request_id": request_id, "state": "awaiting_authorization",
+                            "created": int(self.clock()), "expires_at": expires_at})
+        return {"ok": True, "state": "awaiting_authorization"}
+
+    def _op_cancel(self, request_id):
+        """The installer did NOT authorize it: drop the marker (nothing had changed) and spend the id."""
+        journal = self._journal()
+        if journal is None or journal["request_id"] != request_id or journal["state"] != "awaiting_authorization":
+            raise VaultError("nothing_to_cancel")
+        self._spend(request_id)
+        self._end_journal()
+        return {"ok": True, "cancelled": True}
+
+    # .. rotation ...............................................................................................................
     def _op_rotate(self, mode, request_id):
-        """Owner-approved key rotation, resumable at every step (journal rotation.json). normal: a new key generation; every backup
-        is re-encrypted with it and VERIFIED before it replaces the original; the old key is destroyed only when no retained backup
-        needs it (works without the old nonce log, so it is also the way out of nonce_log_missing). lost_key: the key is gone;
-        backups that needed it are moved to unreadable/ (never deleted) and a fresh key starts."""
+        """Owner-approved key rotation, resumable at every step.
+        normal: a new generation; every backup is re-encrypted and VERIFIED before it replaces the original.
+        fresh_key: a new generation for NEW backups only (the way out of a lost nonce log): existing backups stay under their key,
+                   which is kept and never encrypts again.
+        lost_key: the active key is gone: backups that need it are preserved in unreadable/ (never deleted), and a fresh key starts.
+        No generation is ever destroyed."""
         index = self._index()
         if index.get("damaged"):
             raise VaultError("vault_index_damaged_run_a_backup_first")
         journal = self._journal()
-        if journal is None:
+        if journal is None or journal["state"] == "awaiting_authorization":
             if request_id is None:
                 return {"ok": True, "nothing_to_resume": True}
-            if mode not in ROTATION_MODES or not re.fullmatch(r"[0-9a-f]{16,128}", str(request_id)):
+            if mode not in ROTATION_MODES or not _RID.fullmatch(str(request_id)):
                 raise VaultError("key_rotation_request_invalid")
-            if request_id in index.get("rotation_requests", []):
+            if journal is not None and (journal["request_id"] != request_id or journal["mode"] != mode):
+                raise VaultError("another_key_rotation_is_in_progress")
+            if request_id in self._spent():
                 raise VaultError("key_rotation_request_already_used")
-            if mode == "normal":
-                try:
-                    old_id, _ = self._read_key_file(self.key_file)
-                except FileNotFoundError:
-                    raise VaultError("backup_key_missing_use_lost_key_mode") from None
-                if index.get("key_id") not in (None, old_id):
-                    raise VaultError("backup_key_does_not_match_the_vault")
-                new_id = self._new_key_files(self.keys_dir, "{id}")
-                journal = {"schema": 1, "mode": mode, "request_id": request_id, "old_key_id": old_id, "new_key_id": new_id,
-                           "state": "reencrypt", "done": [], "kept_old": [], "started": int(self.clock())}
-            else:
-                if os.path.lexists(str(self.key_file)):
-                    raise VaultError("key_is_present_use_normal_mode")
-                journal = {"schema": 1, "mode": mode, "request_id": request_id, "old_key_id": index.get("key_id"),
-                           "new_key_id": None, "state": "move_unreadable", "moved": [], "started": int(self.clock())}
-            self._save_journal(journal)                         # from here on the rotation resumes after any interruption
-            index["rotation_requests"] = (index.get("rotation_requests", []) + [request_id])[-50:]
-            self._save(index)                                   # and this approval can never start another one
+            journal = self._begin(mode, request_id, index)
+            self._save_journal(journal)                     # from here on it resumes after any interruption
+            self._spend(request_id)                         # and this approval can never start another one
         elif request_id is not None and journal["request_id"] != request_id:
             raise VaultError("another_key_rotation_is_in_progress")
-        if journal["mode"] == "normal":
-            return self._rotate_normal(journal)
-        return self._rotate_lost(journal)
+        if self.side == "root":
+            try:
+                with statelock.operation(self.state_dir, "an_install_or_rollback_is_running_try_again_when_it_finishes"):
+                    return self._advance(journal)
+            except statelock.Busy as busy:
+                raise VaultError(busy.code) from None
+        return self._advance(journal)
+
+    def _advance(self, journal):
+        return {"normal": self._rotate_normal, "fresh_key": self._rotate_fresh, "lost_key": self._rotate_lost}[journal["mode"]](journal)
+
+    def _begin(self, mode, request_id, index):
+        now = int(self.clock())
+        if mode == "lost_key":
+            if os.path.lexists(str(self.key_file)):
+                raise VaultError("key_is_present_use_normal_mode")
+            return {"schema": 1, "mode": mode, "request_id": request_id, "state": "move_unreadable",
+                    "old_key_id": index.get("key_id"), "moved": [], "started": now}
+        try:
+            old_id, _ = self._read_key_file(self.key_file)
+        except FileNotFoundError:
+            raise VaultError("backup_key_missing_use_lost_key_mode") from None
+        if index.get("key_id") not in (None, old_id):
+            raise VaultError("backup_key_does_not_match_the_vault")
+        log_present = os.path.lexists(str(self.folder / NONCE_LOG))
+        if mode == "normal" and not log_present:
+            raise VaultError("nonce_log_missing_use_fresh_key_mode")
+        if mode == "fresh_key" and log_present:
+            try:
+                self._nonces(index)
+            except VaultError as error:
+                if error.code != "nonce_log_uncertain":     # an UNCERTAIN history qualifies too
+                    raise
+            else:
+                raise VaultError("nonce_log_is_fine_use_normal_mode")
+        if mode == "normal" and log_present:
+            self._nonces(index)                              # an uncertain history must not be carried on: use fresh_key
+        new_id = self._new_key_files(self.keys_dir)
+        if mode == "fresh_key":
+            return {"schema": 1, "mode": mode, "request_id": request_id, "state": "switch", "old_key_id": old_id,
+                    "new_key_id": new_id, "started": now}
+        return {"schema": 1, "mode": mode, "request_id": request_id, "state": "reencrypt", "old_key_id": old_id,
+                "new_key_id": new_id, "done": [], "kept_old": [], "started": now}
 
     def _reencrypt_one(self, path, index, journal, new_key, used, log):
         header, bundle = self._decrypt(path.name, index)
@@ -634,12 +821,7 @@ class Vault:
             raise VaultError("insufficient_storage")            # nothing is deleted to make room
         nonce = self._new_nonce(used)
         used.add(nonce)
-        fd = os.open(str(log), os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC)
-        try:
-            os.write(fd, (nonce + "\n").encode())
-            os.fsync(fd)                                        # recorded BEFORE it is used
-        finally:
-            os.close(fd)
+        _append_line(log, nonce)                               # recorded (fully, fsynced, checked) BEFORE it is used
         head = json.dumps(dict(header, key_id=journal["new_key_id"], nonce=nonce), sort_keys=True, separators=(",", ":")).encode()
         aad = MAGIC + struct.pack(">H", len(head)) + head
         blob = aad + self._cipher(new_key).encrypt(bytes.fromhex(nonce), bundle, aad)
@@ -664,97 +846,148 @@ class Vault:
             index["backups"][path.name]["size"] = path.lstat().st_size
             self._save(index)
 
+    def _switch(self, journal):
+        """Make the new generation active. Order matters for an OLDER StyNpilot reading this vault after a rollback: the index
+        names the new key FIRST, so until the new key is in place an older reader sees a key/index mismatch and refuses to make
+        backups (fail closed) instead of pairing the old key with the new nonce log."""
+        keys, old_id, new_id = self.keys_dir, journal["old_key_id"], journal["new_key_id"]
+        if not (keys / (old_id + ".key")).exists():
+            current = self._read_key_file(self.key_file)
+            if current[0] != old_id:
+                raise VaultError("key_rotation_journal_damaged")
+            _write_atomic(keys, old_id + ".key", _read_private(self.key_file, 64))   # keep the old generation FIRST
+        if (self.folder / NONCE_LOG).exists() and not (keys / (old_id + ".nonces")).exists() \
+                and self._read_key_file(self.key_file)[0] == old_id:
+            _write_atomic(keys, old_id + ".nonces", _read_private(self.folder / NONCE_LOG, 64 << 20))
+        index = self._index()
+        if index.get("key_id") != new_id:
+            index["key_id"] = new_id
+            self._save(index)
+        if self._read_key_file(self.key_file)[0] != new_id:
+            _write_atomic(self.folder, NONCE_LOG, _read_private(keys / (new_id + ".nonces"), 64 << 20))
+            _write_atomic(self.folder, self.key_file.name, _read_private(keys / (new_id + ".key"), 64))
+        journal["state"] = "cleanup"
+        self._save_journal(journal)
+
+    def _finish_generation(self, journal, summary):
+        """Remove only the two staging COPIES of the now-active key (checked byte-identical first); no generation is destroyed."""
+        keys, new_id = self.keys_dir, journal["new_key_id"]
+        if self._read_key_file(self.key_file)[0] != new_id:
+            raise VaultError("key_rotation_journal_damaged")
+        staged = keys / (new_id + ".key")
+        if staged.exists():
+            if _read_private(staged, 64) != _read_private(self.key_file, 64):
+                raise VaultError("key_rotation_journal_damaged")
+            os.unlink(str(staged))
+        staged_log = keys / (new_id + ".nonces")
+        if staged_log.exists():
+            active = _read_lines(self.folder / NONCE_LOG, _NONCE, 64 << 20)
+            if not set(_read_lines(staged_log, _NONCE, 64 << 20)) <= set(active):
+                raise VaultError("key_rotation_journal_damaged")
+            os.unlink(str(staged_log))
+        for leftover in self.folder.glob(".rotate-*"):
+            os.unlink(str(leftover))
+        _fsync_dir(keys)
+        _fsync_dir(self.folder)
+        self._spend(journal["request_id"])
+        index = self._index()
+        index["last_rotation"] = dict(summary, at=int(self.clock()), mode=journal["mode"], request_id=journal["request_id"])
+        self._save(index)
+        self._end_journal()
+        return dict(summary, ok=True, mode=journal["mode"], request_id=journal["request_id"], generations_kept=len(self.generations()))
+
     def _rotate_normal(self, journal):
         index = self._index()
         old_id, new_id = journal["old_key_id"], journal["new_key_id"]
-        keys = self.keys_dir
         if journal["state"] == "reencrypt":
             new_key = self._key_for(index, new_id)
-            log = keys / (new_id + ".nonces")
-            used = {n for n in _read_private(log, 64 << 20).decode("ascii", "replace").split()}
+            log = self.keys_dir / (new_id + ".nonces")
+            used = set(_read_lines(log, _NONCE, 64 << 20))
             for path in self._files():
                 header = self._header_of(path.name)
                 if header is None or header["key_id"] != old_id:
-                    continue                                    # already done, another generation, or unparseable (kept as is)
+                    continue                                    # done, another generation, or unreadable header (left as is)
                 try:
                     self._reencrypt_one(path, index, journal, new_key, used, log)
                 except VaultError as error:
                     if error.code in ("insufficient_storage", "reencrypted_backup_failed_verification"):
                         raise                                   # stop here; resumes later; nothing lost
                     if path.name not in journal["kept_old"]:
-                        journal["kept_old"].append(path.name)   # unreadable with the old key: it keeps that key alive
+                        journal["kept_old"].append(path.name)   # cannot be opened now: left as is, its key is kept
                         self._save_journal(journal)
                     continue
-                journal["done"].append(path.name)
+                if path.name not in journal["done"]:
+                    journal["done"].append(path.name)
                 self._save_journal(journal)
             journal["state"] = "switch"
             self._save_journal(journal)
         if journal["state"] == "switch":
-            if not (keys / (old_id + ".key")).exists():
-                _write_atomic(keys, old_id + ".key", _read_private(self.key_file, 64))   # keep the old generation FIRST
-            if (self.folder / NONCE_LOG).exists() and not (keys / (old_id + ".nonces")).exists():
-                _write_atomic(keys, old_id + ".nonces", _read_private(self.folder / NONCE_LOG, 64 << 20))
-            _write_atomic(self.folder, NONCE_LOG, _read_private(keys / (new_id + ".nonces"), 64 << 20))
-            _write_atomic(self.folder, self.key_file.name, _read_private(keys / (new_id + ".key"), 64))
-            index = self._index()
-            index["key_id"] = new_id
-            self._save(index)
-            journal["state"] = "cleanup"
-            self._save_journal(journal)
+            self._switch(journal)
         if journal["state"] == "cleanup":
-            if self._read_key_file(self.key_file)[0] != new_id:
-                raise VaultError("key_rotation_journal_damaged")
-            in_use = {}
-            for p in self._files():
-                kid = (self._header_of(p.name) or {}).get("key_id")
-                in_use[kid] = in_use.get(kid, 0) + 1
-            needed = [old_id] * in_use.get(old_id, 0)
-            for kept in keys.glob("*.key"):
-                kid = kept.name[:-4]
-                if kid != new_id and re.fullmatch(r"[0-9a-f]{16}", kid) and not in_use.get(kid):
-                    os.unlink(str(kept))                        # no retained backup needs this generation any more: destroyed
-            for leftover in [keys / (new_id + ".key"), keys / (new_id + ".nonces")] + list(self.folder.glob(".rotate-*")):
-                if os.path.lexists(str(leftover)):
-                    os.unlink(str(leftover))
-            _fsync_dir(keys)
-            index = self._index()
-            if journal["request_id"] not in index.get("rotation_requests", []):
-                index["rotation_requests"] = (index.get("rotation_requests", []) + [journal["request_id"]])[-50:]
-            index["last_rotation"] = {"at": int(self.clock()), "request_id": journal["request_id"], "mode": "normal",
-                                      "reencrypted": len(journal["done"]), "old_key_kept_for": len(needed)}
-            self._save(index)
-            os.unlink(str(self.folder / ROTATION))
-            _fsync_dir(self.folder)
-            return {"ok": True, "mode": "normal", "reencrypted": len(journal["done"]), "old_key_destroyed": not needed,
-                    "still_need_old_key": len(needed)}
+            return self._finish_generation(journal, {"reencrypted": len(journal["done"]), "left_with_old_key": len(journal["kept_old"])})
         raise VaultError("key_rotation_journal_damaged")
 
+    def _rotate_fresh(self, journal):
+        if journal["state"] == "switch":
+            self._switch(journal)
+        if journal["state"] == "cleanup":
+            index = self._index()
+            index["last_error"] = None if str((index.get("last_error") or {}).get("code", "")).startswith("nonce_log") else index.get("last_error")
+            self._save(index)
+            return self._finish_generation(journal, {"reencrypted": 0})
+        raise VaultError("key_rotation_journal_damaged")
+
+    def _preserve(self, source, folder, name):
+        """Move ``source`` into ``folder`` WITHOUT ever overwriting: hard link (fails if the name exists), destination folder
+        durable, byte-for-byte check, then remove the source and make that durable. An identical copy already there (an interrupted
+        earlier move) counts as preserved; a different file there gets a new name. Returns the preserved name."""
+        want = _file_sha(source)
+        for n in range(1000):
+            target = folder / (name if n == 0 else "%s.%d" % (name, n))
+            if os.path.lexists(str(target)):
+                if not target.is_symlink() and target.is_file() and _file_sha(target) == want:
+                    break                                       # already preserved by an interrupted earlier move
+                continue                                        # never overwrite a different preserved file
+            os.link(str(source), str(target))
+            _fsync_dir(folder)
+            break
+        else:
+            raise VaultError("unreadable_folder_full")
+        if _file_sha(target) != want:
+            raise VaultError("preserved_copy_differs")
+        os.unlink(str(source))
+        _fsync_dir(source.parent)
+        return target.name
+
     def _rotate_lost(self, journal):
-        index = self._index()
         if journal["state"] == "move_unreadable":
+            index = self._index()
             unreadable = _private_folder(self.folder / "unreadable")
             for path in self._files():
                 header = self._header_of(path.name)
                 if header is not None:
                     try:
                         self._key_for(index, header["key_id"])
-                        continue                                # its key generation is still here: it stays readable
+                        continue                                # its generation is still here: it stays readable in place
                     except VaultError:
                         pass
-                os.replace(str(path), str(unreadable / path.name))   # kept, NEVER deleted
-                _fsync_dir(self.folder)
+                self._preserve(path, unreadable, path.name)
                 if path.name not in journal["moved"]:
                     journal["moved"].append(path.name)
                     self._save_journal(journal)
-            log = self.folder / NONCE_LOG
-            if log.exists():
-                _write_atomic(unreadable, "nonces-%s.log" % (journal["old_key_id"] or "unknown"), _read_private(log, 64 << 20))
-                os.unlink(str(log))
-                _fsync_dir(self.folder)
-            for name in journal["moved"]:
-                info = index["backups"].pop(name, None)
-                if info is not None:
+            if (self.folder / NONCE_LOG).exists():
+                self._preserve(self.folder / NONCE_LOG, unreadable, "nonces-%s.log" % (journal["old_key_id"] or "unknown"))
+            # reconcile with the index: anything it lists that is no longer here but is in unreadable/ was moved (also by an
+            # interrupted earlier run whose journal entry was lost)
+            index = self._index()
+            for name in list(index["backups"]):
+                if not (self.folder / name).exists() and (unreadable / name).exists():
+                    info = index["backups"].pop(name)
                     index.setdefault("unreadable", {})[name] = {"created": info.get("created"), "key_id": journal["old_key_id"]}
+            for name in journal["moved"]:
+                if name in index["backups"] and not (self.folder / name).exists():
+                    index["backups"].pop(name)
+                index.setdefault("unreadable", {}).setdefault(name, {"created": None, "key_id": journal["old_key_id"]})
             index["key_id"] = None
             self._save(index)
             journal["state"] = "new_key"
@@ -764,15 +997,15 @@ class Vault:
             if not os.path.lexists(str(self.key_file)):
                 index["key_id"] = None
                 self._key(index, create=True)
+            index = self._index()
             index["key_id"] = self._read_key_file(self.key_file)[0]
-            if journal["request_id"] not in index.get("rotation_requests", []):
-                index["rotation_requests"] = (index.get("rotation_requests", []) + [journal["request_id"]])[-50:]
+            index["last_error"] = None
+            self._spend(journal["request_id"])
             index["last_rotation"] = {"at": int(self.clock()), "request_id": journal["request_id"], "mode": "lost_key",
                                       "moved_unreadable": len(journal["moved"])}
             self._save(index)
-            os.unlink(str(self.folder / ROTATION))
-            _fsync_dir(self.folder)
-            return {"ok": True, "mode": "lost_key", "moved_unreadable": len(journal["moved"])}
+            self._end_journal()
+            return {"ok": True, "mode": "lost_key", "request_id": journal["request_id"], "moved_unreadable": len(journal["moved"])}
         raise VaultError("key_rotation_journal_damaged")
 
     def _cipher(self, key):
@@ -1136,12 +1369,14 @@ class Vault:
         return result
 
     def _op(self, op, manual=False, args=None):
-        if op != "rotate" and os.path.lexists(str(self.folder / ROTATION)):
+        if op not in ("rotate", "rotate_prepare", "rotate_cancel") and self._rotation_active():
             raise VaultError("key_rotation_in_progress")           # nothing else runs until the rotation has finished or resumed
         args = args or {}
         return {"backup": lambda: self._op_backup(manual), "drill": lambda: self._op_drill(manual),
                 "recheck": lambda: self._op_recheck("daily"), "recheck_all": lambda: self._op_recheck("all"),
-                "rotate": lambda: self._op_rotate(args.get("mode"), args.get("request_id"))}[op]()
+                "rotate": lambda: self._op_rotate(args.get("mode"), args.get("request_id")),
+                "rotate_prepare": lambda: self._op_prepare(args.get("mode"), args.get("request_id"), args.get("expires_at")),
+                "rotate_cancel": lambda: self._op_cancel(args.get("request_id"))}[op]()
 
     # .. public ...................................................................................................................
     def _spec(self, op, manual, args=None):
@@ -1227,16 +1462,66 @@ class Vault:
         return self._run("recheck_all")
 
     def rotate_key(self, mode, request_id):
-        """Owner-approved (YELLOW) key rotation. Call again with request_id=None to resume an interrupted one."""
-        return self._run("rotate", args={"mode": mode, "request_id": request_id})
+        """Owner-approved (YELLOW) key rotation. request_id=None resumes an interrupted one. The result always carries the
+        DURABLE state: rotation 'completed', 'in_progress' (journal present: it resumes) or 'failed' (nothing in progress)."""
+        result = dict(self._run("rotate", args={"mode": mode, "request_id": request_id}))
+        if result.get("nothing_to_resume"):
+            return result
+        progress = self.rotation_progress()
+        result["progress"] = progress
+        if result.get("ok"):
+            result["rotation"] = "completed"
+        elif progress is not None and progress.get("state") != "awaiting_authorization":
+            result["rotation"] = "in_progress"
+        else:
+            result["rotation"] = "failed"
+        rid = result.get("request_id") or request_id
+        if result["rotation"] != "in_progress" and rid and self.on_rotation_finished is not None:
+            if result["rotation"] == "completed" or result.get("error") not in ("another_key_rotation_is_in_progress",
+                                                                                  "another_backup_operation_is_running"):
+                try:
+                    self.on_rotation_finished(rid, result)
+                except Exception:
+                    pass
+        return result
+
+    def prepare_rotation(self, mode, request_id, expires_at):
+        """Owner side, BEFORE the installer is asked: the durable marker of an approved-but-not-yet-authorized rotation."""
+        return self._guard(lambda: self._op_prepare(mode, request_id, expires_at))
+
+    def _check_awaiting(self, journal):
+        """Owner side: settle a marker whose hand-off was interrupted, by asking the installer's own durable record."""
+        if self.authorization_source is None or self.clock() - journal["created"] < AWAIT_GRACE:
+            return None
+        verdict = self.authorization_source(journal["request_id"])
+        if verdict == "authorized":
+            return self.rotate_key(journal["mode"], journal["request_id"])
+        if verdict == "refused":
+            result = self._guard(lambda: self._op_cancel(journal["request_id"]))
+            if result.get("ok") and self.on_rotation_finished is not None:
+                try:
+                    self.on_rotation_finished(journal["request_id"], {"ok": False, "stopped": "installer_did_not_authorize",
+                                                                      "rotation": "failed", "changed_anything": False})
+                except Exception:
+                    pass
+            return result
+        return {"ok": None, "waiting_for_installer": True}
 
     def tick(self):
         """What is due: re-check what counts (presence hourly; full daily check of the newest verified AND the newest complete
         verified backup; every retained backup monthly), the first backup at once, a missed or replacement one, a weekly drill."""
         done = {}
-        if os.path.lexists(str(self.folder / ROTATION)):
+        try:
+            journal = self._journal()
+        except VaultError:
+            journal = {"state": "damaged"}
+        if journal is not None and journal["state"] == "awaiting_authorization":
+            checked = self._check_awaiting(journal)
+            if checked is not None:
+                done["rotate"] = checked
+        if self._rotation_active():
             done["rotate"] = self.rotate_key(None, None)        # an interrupted rotation finishes before anything else
-            if os.path.lexists(str(self.folder / ROTATION)):
+            if self._rotation_active():
                 return done
         index = self._index()
         now = int(self.clock())
@@ -1285,9 +1570,12 @@ class Vault:
                 problems.append("backup_key_missing")
             if (present or index.get("key_id")) and not (self.folder / NONCE_LOG).exists():
                 problems.append("nonce_log_missing")
-            rotating = os.path.lexists(str(self.folder / ROTATION))
+            rotating = self._rotation_active()
+            progress = self.rotation_progress()
             if rotating:
                 problems.append("key_rotation_incomplete")
+            elif progress is not None:
+                problems.append("key_rotation_awaiting_installer_authorization")
             if index.get("unreadable"):
                 problems.append("unreadable_backups_kept:%d" % len(index["unreadable"]))
             if not verified:
@@ -1329,8 +1617,8 @@ class Vault:
                     "last_error": index.get("last_error"), "last_drill": drill, "retention": self.effective_retention(),
                     "excluded_last_time": (index["backups"].get(verified[-1]["name"], {}).get("excluded") if verified else None),
                     "free_bytes": free, "encrypted": "AES-256-GCM",
-                    "keys": {"active": index.get("key_id"), "rotation_in_progress": rotating,
-                             "retired_kept": len(list((self.folder / "keys").glob("*.key"))) if (self.folder / "keys").is_dir() and not rotating else None,
+                    "keys": {"active": index.get("key_id"), "rotation": progress,
+                             "kept_generations": self.generations(),
                              "last_rotation": {k: v for k, v in (index.get("last_rotation") or {}).items() if k != "request_id"} or None}}
         except Exception as error:
             return {"side": self.side, "healthy": False, "problems": ["status_unreadable_" + type(error).__name__]}

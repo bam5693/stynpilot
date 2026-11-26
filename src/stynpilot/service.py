@@ -275,14 +275,16 @@ def _owner_backup_before_upgrade(state):
 
 
 def _owner_after_approval(get_vault, *, sleep=time.sleep, attempts=20):
-    """After the installer verified and spent an owner-side key-rotation approval, rotate the owner's own vault with it."""
+    """After the installer verified and spent an owner-side key-rotation approval, rotate the owner's own vault with it.
+    Completion is reported only from the owner vault's own durable state; an interrupted rotation stays 'running' (pending) and
+    the vault's scheduler finishes it and settles the request."""
     def after(payload, rid, result):
         if (payload.get("kind") != "backup" or payload.get("action") != "rotate_key" or payload.get("side") != "owner"
                 or result.get("owner_side_authorized") != rid):
             return None
         vault_ = get_vault()
         if vault_ is None:
-            return dict(result, ok=False, stopped="backups_not_available")
+            return dict(result, ok=False, stopped="backups_not_available", rotation="failed")
         for _ in range(attempts):                       # a scheduled backup may hold the vault for a while: wait for it
             outcome = vault_.rotate_key(payload["mode"], rid)
             if outcome.get("error") != "another_backup_operation_is_running":
@@ -292,8 +294,56 @@ def _owner_after_approval(get_vault, *, sleep=time.sleep, attempts=20):
         merged["ok"] = bool(outcome.get("ok"))
         if not outcome.get("ok"):
             merged["stopped"] = outcome.get("error", "key_rotation_failed")
+            if outcome.get("rotation") == "in_progress" or outcome.get("error") == "another_backup_operation_is_running":
+                merged["pending"] = True                # durable journal/marker present: finished later by the vault
         return merged
     return after
+
+
+def _owner_before_run(state, get_vault):
+    """Owner-side steps before the installer is asked: the upgrade backup, and the durable rotation marker."""
+    upgrade = _owner_backup_before_upgrade(state)
+
+    def before(payload, rid):
+        upgrade(payload, rid)
+        if payload.get("kind") == "backup" and payload.get("action") == "rotate_key" and payload.get("side") == "owner":
+            from datetime import datetime, timezone
+            vault_ = get_vault()
+            if vault_ is None:
+                raise _vault_error("backups_not_available")
+            expires = int(datetime.strptime(payload["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
+            prepared = vault_.prepare_rotation(payload["mode"], rid, expires)
+            if not prepared.get("ok"):
+                raise _vault_error(prepared.get("error", "key_rotation_could_not_be_prepared"))
+    return before
+
+
+def _vault_error(code):
+    from .vault import VaultError
+    return VaultError(code)
+
+
+def _rotation_authorization(broker):
+    """rid -> what the installer's own durable record says about an owner-side rotation."""
+    def check(rid):
+        try:
+            record = broker.status(rid)
+        except Exception:
+            return "unknown"
+        state, result = record.get("state"), record.get("result") or {}
+        if state == "done" and result.get("ok") and result.get("owner_side_authorized") == rid:
+            return "authorized"
+        if state in ("denied", "failed", "not_started"):
+            return "refused"
+        return "unknown"
+    return check
+
+
+def _settle_request(store, flow):
+    def settle(rid, result):
+        store.transition(rid, "approved", "running")
+        store.transition(rid, "running", flow._state_for(result), result={k: v for k, v in result.items() if k != "pending"})
+    return settle
 
 
 def start_owner_service(config, *, broker=None, exchange=None, start_listener=None, start_mcp=None, tokens=None,
@@ -317,13 +367,14 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
     revocations.revoked()                                  # must be readable and trusted, or we don't start
     store = RequestStore(state / "requests.sqlite3", clock=clock)
     broker = broker or BrokerClient(config.broker_socket)
+    service_vault = [None]                                  # the owner vault, once it exists (the approval flow needs it later)
     flow = ApprovalFlow(store=store, broker=broker,
                         exchange=exchange or token_exchange(token_endpoint=config.token_endpoint,
                                                             client_id=config.approval_client_id,
                                                             redirect_uri=config.redirect_uri),
                         authorize={"endpoint": config.authorize_endpoint, "client_id": config.approval_client_id,
                                    "redirect_uri": config.redirect_uri},
-                        clock=clock, background=True, before_run=_owner_backup_before_upgrade(state))
+                        clock=clock, background=True, before_run=_owner_before_run(state, lambda: service_vault[0]))
     recovered, waiting = flow.recover(patient=True)        # settle what the installer already knows, BEFORE accepting anything
     service = OwnerService(flow, None, None, recovered, waiting)
     try:
@@ -351,6 +402,9 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
         from .system_status import SystemStatus
         home = os.path.expanduser("~")
         service.vault = vault or owner_vault(config, retention_source=lambda: broker.vault_settings())
+        service_vault[0] = service.vault
+        service.vault.authorization_source = _rotation_authorization(broker)
+        service.vault.on_rotation_finished = _settle_request(store, flow)
         flow.after_run = _owner_after_approval(lambda: service.vault)
         diag = dict(policy=safefs.Policy(home=home,
                                          project_roots=safefs.load_project_roots(state / PROJECT_ROOTS_FILE, home),

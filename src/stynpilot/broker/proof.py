@@ -109,10 +109,15 @@ def render_summary(payload):
                     "'unreadable' folder and kept; nothing is deleted. Backups made with an older key that is still present stay "
                     "where they are and stay usable.",
                     "Approve only if you know the key is really gone (for example after a disk problem).", expires]
+        if payload.get("mode") == "fresh_key":
+            return ["Start a NEW encryption key for NEW backups on %s, because the record of the old key's one-time values is "
+                    "missing or unreliable." % where,
+                    "Existing backups are not changed: they stay readable with the old key, which is kept and never used to "
+                    "encrypt anything again. Nothing is restored or deleted.", expires]
         return ["Replace the encryption key of StyNpilot's backups on %s with a new key." % where,
                 "Every backup is re-encrypted with the new key and checked before it replaces the old copy. If anything is "
-                "interrupted (even a power cut), it carries on safely from where it stopped. The old key is destroyed only when "
-                "no kept backup needs it any more; nothing is restored or deleted.", expires]
+                "interrupted (even a power cut), it carries on safely from where it stopped. The old key is KEPT (not destroyed); "
+                "nothing is restored or deleted.", expires]
     if payload.get("kind") == "backup":
         expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
         return ["Change how many encrypted backups StyNpilot keeps: %s daily and %s weekly (for the root installer side and "

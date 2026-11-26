@@ -38,6 +38,9 @@ disposable environments, never live security-critical state. Do not weaken any s
 ## Current work: Dev23 stage 2 (secure key rotation), package 0.1.0.dev24
 - Branch `claude/dev23-stage2-keys` from the released commit a611385. See `docs/DEV23_STAGE2_KEY_ROTATION.md`.
 - Also on this branch: the retention approval summary now says plainly that owner-side automatic deletion is temporarily off.
+- ChatGPT review of 28a5a7a: architecture accepted; 3 blockers (premature key destruction, owner-side hand-off durability,
+  lost-key archive preservation), lost-nonce-log design (fresh generation, no re-encryption) and extra safety checks - all
+  addressed in the next commit (see the doc). Key retirement is now a tracked follow-up after Dev24 external recovery.
   **Exact next action:** ChatGPT review of the branch head -> if PASS, automated release as 0.1.0~dev24 -> live checks (no live
   rotation is needed to verify the release; rotation is exercised in tests/disposable environments only during vacation)
   -> Dev23 stage 3 (root restore) on a new branch from the released commit.
@@ -48,6 +51,8 @@ disposable environments, never live security-critical state. Do not weaken any s
 - Independent verification of published release assets (download + verify signature/SHA-256 from a second path).
 - Safe owner-side pruning: needs coordination that survives concurrent installer connections and restarts; NO timeout leases.
   Until then owner-side pruning stays disabled (owner backups are all kept and keep being made and checked).
+- Controlled retirement of kept backup key generations (after Dev24 external recovery; must count unreadable/ and external
+  copies; never trust an unreadable or unauthenticated header). Until then no key generation is ever destroyed.
 
 ## Milestone -> package version (approved: the package number increments per release; milestone names stay labels)
 | Milestone | Package version |

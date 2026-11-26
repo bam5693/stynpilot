@@ -580,12 +580,12 @@ class Executor:
                 outcome = self.vault.rotate_key(payload["mode"], rid)
                 result = dict(outcome, action=action, side="root")
                 if not outcome.get("ok"):
-                    result["stopped"] = outcome.get("error", "key_rotation_failed")
-                    result["resumes_automatically"] = outcome.get("error") not in (
-                        "key_rotation_request_invalid", "key_rotation_request_already_used", "key_is_present_use_normal_mode",
-                        "backup_key_missing_use_lost_key_mode", "backup_key_does_not_match_the_vault")
+                    result["stopped"] = outcome.get("error", "key_rotation_failed")    # 'rotation' + 'progress' say what is durable
             else:
-                result = {"ok": True, "action": action, "side": "owner", "mode": payload["mode"], "owner_side_authorized": rid}
+                # The owner's own vault is not the installer's to touch: this records the owner's verified, spent approval as an
+                # AUTHORIZATION for exactly this request. The owner side reports completion separately, from its own vault.
+                result = {"ok": True, "action": action, "side": "owner", "mode": payload["mode"], "owner_side_authorized": rid,
+                          "rotation": "authorized_owner_side_runs_it"}
         except Exception as error:
             result = {"ok": False, "stopped": getattr(error, "code", "unexpected_%s" % type(error).__name__), "action": action}
         self._record_result(rid, "done" if result.get("ok") else "failed", result)
@@ -1170,6 +1170,14 @@ class Executor:
     def _no_other_change(self):
         if self.needs_attention():
             raise ExecutionDenied("owner_intervention_required")
+        vault_ = getattr(self, "vault", None)
+        if vault_ is not None:
+            try:
+                rotating = vault_._rotation_active()
+            except Exception:
+                rotating = True
+            if rotating:
+                raise ExecutionDenied("key_rotation_in_progress")   # no install, rollback, upgrade or second rotation meanwhile
         self._settle_upgrades()
         if self.runs.running():
             raise ExecutionDenied("another_change_is_still_running")

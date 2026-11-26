@@ -1,62 +1,91 @@
 # Dev23 stage 2: secure backup key rotation (package 0.1.0.dev24)
 
-Branch `claude/dev23-stage2-keys`, from the released Dev23 stage 1 commit `a611385`.
+Branch `claude/dev23-stage2-keys`, from the released Dev23 stage 1 commit `a611385`. First reviewed commit `28a5a7a`;
+this revision answers ChatGPT's review of it (3 blockers, the lost-nonce-log design decision, the additional safety checks).
 
 ## What the owner gets
-- A new YELLOW request, filed by an assistant with `commander_request_backup_key_rotation(device_id, side, mode)` (write gate
-  required) and approved only by the owner's passkey/Auth0 single-use approval. The assistant never sees or touches any key.
-- `side`: `root` (installer side; runs inside the installer) or `owner` (the owner's own side: the installer verifies and spends
-  the approval, then the owner service rotates its own vault with that exact request id).
-- `mode normal`: replace the key. Also the approved way out of `nonce_log_missing` (a lost nonce log): the new key generation
-  starts with its own fresh nonce log, so no nonce can repeat under the new key.
-- `mode lost_key`: only when the key is really gone (`backup_key_missing`). Backups that needed it are moved to
-  `unreadable/` and KEPT (never deleted automatically); a fresh key starts. Refused while a key is present.
+- YELLOW request `commander_request_backup_key_rotation(device_id, side, mode)` (write gate), approved only with the owner's
+  passkey/Auth0 single-use approval. No assistant sees or touches any key.
+- `side`: `root` (installer side, runs inside the installer) or `owner` (his own side; see "Owner-side hand-off").
+- `mode`:
+  - `normal`: replace the key; every backup is re-encrypted with the new key and verified before it replaces the original.
+  - `fresh_key`: ONLY when the nonce log is missing or uncertain. A new generation (with its own new nonce log) is used for NEW
+    backups; existing backups are NOT re-encrypted and stay readable with their key, which is kept and never encrypts again.
+    (`normal` is refused while the log is missing or uncertain; `fresh_key` is refused while the log is fine.)
+  - `lost_key`: ONLY when the key is gone. Backups that need it are preserved in `unreadable/` (never deleted); a fresh key starts.
 
-## Key generations
-- Key file format unchanged (`STYNKEY1` + 8-byte id + 32-byte key; Dev24 export-compatible). Every backup header already names its
-  `key_id`, so each backup is opened with the generation that made it: the active `backup-key`, or a kept generation in `keys/`
-  (`keys/<id>.key`, `keys/<id>.nonces`, folder 0700, files 0600).
-- Each generation has its own nonce log. The active one is `nonces.log`; retired logs are kept in `keys/`.
-- A key whose id does not match the vault index is never trusted (`backup_key_does_not_match_the_vault`).
+## Key generations - never destroyed in this stage
+- Key file format unchanged (`STYNKEY1` + 8-byte id + 32-byte key; Dev24-export compatible). Each backup header names its
+  `key_id`; it is opened with that generation: the active `backup-key`, or a kept one in `keys/<id>.key`.
+- Every earlier generation is KEPT with its full nonce history (`keys/<id>.nonces`, or reported `nonce_history: false` when the
+  history was lost). Folder 0700, files 0600. Status lists generations (ids + whether history exists), never key material.
+- No key is ever destroyed automatically (BLOCKER 1). Only the two staging copies of the now-active key are removed, after a
+  byte-for-byte check. Controlled key retirement is a TRACKED FOLLOW-UP after Dev24 external recovery (it must account for
+  unreadable/ archives and external copies, and never trust an unreadable or unauthenticated header).
+- Kept generations only decrypt. New material is only ever encrypted with the active generation.
 
-## Normal rotation, step by step (journal `rotation.json`, fsynced after every step)
-1. Create the new generation (`keys/<new>.key` + empty `keys/<new>.nonces`), then write the journal.
-2. Record the approval id (an approval can never start a second rotation).
-3. For each backup made with the old key: decrypt it; check free space; record a NEW nonce in the new log BEFORE use; encrypt;
-   write `.rotate-<name>` atomically; read it back and decrypt it with the new key; compare the bundle SHA-256 and every header
-   field; only then `os.replace` it over the original. A failed check removes the temporary copy, leaves the original untouched
-   and stops (it resumes later). A backup the old key cannot open is left as it is and keeps the old key alive.
-4. Switch: copy the old key and its nonce log into `keys/` FIRST, then install the new nonce log and the new key, then the index.
-5. Cleanup: destroy every kept key generation that no retained backup needs any more (counted from the backups' own headers);
-   remove temporary copies; record `last_rotation`; delete the journal.
+## Nonce histories
+- Appends are written fully, fsynced, and CHECKED (file size must grow by exactly the line; otherwise `log_write_incomplete`).
+- Reading: every complete line must be a valid nonce. An unfinished last line (power cut mid-write; never used, because a nonce
+  is fsynced before use) is tolerated and is closed with a `!` marker before the next append. Anything else is
+  `nonce_log_uncertain`: no new backups until an owner-approved `fresh_key` rotation.
 
-While a journal exists nothing else runs (`key_rotation_in_progress`). The scheduler resumes an interrupted rotation first, on the
-next tick (also after a service restart or power loss). Status shows `key_rotation_incomplete` meanwhile, and `keys` (active id,
-kept generations, last rotation - never key material or the approval id).
+## The journal (`rotation.json`)
+- Validated completely before anything acts on it: exact key set per mode and state, ids (16 hex), request id (64 hex), file names
+  (strict backup-name pattern), state machine. Anything else is `key_rotation_journal_damaged`: nothing runs, status shows it.
+- Every step is fsynced and idempotent; the scheduler resumes an active rotation before anything else (also after a restart).
+- Spent approvals: append-only, fsynced, UNBOUNDED `rotation-requests.log` (no bounded list).
 
-## Lost-key recovery
-1. Journal, then approval id recorded.
-2. Move every backup whose key generation is not present to `unreadable/` (kept, never deleted; retention never looks there);
-   backups of a kept older generation stay in place and stay usable. The lost key's nonce log is kept beside them.
-3. Fresh key + fresh nonce log; index updated; journal removed. Status shows `unreadable_backups_kept:N`.
+## Normal rotation steps
+1. New generation in `keys/`, then the journal, then the approval id is spent.
+2. Per backup made with the old key: decrypt; space check; record a new nonce (checked write) BEFORE use; encrypt to
+   `.rotate-<name>`; read back, decrypt with the new key, compare bundle SHA-256 and all header fields; only then `os.replace`.
+   A failed check leaves the original untouched and stops (resumes later). Unreadable headers / backups the old key cannot open
+   are left exactly as they are.
+3. Switch: old key and its log copied into `keys/` FIRST; then the INDEX names the new key; then the new log and new key are put
+   in place. (Older StyNpilot after a rollback: until the new key is in place it sees a key/index mismatch and refuses to make
+   backups, so it can never pair the old key with the new log.)
+4. Finish: staging copies removed (after checks), `last_rotation` recorded, journal removed.
 
-## Where it runs
-- Inside the isolated, memory-limited (`RLIMIT_AS` 1280 MiB) backup worker, under the vault lock, like every heavy vault operation.
-  Peak memory is about two copies of one backup.
+## Lost-key recovery (BLOCKER 3)
+- Each archive is preserved with a hard link (which fails if the name exists, so nothing is ever overwritten), the destination
+  folder is fsynced, the copy is checked byte-for-byte (SHA-256), and only then the source is removed and its folder fsynced.
+  A different file already at the destination: the archive gets a new name (`<name>.1`, ...). An identical copy already there
+  (interrupted earlier move): counted as preserved.
+- The lost key's nonce history is preserved the same way (`nonces-<id>.log`).
+- Crash recovery reconciles the index with what is actually in `unreadable/` (also files whose journal entry was lost).
+
+## Owner-side hand-off (BLOCKER 2)
+1. Before the installer is asked, the owner service writes a durable marker bound to the exact request
+   (`awaiting_authorization`: mode, request id, expiry). It changes nothing and does not stop backups.
+2. The installer verifies and spends the approval and records an AUTHORIZATION (`rotation: authorized_owner_side_runs_it`), not
+   a completion.
+3. The owner service rotates its own vault with that request id. The owner's request becomes `done` only when the owner vault
+   reports completion; if the rotation is interrupted it stays `running` and the vault finishes it and settles the request.
+4. After a crash anywhere in between: the approval flow's recovery never marks such a request done from the installer's
+   authorization; the vault (after a 10-minute grace) asks the installer's own record: authorized -> rotate and settle;
+   not received / denied / failed -> drop the marker, spend the id, settle as failed; installer unreachable -> wait.
+- States: awaiting_authorization -> (authorized at the installer) -> in progress (journal state) -> completed | failed;
+  interrupted = journal present, resumed automatically. Results carry `rotation` and `progress` read from the journal itself.
+
+## Overlap and rollback compatibility
+- The installer refuses installs, rollbacks, upgrades and another rotation while a root rotation is active
+  (`key_rotation_in_progress`). A root rotation itself holds the installer's operation lock, so it never runs during an install,
+  rollback or backup of the installer's records. Vault operations are serialized by the vault lock; restore (stages 3/4) must
+  check the journal too.
+- Rollback to 0.1.0~dev23 checked with the RELEASED dev23 vault code (`a611385`) against rotated vaults: after a completed normal
+  rotation it works normally; after `fresh_key` the backups under the kept generation fail its recheck and are reported
+  (`backups_failed_a_recheck`) and kept, never deleted; after `lost_key` it works on the new key and ignores `unreadable/`; cut
+  at every durable step of a normal rotation, dev23 never paired the old key with the new nonce log (95 steps, 0 unsafe), and
+  this version finished every rotation afterwards.
 
 ## Tests (`tests/test_dev23_key_rotation.py`)
-- Power loss at EVERY durable step (every atomic write, rename, delete and fsync) of a normal rotation and of a lost-key recovery:
-  after a restart the rotation completes (or, before the approval was recorded, can be re-approved), all backups are intact with
-  identical contents, all under the new key, no old key left that nothing needs, no temporary copies, no repeated nonce.
-- Re-encrypted copy failing verification never replaces the original; out of space stops safely and resumes.
-- Separate key ids and nonce logs per generation; nonce uniqueness across 3 rotations.
-- Never destroying a key a retained backup needs; a retired generation still opens its backups.
-- Lost nonce log resolved by an approved new key; swapped key never trusted.
-- Lost key: unreadable archives preserved byte-for-byte, retention never touches them; refused while the key is present; older
-  readable generations kept in place.
-- Executor: single-use proof, replay refused, malformed/expired/forged requests refused; owner-side only authorizes; owner hook
-  rotates only for its own authorized request id; request tool needs the write gate.
-- The isolated worker path.
+Power loss at EVERY durable step (atomic write, rename, delete, fsync, link) of normal, fresh_key and lost-key rotations, each
+followed by restart + resume and full checks (contents, keys, nonce uniqueness, preserved archives, index), plus an
+older-reader safety check at every step; unreadable headers never cost a key; verification failure; out of space; forged/
+damaged journals; unbounded replay record; uncertain/torn/short nonce writes; swapped key; destination collisions and an
+identical earlier copy; owner hand-off end to end with the real approval flow and installer (normal, crash after authorization,
+crash before the installer received it); installer refusing other changes during a rotation; installer lock; isolated worker.
 
 ## Not in this stage
-- No live rotation during the vacation (not needed to verify the release). Restore stages 3/4 and Dev24 export come later.
+No live rotation during the vacation (not needed to verify the release). Key retirement, restore stages 3/4, Dev24 export later.

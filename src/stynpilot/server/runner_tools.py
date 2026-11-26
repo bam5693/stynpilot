@@ -195,14 +195,15 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
     @server.tool(name="commander_request_backup_key_rotation", title="Ask the owner to replace a backup encryption key",
                  annotations=FILES_A_REQUEST,
                  description=("Ask the owner to approve a new backup encryption key for side 'root' (installer) or 'owner' (his own "
-                              "side). mode 'normal': every backup is re-encrypted and checked, resumable after any interruption; also "
-                              "the fix for nonce_log_missing. mode 'lost_key': only when backup_key_missing; unreadable backups are kept "
-                              "aside, never deleted. He approves on his phone; you cannot see or touch any key."))
+                              "side). mode 'normal': every backup is re-encrypted and checked, resumable after any interruption. mode "
+                              "'fresh_key': only for nonce_log_missing / nonce_log_uncertain; new backups get a new key, existing ones "
+                              "stay as they are. mode 'lost_key': only for backup_key_missing; unreadable backups are kept aside, never "
+                              "deleted. Old keys are always kept. He approves on his phone; you cannot see or touch any key."))
     def request_backup_key_rotation(device_id: str, side: str, mode: str = "normal") -> dict:
         def work(owner):
             from .. import vault as _vault
             if side not in ("root", "owner") or mode not in _vault.ROTATION_MODES:
-                raise WorkspaceError("side_root_or_owner_and_mode_normal_or_lost_key")
+                raise WorkspaceError("side_root_or_owner_and_mode_normal_fresh_key_or_lost_key")
             expires = now() + timedelta(hours=1)
             payload = {"kind": "backup", "action": "rotate_key", "side": side, "mode": mode, "owner": owner,
                        "device": device_id, "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}

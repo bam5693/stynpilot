@@ -104,6 +104,11 @@ class RunnerToolTests(unittest.TestCase):
         (self.projects / "app").mkdir(parents=True)
         (self.projects / "other").mkdir()
         self.broker = FakeBroker()
+        from unittest.mock import patch
+        readiness = patch("stynpilot.local_ai_readiness.inspect",
+                          return_value={"resource_checks_passed": True})
+        self.readiness = readiness.start()
+        self.addCleanup(readiness.stop)
         self.limiter = RateLimit(per_minute=1000)
         self.router, self.clients = router, clients
         self.server = create_server(router=router, resource_url=AUDIENCE,
@@ -344,6 +349,19 @@ class RunnerToolTests(unittest.TestCase):
                 time.sleep(.01)
             self.assertEqual(out["result"]["state"], "cancelled", out)
             self.assertNotIn("output", out["result"])
+
+    def test_local_ai_containment_gate_and_readiness(self):
+        from unittest.mock import patch
+        self.authorize("local-ai-pilot")
+        self.readiness.return_value = {"resource_checks_passed": False}
+        report = self.call("local_ai_readiness", self.d(), "readonly")
+        self.assertTrue(report["ok"], report)
+        self.assertFalse(report["result"]["resource_checks_passed"])
+        with patch("stynpilot.local_ai.http.client.HTTPConnection") as transport:
+            out = self.call("local_ai_submit", self.d(prompt="test"))
+            self.assertEqual(out["error"], "local_ai_containment_required")
+            transport.assert_not_called()
+        self.assertFalse(self.call("local_ai_readiness", self.d(), "stranger")["ok"])
 
 
 if __name__ == "__main__":

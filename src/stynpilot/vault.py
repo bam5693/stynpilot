@@ -1501,7 +1501,7 @@ class Vault:
             code = ("import sys,json;sys.path[:0]=json.loads(sys.argv[1]);from stynpilot.vault import _child;_child()")
             error = "backup_process_unavailable"
             try:
-                done = subprocess.run([sys.executable, "-I", "-c", code, json.dumps(paths)], input=json.dumps(self._spec(op, manual, args)).encode(),
+                done = subprocess.run([sys.executable, "-IB", "-X", "pycache_prefix=" + (sys.pycache_prefix or "/usr/lib/stynpilot/.source-only"), "-c", code, json.dumps(paths)], input=json.dumps(self._spec(op, manual, args)).encode(),
                                       capture_output=True, timeout=CHILD_TIMEOUT, close_fds=True)
                 lines = done.stdout.decode("utf-8", "replace").strip().splitlines()
                 result = json.loads(lines[-1][-65536:]) if done.returncode == 0 and lines else None

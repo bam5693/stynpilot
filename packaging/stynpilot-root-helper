@@ -1,5 +1,7 @@
 #!/usr/bin/python3 -IB
 import sys
+# The reproducible package preserves source mtimes. Ignore the pre-upgrade bytecode beside source.
+sys.pycache_prefix = "/usr/lib/stynpilot/.source-only"
 sys.path[:0] = ["/usr/lib/stynpilot/lib"]
 sys.path.append("/usr/lib/stynpilot/vendor")
 from stynpilot.root_helper import main

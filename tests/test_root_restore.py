@@ -227,9 +227,11 @@ class RestoreTests(unittest.TestCase):
         from stynpilot import __version__
         result = dict(ok=True, ran=True, version=__version__, passed=list(selftest.REQUIRED + selftest.OPTIONAL + selftest.STRICT_REQUIRED),
                       failed=[], unverified=[])
-        self.assertTrue(complete_checks(result))
+        self.assertTrue(complete_checks(result, __version__.replace(".dev", "~dev")))
+        self.assertFalse(complete_checks(result, "0.1.0~dev22"))
+        self.assertFalse(complete_checks(result, None))
         for changes in ({"version": "old"}, {"passed": result["passed"][:-1]}, {"unverified": ["limit_io"]}, {"failed": ["identity"]}):
-            self.assertFalse(complete_checks(dict(result, **changes)))
+            self.assertFalse(complete_checks(dict(result, **changes), __version__.replace(".dev", "~dev")))
 
 
 class ApprovalBoundaryTests(unittest.TestCase):
@@ -445,3 +447,46 @@ class OwnerExclusionTests(unittest.TestCase):
             self.assertTrue(fresh().prepare_rotation("normal", other, 105)["ok"])
             with self.assertRaisesRegex(vault.VaultError, "owner_key_rotation_in_progress"):
                 fresh().reserve_root_restore(rid, 101)
+
+
+
+class RestoreCapacityAndVersionTests(unittest.TestCase):
+    def test_combined_capacity_checks_precede_archive_decode(self):
+        fixture = RestoreTests("runTest")
+        fixture.setUp()
+        try:
+            size = (fixture.v.folder / fixture.archive).stat().st_size
+            live, _ = vault._state_sizes(fixture.state, "root")
+            fixture.v.limits["gather"] = size + live - 1
+            with mock.patch.object(fixture.v, "_verify") as decode:
+                result = fixture.v._run("restore_preview", args={"archive": fixture.archive})
+                assert result["error"] == "combined_restore_too_large"
+                decode.assert_not_called()
+            fixture.v.limits["gather"] = vault.MAX_GATHER
+            with mock.patch.object(fixture.v, "space", return_value=type("Space", (), {"free": vault.SPACE_MARGIN})()):
+                result = fixture.v._run("restore_preview", args={"archive": fixture.archive})
+                assert result["error"] == "insufficient_combined_restore_storage"
+        finally:
+            fixture.doCleanups()
+
+
+    def test_fresh_package_launcher_ignores_equal_size_equal_mtime_legacy_bytecode(self):
+        import subprocess
+        import sys
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        tmp_path = Path(directory.name)
+        package = tmp_path / "stynpilot"
+        package.mkdir()
+        version = package / "__init__.py"
+        (package / "cli.py").write_text("def main():\n    from . import __version__\n    print(__version__)\n")
+        version.write_text('__version__ = "0.1.0.dev22"\n')
+        os.utime(version, (1763769600, 1763769600))
+        subprocess.run([sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import stynpilot",
+                        str(tmp_path)], check=True)
+        version.write_text(version.read_text().replace("dev22", "dev25"))
+        os.utime(version, (1763769600, 1763769600))
+        launcher = (Path(__file__).resolve().parents[1] / "packaging" / "stynpilot-launcher").read_text()
+        launcher = launcher.replace("/usr/lib/stynpilot/lib", str(tmp_path))
+        output = subprocess.check_output([sys.executable, "-IB", "-c", launcher], text=True)
+        assert output.strip() == "0.1.0.dev25"

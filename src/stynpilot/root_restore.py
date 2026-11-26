@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import tempfile
 import time
@@ -108,6 +109,49 @@ def _security(v, skip=""):
     return digest.hexdigest()
 
 
+def _capacity(v, name):
+    """Bound overlapping decode, safety backup and staging before opening either archive."""
+    archive = (v.folder / name).lstat().st_size
+    live, _ = vault._state_sizes(v.state_dir, "root")
+    for _, path, _, _, _ in v._extra_list():
+        try:
+            live += os.lstat(path).st_size
+        except FileNotFoundError:
+            pass
+    for name in backup.ROOT_DBS + backup.ROOT_OPTIONAL_DBS:
+        sidecar = v.state_dir / (name + "-wal")
+        if sidecar.exists():
+            live += sidecar.stat().st_size
+    combined = archive + live
+    # The decrypted size is bounded by the ciphertext. Charging both whole input sets is conservative
+    # when snapshots overlap and leaves room below the worker's memory limit for verification copies.
+    if combined > min(v.limits["gather"], vault.MAX_GATHER):
+        raise ERROR("combined_restore_too_large")
+    if v.space(str(v.state_dir)).free < 4 * combined + vault.SPACE_MARGIN:
+        raise ERROR("insufficient_combined_restore_storage")
+    if shutil.disk_usage(tempfile.gettempdir()).free < combined + vault.SPACE_MARGIN:
+        raise ERROR("insufficient_restore_scratch_storage")
+
+
+def _eligible(v, stage, archive=None):
+    """Check file sizes and the next backup's input budget before any state is replaced."""
+    estimated = [p.stat().st_size for tree in MEMBERS[1:] for p in (stage / tree).rglob("*") if p.is_file()]
+    estimated.append((stage / MEMBERS[0]).stat().st_size)
+    for name in ("runs.sqlite3", "passkeys.sqlite3"):
+        path = v.state_dir / name
+        if path.exists():
+            # Historical proof and key rows can grow the authoritative databases during the security merge.
+            sidecar = path.with_name(name + "-wal")
+            estimated.append(path.stat().st_size + (sidecar.stat().st_size if sidecar.exists() else 0))
+            if archive is not None:
+                estimated[-1] += len(archive.get(name, b"")) + (1 << 20)
+    extras = [os.lstat(path).st_size for _, path, _, _, _ in v._extra_list() if os.path.lexists(path)]
+    if (sum(estimated) + sum(extras) > v.limits["gather"]
+            or max(estimated, default=0) > v.limits["file"]
+            or max(extras, default=0) > v.limits["extra"]):
+        raise ERROR("restored_state_exceeds_backup_limits")
+
+
 def selected(v, name):
     if v.side != "root" or type(name) is not str or not vault.NAME.fullmatch(name) or not name.startswith("root-"):
         raise ERROR("invalid_root_archive")
@@ -123,6 +167,9 @@ def selected(v, name):
 
 
 def preview(v, name, *, skip="", generation=None):
+    if type(name) is str and vault.NAME.fullmatch(name) and name.startswith("root-"):
+        if (v.folder / name).exists():
+            _capacity(v, name)
     header, _, blobs = selected(v, name)
     differences = []
     for label, path, _, _, _ in v._extra_list():
@@ -183,12 +230,15 @@ def _trees(stage, files):
 
 
 def _stage(v, payload, tx):
-    _, archive, _ = selected(v, payload["archive"])
+    _capacity(v, payload["archive"])
     if vault._file_sha(v.folder / payload["archive"]) != payload["sha256"]:
         raise ERROR("approved_archive_changed")
     index = v._index()
     name = v._create(index)
-    _, live, _, meta = v._verify(name, index, with_metadata=True)
+    _, live, safety_blobs, meta = v._verify(name, index, with_metadata=True)
+    del safety_blobs
+    _, archive, archive_blobs = selected(v, payload["archive"])
+    del archive_blobs
     if meta.get("incomplete") != []:
         raise ERROR("incomplete_safety_backup")
     index["backups"][name]["verified_at"] = int(v.clock())
@@ -223,6 +273,7 @@ def _stage(v, payload, tx):
                     raise ERROR("conflicting_install_ledger")
                 elif row[-1] is not None:
                     db.execute("UPDATE installs SET rolled_back=coalesce(rolled_back,?) WHERE rollback_id=?", (row[-1], row[0]))
+        _eligible(v, stage, archive)
         # Validate each referenced snapshot against the merged ledger before allowing any switch.
         backup._validate_complete("root", {**trees, "installs.sqlite3": (stage / MEMBERS[0]).read_bytes(),
                                            "runs.sqlite3": live["runs.sqlite3"]})
@@ -417,6 +468,7 @@ def worker(v, services, checkpoint=lambda phase: None):
                     with statelock.exclusive_for_restore(state):
                         _check_safety(tx)
                         _security_union(state, tx, rid)
+                        _eligible(v, tx / "new")
                         phase("switch")
                 elif step == "switch":
                     services.stop()

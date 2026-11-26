@@ -84,6 +84,33 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
         _LOG.info("tool=%s client=%s outcome=ok", tool, who)
         return {"ok": True, "device_id": device_id, "result": result}
 
+    # A narrow, owner-side inference bridge, not a network exception for the project runner.
+    from .. import local_ai
+    inference = local_ai.Jobs()
+
+    def inference_caller(owner, device_id, *, require_workspace=True):
+        if require_workspace:
+            local_ai.require_workspace(broker.runner("status"))
+        return (owner, device_id, ctx.proposer.client)
+
+    @server.tool(name="local_ai_submit", title="Submit bounded local text inference", annotations=WORKS,
+                 description="Use the fixed local Ollama coding model. Requires the enrolled pilot workspace and an open runner gate. One active job; returns a job ID. No files, tools, shell or cloud fallback.")
+    def local_ai_submit(device_id: str, prompt: str) -> dict:
+        return run("local_ai_submit", device_id,
+                   lambda owner: inference.submit(inference_caller(owner, device_id), prompt), write=True)
+
+    @server.tool(name="local_ai_status", title="Read your local inference job", annotations=READ_ONLY,
+                 description="Read the state and, if complete, untrusted text result of your own local inference job. Results are volatile and expire after ten minutes. Requires workspace.propose.")
+    def local_ai_status(device_id: str, job_id: str) -> dict:
+        return run("local_ai_status", device_id,
+                   lambda owner: inference.status(inference_caller(owner, device_id), job_id), write=True)
+
+    @server.tool(name="local_ai_cancel", title="Cancel your local inference request", annotations=WORKS,
+                 description="Cancel your own inference request and discard its output. The connection is interrupted on a best-effort basis; this does not guarantee that the model server stops immediately.")
+    def local_ai_cancel(device_id: str, job_id: str) -> dict:
+        return run("local_ai_cancel", device_id,
+                   lambda owner: inference.cancel(inference_caller(owner, device_id, require_workspace=False), job_id), write=True)
+
     def workspace(name):
         if type(name) is not str or not _NAME.fullmatch(name):
             raise WorkspaceError("workspace_name_invalid")

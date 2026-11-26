@@ -81,7 +81,13 @@ def empty_group(group, *, read=read_bounded):
     except FileNotFoundError:
         # Missing group is acceptable only if the group itself is gone;
         # a missing control in a still-present group is not evidence.
-        return not os.path.lexists(group)
+        try:
+            os.lstat(group)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return False
     try:
         fields = dict(line.split() for line in info.decode("ascii").splitlines())
     except (ValueError, UnicodeError):

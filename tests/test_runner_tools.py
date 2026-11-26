@@ -104,18 +104,15 @@ class RunnerToolTests(unittest.TestCase):
         (self.projects / "app").mkdir(parents=True)
         (self.projects / "other").mkdir()
         self.broker = FakeBroker()
-        from unittest.mock import patch
-        readiness = patch("stynpilot.local_ai_readiness.inspect",
-                          return_value={"resource_checks_passed": True})
-        self.readiness = readiness.start()
-        self.addCleanup(readiness.stop)
+        from unittest.mock import Mock
+        self.readiness = Mock(return_value={"resource_checks_passed": True})
         self.limiter = RateLimit(per_minute=1000)
         self.router, self.clients = router, clients
         self.server = create_server(router=router, resource_url=AUDIENCE,
                                     propose=dict(clients=clients, store=self.store, approval_url="https://ryzen.example.test/app",
                                                  clock=lambda: self.now[0]),
                                     runner=dict(broker=self.broker, projects_dir=str(self.projects), clock=lambda: self.now[0],
-                                                limiter=self.limiter))
+                                                limiter=self.limiter, inference_readiness_probe=self.readiness))
 
     def call(self, name, arguments, token="chatgpt"):
         who = Tokens.valid[token]

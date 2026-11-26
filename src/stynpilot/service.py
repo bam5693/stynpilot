@@ -325,7 +325,9 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
         from .diagnostics import Diagnostics
         from .system_status import SystemStatus
         home = os.path.expanduser("~")
-        service.vault = vault or owner_vault(config, retention_source=lambda: broker.vault_settings())
+        service.vault = vault or owner_vault(config, retention_source=lambda: broker.vault_settings(),
+                                             prune_lease=lambda: broker.vault_prune_lease(),
+                                             prune_release=lambda token: broker.vault_prune_release(token))
         diag = dict(policy=safefs.Policy(home=home,
                                          project_roots=safefs.load_project_roots(state / PROJECT_ROOTS_FILE, home),
                                          extra_deny=[config.state_dir, config.pairing_db, config.broker_socket]),

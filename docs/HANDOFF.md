@@ -23,10 +23,10 @@ disposable environments, never live security-critical state. Do not weaken any s
 ## Where things live
 - Code: GitHub `bam5693/stynpilot` (public). Branches: `claude/dev20-first-automated`, `claude/dev21-tar-free`,
   `claude/dev22-backups` (= installed baseline), `claude/dev23-stage1-retention` (current work).
-- Master plan (canonical, newest entries at the top of the log): GitLab project 88825825 (`cstivers56/desktether-linux-beta-ci`),
-  branch `knowledge/master`, file `MASTER_PLAN.md`. Ideas Vault: same branch, `MASTER_IDEAS.md` (never recreate it).
+- Master plan (canonical, private, newest entries at the top of its log) and the Ideas Vault (`MASTER_IDEAS.md`, never recreate
+  it) live in the owner's PRIVATE GitLab knowledge branch. Machine identifiers, key fingerprints, repository/project IDs and other
+  private operational details are kept there, not in this public file. Ask ChatGPT or the owner for access if you do not have it.
 - Docs per release: `docs/DEV16_RELEASE_AUTHORITY.md` ... `docs/DEV22_BACKUPS.md`, `docs/DEV23_STAGE1_RETENTION_AND_VERIFICATION.md`.
-- Ryzen device_id: `dtdev_eqOFUSZH9dL5FhBd` (not a secret).
 
 ## Installed / stable
 - Live on the Ryzen: Dev22, package 0.1.0~dev22, source `ca24e68a3eab3078d30e892b3139c88cdc3d57bd`. Stable baseline and
@@ -39,9 +39,12 @@ disposable environments, never live security-critical state. Do not weaken any s
 ## Current work: Dev23 stage 1 (retention settings + periodic re-verification)
 - Branch `claude/dev23-stage1-retention`. First reviewed commit `9cc6a50` (version 0.1.0.dev23). ChatGPT review: architecture,
   payload validation, single-use approval, write gate and daily verification PASSED. The findings below are FIXED in commit
-  `d2366356bf4f7be61489cb7f98959b30328933d6` (normal 861 passed/5 skipped; sandbox emulation 859 passed/95 skipped/0 failed).
-  **Exact next action:** ChatGPT focused review of d236635 -> if PASS, automated release as 0.1.0~dev23 -> live checks ->
-  start Dev23 stage 2 (secure key rotation) on a NEW branch from the released commit, with package version 0.1.0.dev24.
+  `d2366356` and the second review's findings in the following commit (see the branch head and the private plan for exact
+  hashes and test numbers): a MISSING settings file after any approval (durable `policy.log` evidence) holds pruning, and owner-
+  side pruning happens only under an installer-held lease, with the lease's policy (no retention change can be applied while the
+  lease is held).
+  **Exact next action:** ChatGPT focused review of the branch head -> if PASS, automated release as 0.1.0~dev23 -> live checks
+  -> start Dev23 stage 2 (secure key rotation) on a NEW branch from the released commit, package version 0.1.0.dev24.
 - Findings (now fixed):
   1. BLOCKER: a damaged/unreadable/invalid approved settings file must NOT fall back to 7+4 for pruning: prune nothing, keep
      backing up and verifying, report `retention_settings_untrusted`. Owner side: no pruning unless the installer's current
@@ -51,6 +54,18 @@ disposable environments, never live security-critical state. Do not weaken any s
   3. Release versions: do not reuse a published version for later Dev23 stages. Proposal (awaiting ChatGPT): the PACKAGE version
      simply increments per release (stage 1 = 0.1.0.dev23, stage 2 = 0.1.0.dev24, ...) while milestone names (Dev23 stage N,
      Dev24 off-machine, Dev25 repositories) stay as labels. dev numbers must keep increasing or the upgrader refuses the release.
+
+## Milestone -> package version (approved: the package number increments per release; milestone names stay labels)
+| Milestone | Package version |
+|---|---|
+| Dev20 first automated release | 0.1.0~dev20 |
+| Dev21 tar-free packages | 0.1.0~dev21 |
+| Dev22 encrypted backups (installed baseline) | 0.1.0~dev22 |
+| Dev23 stage 1 retention + verification | 0.1.0~dev23 |
+| Dev23 stage 2 key rotation | 0.1.0~dev24 (next free number) |
+| Dev23 stage 3 root restore / stage 4 owner restore | next free numbers in order |
+| Dev24 off-machine, Dev25 repositories | next free numbers when released |
+Never reuse a published version; the upgrader refuses anything not newer than what is installed.
 
 ## Tests (how to run, latest results)
 - Normal: `PYTHONPATH=src python3 -m pytest -q -p no:cacheprovider tests --ignore=tests/test_g7.py --ignore=tests/test_compat_check.py`
@@ -65,7 +80,7 @@ disposable environments, never live security-critical state. Do not weaken any s
 1. Push the exact commit; ChatGPT reviews it independently.
 2. ChatGPT: `commander_prepare_stynpilot_release(device_id, commit=<40 hex>, version="0.1.0~devNN")` -> poll
    `stynpilot_release_status` (two reproducible builds + full test suite in the sandbox) -> `commander_request_stynpilot_release`.
-3. Owner approves ONCE on his phone (passkey). The Ryzen signs (key fa3e08452ebb805d), publishes the GitHub release, installs,
+3. Owner approves ONCE on his phone (passkey). The Ryzen signs with its own release key, publishes the GitHub release, installs,
    health-checks and rolls back automatically on failure. Interrupted after approval -> `commander_resume_stynpilot_release`.
 4. After install, ChatGPT checks: both services, runner_selftest 21/21 + gate open, backup_status, system status, rollback ready.
 - Manual release path (only if an authority change cannot ship otherwise; needs explicit owner OK): build with
@@ -98,14 +113,14 @@ disposable environments, never live security-critical state. Do not weaken any s
 - Dev24: encrypted external backups (Pi 8 TB drive first), owner-controlled key export/recovery, independent verification of
   transferred archives, recovery after full Ryzen drive failure, scoped transfers without exposing credentials/keys to AI workers.
 - Dev25 (required Core): GitHub/GitLab/Forgejo/local Git management with GREEN/YELLOW/BLACK rules; first acceptance test =
-  reconcile DeckPlay HQ across GitHub, GitLab (project 88611592, 34 branches, main is NOT the baseline) and Pi Forgejo
-  (deckplayadmin/Deckplayhq) and create one canonical authorized Ryzen workspace without losing history. Read-only
-  reconciliation may run in parallel; never blindly overwrite/merge/sync/delete/deploy.
+  reconcile the owner's DeckPlay HQ project across its GitHub, GitLab and Pi Forgejo copies (repository details in the private
+  plan; the GitLab main branch is NOT the baseline) and create one canonical authorized Ryzen workspace without losing history.
+  Read-only reconciliation may run in parallel; never blindly overwrite/merge/sync/delete/deploy.
 
 ## Deferred tracker (keep)
 authority SHOULD-FIX (tmpfs size/options check, verified unmount + cleanup, keep test counts after a later failure); self-test
 syscall numbers per architecture; release build account identity check; Wake-on-LAN read on the installer side; KDE Plasma power
 settings; 'unavailable' vs 'effective default' in system status; ScopeChallenge body limits; audit-dir fsync ordering; pkexec
-helper routing; stricter fetch-destination filtering before public release; signing-key rotation drill + retiring old key
-3ed773adf74d325e; manifest v2 multi-signature + signed revocation list; passkey enrollment GUI; delete staging branches
+helper routing; stricter fetch-destination filtering before public release; signing-key rotation drill + retiring the old key
+(details in the private plan); manifest v2 multi-signature + signed revocation list; passkey enrollment GUI; delete staging branches
 dev12/dev13; Phase S2/S4/S5 (system changes, shutdown/reboot, network safety net); independent published-asset verification.

@@ -127,6 +127,14 @@ class BrokerService:
                 return {"ok": True, "result": call()}
             if op == "runner":
                 return {"ok": True, "result": self.executor.runner_call(message.get("call"), message.get("args"))}
+            if op == "vault_prune_lease":
+                vault = getattr(self, "vault", None)
+                if vault is None:
+                    return {"ok": True, "result": None}
+                return {"ok": True, "result": {"lease": self.executor.take_prune_lease(), "policy": vault.effective_retention()}}
+            if op == "vault_prune_release":
+                self.executor.release_prune_lease(message.get("lease"))
+                return {"ok": True, "result": True}
             if op == "vault_settings":
                 vault = getattr(self, "vault", None)
                 return {"ok": True, "result": vault.effective_retention() if vault is not None else None}
@@ -282,6 +290,12 @@ class BrokerClient:
 
     def release_prepare(self, commit, version):
         return self._ask({"op": "release_prepare", "commit": commit, "version": version}, 30)["result"]
+
+    def vault_prune_lease(self):
+        return self._ask({"op": "vault_prune_lease"}, 30)["result"]
+
+    def vault_prune_release(self, lease):
+        return self._ask({"op": "vault_prune_release", "lease": lease}, 30)["result"]
 
     def vault_settings(self):
         return self._ask({"op": "vault_settings"}, 30)["result"]

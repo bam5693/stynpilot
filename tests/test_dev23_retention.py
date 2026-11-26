@@ -92,21 +92,66 @@ class PruneFailClosedTests(unittest.TestCase):
         self.assertIn("retention_settings_untrusted", problems)
         self.assertIn("pruning_on_hold:retention_settings_untrusted", problems)
 
-    def test_the_owner_side_prunes_only_after_confirming_the_installers_policy(self):
-        self.vault.retention_source = lambda: (_ for _ in ()).throw(OSError("installer down"))
+    def owner_side(self, policy):
+        """Wire the vault like the owner service: policy reads and a pruning lease from a (fake) installer."""
+        installer = type("I", (), {})()
+        installer.policy, installer.leases, installer.released = policy, [], []
+
+        def lease():
+            if installer.policy is None:
+                raise OSError("installer down")
+            installer.leases.append(dict(installer.policy))
+            return {"lease": "t%d" % len(installer.leases), "policy": dict(installer.policy)}
+        self.vault.retention_source = lambda: (dict(installer.policy) if installer.policy is not None
+                                               else (_ for _ in ()).throw(OSError("installer down")))
+        self.vault.prune_lease, self.vault.prune_release = lease, installer.released.append
+        self.vault.policy_confirmed = False
+        return installer
+
+    def test_the_owner_side_prunes_only_under_the_installers_lease_and_policy(self):
+        installer = self.owner_side(None)                                        # installer unreachable
         self.vault.retention = {"daily": 1, "weekly": 0}
         self.daily(5)
         self.assertEqual(self.count(), 5)                                        # policy unconfirmed: nothing deleted
         self.assertIn("pruning_on_hold:retention_policy_unconfirmed", self.vault.status()["problems"])
-        self.vault.retention_source = lambda: {"daily": 1, "weekly": 0, "approved": "b" * 64, "trusted": True}
+        installer.policy = {"daily": 1, "weekly": 0, "approved": "b" * 64, "trusted": True}
         self.daily(1)
-        self.assertEqual(self.count(), 1)                                        # confirmed: the approved rule applies
-        self.vault.retention_source = lambda: {"daily": 7, "weekly": 4, "approved": None, "trusted": True}
+        self.assertEqual(self.count(), 1)                                        # confirmed under a lease: the approved rule applies
+        self.assertEqual(installer.released, ["t1"])                             # and the lease was released
+        installer.policy = {"daily": 7, "weekly": 4, "approved": None, "trusted": True}
         self.daily(3)
         self.assertEqual(self.count(), 4)                                        # we hold an approval the installer lost: hold
-        self.vault.retention_source = lambda: {"daily": 7, "weekly": 4, "approved": None, "trusted": False}
+        installer.policy = {"daily": 7, "weekly": 4, "approved": None, "trusted": False}
         self.daily(1)
         self.assertIn("pruning_on_hold:retention_policy_unconfirmed", self.vault.status()["problems"])
+
+    def test_a_policy_approved_after_the_sync_is_the_one_pruning_uses(self):
+        installer = self.owner_side({"daily": 1, "weekly": 0, "approved": "c" * 64, "trusted": True})
+        self.daily(3)
+        self.assertEqual(self.count(), 1)
+        real_source = self.vault.retention_source
+        changed = {"daily": 5, "weekly": 0, "approved": "d" * 64, "trusted": True}
+
+        def sync_then_change():                                                 # the owner syncs the OLD policy, then a newer one
+            old = real_source()                                                 # is approved before pruning starts
+            installer.policy = changed
+            return old
+        self.vault.retention_source = sync_then_change
+        self.daily(4)
+        self.assertEqual(self.vault.effective_retention()["approved"], "d" * 64)
+        self.assertEqual(self.count(), 5)                                        # pruned with the NEWER rule (5 daily), not the old 1
+
+    def test_a_missing_settings_file_after_an_approval_holds_pruning(self):
+        self.vault.set_retention(2, 0, "e" * 64)
+        self.daily(3)
+        self.assertEqual(self.count(), 2)
+        os.unlink(self.o.tmp / "vault" / vault.SETTINGS)                         # the approved policy is LOST
+        self.assertFalse(self.vault.effective_retention()["trusted"])
+        self.daily(6)
+        self.assertEqual(self.count(), 8)                                        # nothing deleted under the default 7+4
+        self.assertIn("retention_settings_untrusted", self.vault.status()["problems"])
+        fresh = vault.Vault(side="owner", state_dir=self.o.config.state_dir, folder=self.o.tmp / "fresh")
+        self.assertTrue(fresh.effective_retention()["trusted"])                  # first-time default (no approval ever) is fine
 
     def test_a_stale_verification_flag_is_rechecked_before_anything_is_pruned(self):
         from stynpilot import service
@@ -167,6 +212,19 @@ class ApprovalTests(unittest.TestCase):
         self.assertEqual((result["ok"], result["daily"], result["weekly"]), (True, 10, 6))
         self.assertEqual(self.v.effective_retention()["approved"], door.request_id(payload)[0])
         self.denied("already_decided_or_used", self.executor.challenge, payload, "approve")      # never replayable
+
+    def test_no_retention_change_is_applied_while_the_owner_side_prunes(self):
+        lease = self.executor.take_prune_lease()
+        self.denied("backup_pruning_in_progress_try_again_shortly", self.executor.challenge, self.bpayload(), "approve")
+        payload = self.bpayload(daily=12)
+        self.executor.release_prune_lease("wrong token")
+        self.denied("backup_pruning_in_progress_try_again_shortly", self.executor.challenge, payload, "approve")
+        self.executor.release_prune_lease(lease)
+        out = self.executor.challenge(payload, "approve")                      # nothing was spent while it was held
+        self.assertTrue(self.executor.backup_admin(payload, self.proof(payload, out["challenge"]), out["challenge"])["ok"])
+        self.executor.take_prune_lease()
+        self.executor._prune_lease = (self.executor._prune_lease[0], 0)          # an expired lease no longer blocks
+        self.executor.challenge(self.bpayload(daily=13), "approve")
 
     def test_out_of_range_forged_or_expired_requests_change_nothing(self):
         for bad in (self.bpayload(daily=0), self.bpayload(weekly=13), self.bpayload(daily="7"), self.bpayload(action="restore"),

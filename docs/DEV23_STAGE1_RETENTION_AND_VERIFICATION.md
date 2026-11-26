@@ -33,3 +33,13 @@
 - The monthly full check has a durable start (`full_check_at`, set at the first successful backup) and no longer depends on the
   oldest retained backup; 65 days of daily backups under normal retention run it at least twice.
 - Release versions: the package dev number increments per release (stage 1 = 0.1.0.dev23); a published version is never reused.
+
+## Second focused review
+- Durable approval evidence: every applied policy is appended (fsynced) to `policy.log` BEFORE settings.json is written. A missing
+  settings.json is the trusted built-in default only when no policy was ever approved there; otherwise it is a lost approval and
+  pruning holds (`retention_settings_untrusted`).
+- Owner/installer race closed by independently enforced coordination: the owner side prunes only inside a lease taken from the
+  installer (`vault_prune_lease`, 120 s) and only with the policy that lease returned; while a lease is held the installer refuses
+  to apply a retention change (`backup_pruning_in_progress_try_again_shortly`, checked before any approval is spent). Pruning
+  runs in the owner service itself but is index-only (the worker already re-verified the last good point); any failure holds.
+- Root side: a retention change already waits for the vault lock, so it can never change the rule under a running backup.

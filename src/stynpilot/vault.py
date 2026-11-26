@@ -58,6 +58,7 @@ OVERDUE_AFTER = 2 * DAY
 DEFAULT_RETENTION = {"daily": 7, "weekly": 4}
 RETENTION_LIMITS = {"daily": (1, 30), "weekly": (0, 12)}      # changing it is YELLOW (owner approval); these bounds always hold
 SETTINGS = "settings.json"
+POLICY_LOG = "policy.log"          # append-only, fsynced: every approved policy ever applied here (durable approval evidence)
 
 
 def valid_retention(daily, weekly):
@@ -292,7 +293,7 @@ class Vault:
     its own memory limit, so running out of memory or a crash there can never take the owner service or the installer down."""
 
     def __init__(self, *, side, state_dir, folder, extras=(), version="", clock=time.time, retention=None, aesgcm=None,
-                 space=shutil.disk_usage, isolate=False, limits=None, retention_source=None):
+                 space=shutil.disk_usage, isolate=False, limits=None, retention_source=None, prune_lease=None, prune_release=None):
         if side not in ("owner", "root"):
             raise ValueError("side")
         self.side, self.state_dir, self.folder = side, Path(state_dir), Path(folder)
@@ -301,9 +302,12 @@ class Vault:
         self.limits = dict({"gather": MAX_GATHER, "file": MAX_ONE_FILE, "extra": MAX_EXTRA, "memory": CHILD_MEMORY}, **(limits or {}))
         self.isolate = isolate
         self.retention_source = retention_source              # owner side: the installer's approved setting is the authority
-        self.policy_confirmed = retention_source is None       # owner side: only after the installer's policy was confirmed
+        self.policy_confirmed = retention_source is None       # owner side: only inside a pruning lease (see _prune_under_lease)
+        self.prune_lease = prune_lease                         # owner side: () -> {"lease": token, "policy": {...}} from the installer
+        self.prune_release = prune_release or (lambda token: None)
         self._aesgcm = aesgcm
         self._mutex = threading.Lock()
+        self._held = threading.local()
         self.key_file = self.folder / "backup-key"
         self.index_file = "index.json"
 
@@ -325,7 +329,9 @@ class Vault:
         (the owner approved a policy we cannot read; falling back to the default could delete backups it would keep)."""
         path = self.folder / SETTINGS
         if not os.path.lexists(str(path)):
-            return dict(self.retention, approved=None, at=None, trusted=True)
+            # No settings file: the built-in default is trusted ONLY if no policy was ever approved here. Once one was, a missing
+            # file means a LOST approval, and pruning holds.
+            return dict(self.retention, approved=None, at=None, trusted=not self._policy_evidence())
         try:
             data = json.loads(_read_private(path, 4096).decode())
             if (type(data) is dict and data.get("schema") == 1 and valid_retention(data.get("daily"), data.get("weekly"))
@@ -336,14 +342,31 @@ class Vault:
             pass
         return dict(self.retention, approved=None, at=None, trusted=False)
 
+    def _policy_evidence(self):
+        log = self.folder / POLICY_LOG
+        try:
+            return os.path.lexists(str(log)) and (log.is_symlink() or os.lstat(str(log)).st_size > 0)
+        except OSError:
+            return True                                    # cannot tell: treat as "a policy existed" (holds pruning)
+
     def set_retention(self, daily, weekly, request_id):
         """Store an approved retention setting atomically. Bounds are enforced here too, whatever the caller checked."""
         if not valid_retention(daily, weekly) or type(request_id) is not str or not re.fullmatch(r"[0-9a-f]{64}", request_id):
             raise VaultError("retention_invalid")
         def write():
+            fd = os.open(str(self.folder / POLICY_LOG), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                if os.fstat(fd).st_uid != os.geteuid() or os.fstat(fd).st_mode & 0o077:
+                    raise VaultError("file_not_private_or_not_ours")
+                os.write(fd, ("%s %d %d\n" % (request_id, daily, weekly)).encode())
+                os.fsync(fd)                               # the evidence is durable BEFORE the setting takes effect
+            finally:
+                os.close(fd)
             _write_atomic(self.folder, SETTINGS, json.dumps({"schema": 1, "daily": daily, "weekly": weekly, "request_id": request_id,
                                                               "at": int(self.clock())}, sort_keys=True).encode())
             return {"ok": True, "daily": daily, "weekly": weekly}
+        if getattr(self._held, "locked", False):
+            return write()                                     # already inside this vault's lock (pruning under a lease)
         with self._mutex:
             _private_folder(self.folder)
             lock = os.open(str(self.folder / ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -618,15 +641,10 @@ class Vault:
         return header, files, blobs
 
     # .. retention ..............................................................................................................
-    def _retain(self, index, protect=None):
+    def _retain(self, index, protect=None, allow_verify=True):
         skip, self._skip_retention = getattr(self, "_skip_retention", False), False
         if skip or index.get("damaged") or not self._valid_index(index):
             return []                                           # never delete anything on the strength of a doubtful index
-        retention = self.effective_retention()
-        if not retention["trusted"] or not self.policy_confirmed:
-            index["prune_held"] = "retention_settings_untrusted" if not retention["trusted"] else "retention_policy_unconfirmed"
-            return []                                           # back up and verify, but delete nothing under a doubtful policy
-        index.pop("prune_held", None)
         verified = sorted((info["created"], name) for name, info in index["backups"].items()
                           if info.get("verified_at") and (self.folder / name).is_file())
         if not verified:
@@ -635,6 +653,9 @@ class Vault:
         if complete:
             newest_complete = index["backups"][complete[-1][1]]
             if int(self.clock()) - (newest_complete.get("checked_at") or newest_complete["verified_at"]) > DAY:
+                if not allow_verify:
+                    index["prune_held"] = "newest_complete_backup_check_is_stale"
+                    return []
                 try:                                            # prune only on the strength of a FRESH check of the last good point
                     self._verify(complete[-1][1], index)
                     newest_complete["checked_at"] = int(self.clock())
@@ -643,6 +664,11 @@ class Vault:
                     newest_complete["check_error"] = str(getattr(error, "code", type(error).__name__))[:80]
                     index["prune_held"] = "newest_complete_backup_failed_its_check"
                     return []
+        retention = self.effective_retention()
+        if not retention["trusted"] or not self.policy_confirmed:
+            index["prune_held"] = "retention_settings_untrusted" if not retention["trusted"] else "retention_policy_unconfirmed"
+            return []                                           # back up and verify, but delete nothing under a doubtful policy
+        index.pop("prune_held", None)
         keep = {verified[-1][1], protect}                       # the newest VERIFIED backup (and the one just made) are never deleted
         if complete:
             keep.add(complete[-1][1])                           # ... nor the newest COMPLETE verified one, however many partial follow
@@ -683,7 +709,11 @@ class Vault:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except OSError:
                     raise VaultError("another_backup_operation_is_running") from None
-                return fn()
+                self._held.locked = True
+                try:
+                    return fn()
+                finally:
+                    self._held.locked = False
             finally:
                 os.close(lock)
 
@@ -823,31 +853,62 @@ class Vault:
                 "version": self.version, "retention": self.retention, "limits": self.limits, "op": op, "manual": manual,
                 "policy_confirmed": self.policy_confirmed}
 
+    def _adopt(self, theirs):
+        """Owner side: take over the installer's policy. True only if it is valid, trusted and consistent with what we hold."""
+        if not isinstance(theirs, dict) or theirs.get("trusted") is False or not valid_retention(theirs.get("daily"), theirs.get("weekly")):
+            return False
+        mine = self.effective_retention()
+        if theirs.get("approved"):
+            if (theirs["daily"], theirs["weekly"], theirs["approved"]) != (mine["daily"], mine["weekly"], mine["approved"]):
+                self.set_retention(theirs["daily"], theirs["weekly"], theirs["approved"])
+            return self.effective_retention()["trusted"]
+        return not self._policy_evidence()                  # we hold an approval the installer no longer reports: not consistent
+
     def _sync_retention(self):
-        """Owner side: fetch the installer's policy. Pruning is allowed only when this run confirmed it (the installer answered
-        with a valid policy: an approved one, or 'none approved' = the default)."""
+        """Owner side, before a run: keep the shown setting current (best effort). It NEVER allows pruning by itself."""
         if self.retention_source is None:
             return
-        self.policy_confirmed = False
         try:
-            theirs = self.retention_source()
+            self._adopt(self.retention_source())
         except Exception:
-            return                                             # unreachable installer: back up and verify, prune nothing
-        if not isinstance(theirs, dict) or not valid_retention(theirs.get("daily"), theirs.get("weekly")) or theirs.get("trusted") is False:
-            return
+            pass
+
+    def _prune_under_lease(self):
+        """Owner side, after a successful backup: prune only while the installer holds a LEASE that stops any retention change, and
+        only with the policy that lease returned. Index-only work (the child already refreshed the last good point's check)."""
+        if self.prune_lease is None:
+            return {"pruned": 0, "held": "retention_policy_unconfirmed"}
         try:
-            mine = self.effective_retention()
-            if theirs.get("approved"):
-                if (theirs["daily"], theirs["weekly"], theirs["approved"]) != (mine["daily"], mine["weekly"], mine["approved"]):
-                    self.set_retention(theirs["daily"], theirs["weekly"], theirs["approved"])
-            elif os.path.lexists(str(self.folder / SETTINGS)):
-                return                                         # we hold an approved setting the installer no longer reports: hold
-            self.policy_confirmed = True
+            lease = self.prune_lease()
         except Exception:
-            return
+            lease = None
+        token = lease.get("lease") if isinstance(lease, dict) else None
+        try:
+            def prune():
+                index = self._index()
+                self.policy_confirmed = bool(token) and self._adopt(lease.get("policy"))
+                try:
+                    removed = self._retain(index, allow_verify=False)
+                finally:
+                    self.policy_confirmed = False
+                self._save(index)
+                return {"pruned": len(removed), "held": index.get("prune_held")}
+            return self._guard(prune)
+        finally:
+            if token:
+                try:
+                    self.prune_release(token)
+                except Exception:
+                    pass                                     # the lease also expires by itself
 
     def _run(self, op, manual=False):
         self._sync_retention()
+        result = self._run_op(op, manual)
+        if self.retention_source is not None and op == "backup" and isinstance(result, dict) and result.get("ok"):
+            result["retention"] = self._prune_under_lease()
+        return result
+
+    def _run_op(self, op, manual=False):
         if not self.isolate:
             return self._guard(lambda: self._op(op, manual))
         with self._mutex:

@@ -137,6 +137,10 @@ def render_summary(payload):
     if payload.get("kind") == "runner":
         expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
         name = str(payload.get("name"))
+        if payload.get("action") == "settle_inference":
+            return ["Stop the fixed local Ollama pilot service and settle inference reservation %s." % name,
+                    "This can interrupt local AI and OpenCode. The service will remain stopped. No models, project files or backups are deleted.",
+                    "Only this exact reservation can be cleared, and only after StyNpilot verifies the service is inactive, its cgroup is empty and the inference port is no longer listening.", expires]
         if payload.get("action") == "setup":
             return ["Set up the sandboxed command runner (one time).",
                     "This creates a locked-down system account named stynpilot-run (no login, no sudo, no network, no groups) "

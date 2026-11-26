@@ -99,7 +99,11 @@ def infer(body, stop):
 
 class Jobs:
     """One active request globally. Volatile, bounded, caller-scoped results."""
-    def __init__(self, transport=infer, clock=time.monotonic):
+    def __init__(self, transport=infer, clock=time.monotonic, *, reserve=None, finish=None):
+        if (reserve is None) != (finish is None):
+            raise ValueError("paired activity callbacks required")
+        self._reserve = reserve
+        self._finish = finish
         self._transport = transport
         self._clock = clock
         self._lock = threading.Lock()
@@ -121,6 +125,9 @@ class Jobs:
             if len(self._jobs) >= MAX_JOBS:
                 raise LocalAIError("local_ai_results_full")
             jid = secrets.token_hex(16)
+            # The installer persists the claim before the owner service starts inference.
+            if self._reserve is not None:
+                self._reserve(jid)
             row = {"caller": caller, "state": "running", "stop": threading.Event(),
                    "finished": None, "output": None, "error": None}
             self._jobs[jid] = row
@@ -146,6 +153,14 @@ class Jobs:
         except Exception:
             error = "local_ai_unavailable"
         finally:
+            # Do not equate an HTTP disconnect with model-server quiescence.
+            # Only a complete, validated response may settle this draft claim.
+            # Cancellation, timeout, crash and uncertain completion retain it.
+            if self._finish is not None and error is None and not row["stop"].is_set():
+                try:
+                    self._finish(jid)
+                except Exception:
+                    output, error = None, "local_ai_activity_unsettled"
             with self._lock:
                 if row["stop"].is_set():
                     row["state"] = "cancelled"

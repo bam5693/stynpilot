@@ -35,6 +35,22 @@ disposable environments, never live security-critical state. Do not weaken any s
 - PRESERVE: Codex's two encrypted precautionary Dev21 archives (20,592,730 bytes total) and their separate recovery credentials;
   never include them in any retention/cleanup. All existing backups and Pi backups.
 
+## HANDOFF STATUS (2026-11-25 22:52 CT): Claude stopped development at 99% usage; development ownership -> Codex
+- Candidate: branch `claude/dev23-stage2-keys`, commit `015bb403f769002e3280de25c327684649031750` (package 0.1.0.dev24),
+  committed and pushed. Results: normal 912 passed / 5 skipped; release-sandbox emulation 910 passed / 95 skipped / 0 failed.
+- Review status: ChatGPT reviewed 28a5a7a (3 blockers) and 8ab01c0 (1 blocker + should-fixes); all corrections are in
+  015bb40, which AWAITS ChatGPT's independent review. ChatGPT handles the release (0.1.0~dev24) if approved.
+- Completed corrections: key generations never destroyed; durable owner-side hand-off; collision-safe, verified lost-key
+  preservation; fresh_key mode for lost/uncertain nonce logs; full journal validation; checked nonce writes; rotation exclusion
+  on every upgrade/release/resume path (installer, under the lock) and owner-side coordination; completion reconciliation;
+  durable preserve of identical copies.
+- Deferred (tracked): controlled key retirement after Dev24; safe owner-side pruning; stale Dev22 self-test version label;
+  fresh Dev23 backup verification live; independent published-asset verification; the deferred tracker below.
+- Next assignment for Codex: any corrections from ChatGPT's review of 015bb40 (on a `codex/` branch from it, or this branch
+  after confirming nobody else pushed); after 0.1.0~dev24 is released and verified live, Dev23 stage 3 (root restore) on a new
+  branch from the released commit, per the approved architecture below. Same review/approval rules; vacation restrictions stay.
+- Preserve: all worktrees, branches, backups, Codex's two Dev21 archives and their credentials.
+
 ## Current work: Dev23 stage 2 (secure key rotation), package 0.1.0.dev24
 - Branch `claude/dev23-stage2-keys` from the released commit a611385. See `docs/DEV23_STAGE2_KEY_ROTATION.md`.
 - Also on this branch: the retention approval summary now says plainly that owner-side automatic deletion is temporarily off.

@@ -650,6 +650,19 @@ def build_installer(config, *, jwks, jwks_loader=None, run_command=apt.real_run,
         executor_options["authority"] = build_authority(config)
     executor = Executor(state_dir=config.state_dir, owner=config.owner, device=config.device, verifier=verifier,
                         run=run_command, require_root=require_root, **executor_options)
+    # Only the installed, fixed-layout root service provisions the fence.
+    # An existing durable claim forbids silently recreating a missing fence.
+    if (require_root and config.state_dir == Path("/var/lib/stynpilot-installer")
+            and config.socket_path == Path("/run/stynpilot/installer.sock")):
+        from . import inference_fence, managed_activity
+        try:
+            inference_fence.provision(config.owner_uid, allow_create=not managed_activity.held(config.state_dir))
+        except (OSError, KeyError, managed_activity.ActivityError):
+            # Inference stays unavailable; unrelated recovery/installer
+            # functionality must not fail merely because the pilot is absent.
+            pass
+        else:
+            executor.inference_settlement_fence = lambda: inference_fence.settlement(config.owner_uid)
     return BrokerService(socket_path=config.socket_path, executor=executor, allowed_uid=config.owner_uid)
 
 

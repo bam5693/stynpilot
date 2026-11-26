@@ -82,7 +82,16 @@ class FakeBroker:
             return {"workspaces": [{"name": w, "enrolled_at": 1} for w in self.workspaces]}
         if call == "inference_claim_status":
             return {"claim": getattr(self, "inference_claim", None)}
-        if call in ("inference_claim", "inference_finish"):
+        if call == "inference_claim":
+            self.inference_claim = {"kind": "inference", "job_id": args["job_id"]}
+            return {"ok": True}
+        if call == "inference_validate":
+            if (not self.gate or "local-ai-pilot" not in self.workspaces or
+                    getattr(self, "inference_claim", None) != {"kind": "inference", "job_id": args["job_id"]}):
+                raise Refused("activity_claim_changed")
+            return {"ok": True}
+        if call == "inference_finish":
+            self.inference_claim = None
             return {"ok": True}
         if call == "run":
             return {"job_id": "a" * 32, "argv": ["/usr/bin/git"], "limits": {}}

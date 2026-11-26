@@ -175,3 +175,37 @@ class LocalAITests(unittest.TestCase):
         jid=jobs.submit(CALLER,"test",authorize=authorize)["job_id"]
         self.assertNotIn("output",self.wait(jobs,jid,"cancelled"))
         self.assertEqual(finished,[])
+
+
+    def test_worker_lease_spans_reservation_transport_and_finish(self):
+        from contextlib import contextmanager
+        calls=[]
+        @contextmanager
+        def lease():
+            calls.append("lease_enter")
+            try:
+                yield
+            finally:
+                calls.append("lease_exit")
+        def transport(body,stop):
+            calls.append("transport")
+            return "ok"
+        jobs=ai.Jobs(transport, reserve=lambda _:calls.append("reserve"),
+                     finish=lambda _:calls.append("finish"), worker_lease=lease)
+        jid=jobs.submit(CALLER,"test")["job_id"]
+        self.wait(jobs,jid,"done")
+        self.assertEqual(calls,["lease_enter","reserve","transport","finish","lease_exit"])
+
+    def test_missing_lease_prevents_reservation_and_transport(self):
+        from contextlib import contextmanager
+        @contextmanager
+        def lease():
+            raise ai.LocalAIError("inference_fence_unavailable")
+            yield
+        with patch("stynpilot.local_ai.infer") as transport:
+            claims=[]
+            jobs=ai.Jobs(transport,reserve=claims.append,finish=lambda _:None,worker_lease=lease)
+            with self.assertRaises(ai.LocalAIError):
+                jobs.submit(CALLER,"test")
+            self.assertEqual(claims,[])
+            transport.assert_not_called()

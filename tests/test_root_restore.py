@@ -411,7 +411,20 @@ class ApprovalBoundaryTests(unittest.TestCase):
             self.assertFalse(result["result"]["ok"])
             self.assertEqual(result["result"]["stopped"], "inference_quiescence_unverified")
         self.assertTrue(managed_activity.held(self.ex.dir))
+        # The failed, spent settlement changes the security history. The old
+        # restore preview must be rejected; a fresh valid preview must still
+        # be blocked by the durable activity claim before spending its proof.
+        self.assertEqual(self.decide()["error"], "backup_request_invalid")
+        preview = self.door.handle({"op": "restore_preview", "archive": self.payload["archive"]})
+        self.assertTrue(preview["ok"], preview)
+        self.payload = dict(preview["result"], kind="backup", action="restore_root", side="root",
+                            owner=self.ex.owner, device=self.ex.device, expires_at="2099-01-01T00:00:00Z")
+        self.rid = request_id(self.payload)[0]
+        reply = self.door.handle({"op": "challenge", "payload": self.payload, "decision": "approve"})
+        self.assertTrue(reply["ok"], reply)
+        self.challenge = reply["challenge"]["challenge"]
         self.assertEqual(self.decide()["error"], "restore_requires_idle_managed_activity")
+        self.assertEqual(self.ex.status(self.rid)["state"], "not_started")
 
     def test_unspent_intent_recovers_without_stopping_installer(self):
         with mock.patch.object(self.ex.runs, "consume", side_effect=PowerLoss()), self.assertRaises(PowerLoss):

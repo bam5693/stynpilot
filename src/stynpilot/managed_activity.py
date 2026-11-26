@@ -74,6 +74,33 @@ def claim(state, kind, job):
     _sync(state)
 
 
+def current(state):
+    """Return only validated claim identity, never caller-provided evidence."""
+    try:
+        fd = os.open(path(state), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if held(state):
+            raise ActivityError("activity_claim_unreadable") from None
+        return None
+    except OSError:
+        raise ActivityError("activity_claim_unreadable") from None
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 64):
+            raise ActivityError("activity_claim_mismatch")
+        raw = os.read(fd, 65)
+        try:
+            kind, job = raw.decode("ascii").rstrip("\n").split(":")
+        except (ValueError, UnicodeError):
+            raise ActivityError("activity_claim_mismatch") from None
+        if raw != _record(kind, job):
+            raise ActivityError("activity_claim_mismatch")
+        return {"kind": kind, "job_id": job}
+    finally:
+        os.close(fd)
+
+
 def finish(state, kind, job):
     """Clear only the exact claim after the trusted controller proves completion."""
     expected = _record(kind, job)

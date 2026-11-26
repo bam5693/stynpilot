@@ -24,7 +24,11 @@ _LOG = logging.getLogger("stynpilot.audit")
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 NOT_AUTHORIZED = {"ok": False, "error": "device_unavailable_or_not_authorized"}
 CALLS_PER_MINUTE = 60
-DIAG_TOOLS = ("computer_diagnostics", "computer_system_status", "computer_logs", "files_list", "files_stat", "files_read", "files_search")
+DIAG_TOOLS = ("computer_diagnostics", "computer_system_status", "computer_logs", "files_list", "files_stat", "files_read", "files_search",
+              "backup_status", "commander_backup_now", "commander_backup_drill")
+# GREEN but not read-only: makes a NEW encrypted backup or a scratch restore inside the vaults; never touches live state, never
+# returns contents, keys or credentials; rate limited inside the vault (10 min per backup, 1 h per drill).
+SAFE_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
 
 
 class RateLimit:
@@ -47,7 +51,7 @@ class RateLimit:
             return True
 
 
-def register(server, *, router, bearer, policy, diagnostics=None, limiter=None, system=None):
+def register(server, *, router, bearer, policy, diagnostics=None, limiter=None, system=None, vault=None, broker=None):
     diagnostics = diagnostics or Diagnostics()
     system = system or SystemStatus()
     limiter = limiter or RateLimit()
@@ -93,6 +97,35 @@ def register(server, *, router, bearer, policy, diagnostics=None, limiter=None, 
                               "not readable from Linux) and StyNpilot backup status with the newest backup verified. Changes nothing."))
     def computer_system_status(device_id: str) -> dict:
         return guarded("computer_system_status", device_id, system.report)
+
+    def both(owner_call, root_call):
+        """The owner side here, then the root side through the installer (each side only ever reads its own vault)."""
+        result = {"owner": owner_call() if vault is not None else {"healthy": False, "problems": ["owner_vault_not_running"]}}
+        try:
+            result["root"] = root_call() if broker is not None else {"healthy": False, "problems": ["installer_not_connected"]}
+        except Exception:
+            result["root"] = {"healthy": False, "problems": ["installer_unreachable"]}
+        return result
+
+    @server.tool(name="backup_status", title="Backup health", annotations=READ_ONLY,
+                 description=("Read-only health of StyNpilot's encrypted daily backups, for the owner side and the root installer side: "
+                              "newest verified backup, last attempt and error, last recovery drill, retention, free space and problems "
+                              "(overdue, missing key, corruption, low storage, failed drill). Metadata only: never contents or keys."))
+    def backup_status(device_id: str) -> dict:
+        return guarded("backup_status", device_id, lambda: both(vault.status, broker.vault_status))
+
+    @server.tool(name="commander_backup_now", title="Make a verified backup now", annotations=SAFE_WRITE,
+                 description=("Make a new encrypted backup of the owner side and then the root side, and verify each. Old backups are "
+                              "thinned by the retention rule; the newest verified one is never deleted. Rate limited (one per 10 minutes)."))
+    def backup_now(device_id: str) -> dict:
+        return guarded("commander_backup_now", device_id,
+                       lambda: both(lambda: vault.backup_now(manual=True), broker.vault_backup))
+
+    @server.tool(name="commander_backup_drill", title="Test-restore the newest backup", annotations=SAFE_WRITE,
+                 description=("Recovery drill: restore the newest verified backup of each side into a fresh private scratch folder, "
+                              "check every file and database, then delete the scratch copy. Live state is never touched. One per hour."))
+    def backup_drill(device_id: str) -> dict:
+        return guarded("commander_backup_drill", device_id, lambda: both(lambda: vault.drill(manual=True), broker.vault_drill))
 
     @server.tool(name="computer_logs", title="Read service logs", annotations=READ_ONLY,
                  description=("Read recent systemd journal lines for ONE unit (for example stynpilot-installer.service, "

@@ -148,11 +148,15 @@ class OwnerService:
     _stop: object = None
     _thread: object = None
     unreachable_since: dict = None
+    vault: object = None
+    _vault_stop: object = None
 
     def __post_init__(self):
         self.unreachable_since = {}
 
     def stop(self):
+        if self._vault_stop is not None:
+            self._vault_stop.set()
         if self._stop is not None:
             self._stop.set()
         if self._thread is not None:
@@ -215,6 +219,40 @@ def _installed_stynpilot_version():
     return out.strip() or "unknown"
 
 
+def owner_vault(config, *, settings_path=None, **kw):
+    """The owner side's encrypted daily backups: owner state + owner settings + pairing database + project roots."""
+    from . import __version__, vault
+    settings = Path(settings_path or os.path.expanduser("~/.config/stynpilot/owner.json"))
+    extras = [("owner.json", settings, "json"), ("pairing.sqlite3", config.pairing_db, "sqlite"),
+              ("read-roots.json", config.state_dir / PROJECT_ROOTS_FILE, "json")]
+    return vault.Vault(side="owner", state_dir=config.state_dir, folder=config.state_dir / "vault", extras=extras,
+                       version=__version__, **kw)
+
+
+def root_vault_extras(config_path, state_dir):
+    """What the root vault adds to the installer's own records. Deliberately NOT here: /var/lib/stynpilot/release/ (the release
+    signing key and the GitHub token) -- those are recovered by rotation, never from a backup."""
+    from . import release
+    etc = Path(config_path).parent
+    extras = [(name, etc / name, "json") for name in ("installer.json", PASSKEY_SETTINGS_NAME, RELEASE_SETTINGS_NAME)]
+    extras.append(("trusted-release-keys.json", release.ADDENDUM_FILE, "json"))
+    tx = Path(state_dir) / "release-tx"
+    if tx.is_dir() and not tx.is_symlink():
+        extras += [("release-tx/" + p.name, p, "json") for p in sorted(tx.glob("*.json"))[:200]]
+    return extras
+
+
+def root_vault(config_path, config, **kw):
+    from . import __version__, vault
+
+    class _Extras:                                     # re-read every run, so new release records are included
+        def __iter__(self):
+            return iter(root_vault_extras(config_path, config.state_dir))
+    v = vault.Vault(side="root", state_dir=config.state_dir, folder=config.state_dir / "vault", extras=(), version=__version__, **kw)
+    v.extras = _Extras()
+    return v
+
+
 def _owner_backup_before_upgrade(state):
     """Before an upgrade runs, save the owner's own records (request queue, revocations) with integrity hashes."""
     def before(payload, rid):
@@ -231,7 +269,7 @@ def _owner_backup_before_upgrade(state):
 
 def start_owner_service(config, *, broker=None, exchange=None, start_listener=None, start_mcp=None, tokens=None,
                         clock=time.time, monotonic=time.monotonic, reconcile_interval=5.0, give_up_after=600.0,
-                        resolve_apt=None):
+                        resolve_apt=None, vault=None, backups=True):
     """Assemble and start the owner side. The keyword hooks are for tests; production passes none."""
     import threading
     from .approval_web import token_exchange
@@ -283,16 +321,21 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
         from .diagnostics import Diagnostics
         from .system_status import SystemStatus
         home = os.path.expanduser("~")
+        service.vault = vault or owner_vault(config)
         diag = dict(policy=safefs.Policy(home=home,
                                          project_roots=safefs.load_project_roots(state / PROJECT_ROOTS_FILE, home),
                                          extra_deny=[config.state_dir, config.pairing_db, config.broker_socket]),
-                    diagnostics=Diagnostics(), system=SystemStatus(backup_dir=config.state_dir.parent))
+                    diagnostics=Diagnostics(), system=SystemStatus(backup_dir=config.state_dir / "backups", vault=service.vault),
+                    vault=service.vault, broker=broker)
         runner_tools = dict(broker=broker, projects_dir=os.path.join(home, "StyNpilot-Projects"))
         service.mcp = (start_mcp or run.start)(router=router, public_host=config.mcp_public_host,
                                                port=config.mcp_port, propose=propose, diag=diag, runner=runner_tools)
     except Exception:
         service.stop()
         raise
+    if backups:
+        from . import vault as _vault
+        service._vault_stop, _ = _vault.start_scheduler(service.vault)   # first backup shortly after start; never raises
     if waiting:
         stop, thread = threading.Event(), None
 
@@ -518,6 +561,9 @@ def main(argv=None):                                       # pragma: no cover - 
         config = InstallerConfig.from_file(args.config)
         service = build_installer(config, jwks=fetch_jwks(config.issuer),
                                   jwks_loader=lambda: fetch_jwks(config.issuer))     # rotation: only on an unknown key ID
+        from . import vault as _vault
+        service.vault = root_vault(args.config, config)
+        _vault.start_scheduler(service.vault)                 # first backup shortly after start, then hourly checks; never raises
         service.serve_forever()
         return 0
     if args.role == "passkeys":

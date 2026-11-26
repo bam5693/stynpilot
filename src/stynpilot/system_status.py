@@ -68,9 +68,10 @@ def _settings(text, keys):
 
 class SystemStatus:
     def __init__(self, *, run=real_run, sys_root="/sys", reboot_flag="/var/run/reboot-required", backup_dir=None, uid=None,
-                 clock=time.time):
+                 clock=time.time, vault=None):
         self.run, self.sys, self.reboot_flag = run, Path(sys_root), reboot_flag
         self.backup_dir, self.uid, self.clock = (Path(backup_dir) if backup_dir else None), (os.getuid() if uid is None else uid), clock
+        self.vault = vault
 
     def _read(self, path, limit=200):
         try:
@@ -175,10 +176,16 @@ class SystemStatus:
                 "because_of": sorted({_clean(p, 40) for p in pkgs.split()})[:20] if pkgs else []}
 
     def backups(self):
+        out = self._legacy_backups()
+        if self.vault is not None:
+            out = {"encrypted_daily": self.vault.status(), "pre_upgrade_copies": out}
+        return out
+
+    def _legacy_backups(self):
         if not self.backup_dir:
             return {"unavailable": "no_backup_folder_configured"}
         try:
-            found = sorted(self.backup_dir.glob("stynpilot-backup-*.tar"), key=lambda p: p.stat().st_mtime, reverse=True)
+            found = sorted(list(self.backup_dir.glob("stynpilot-backup-*.tar")) + list(self.backup_dir.glob("pre-upgrade-*.tar")), key=lambda p: p.stat().st_mtime, reverse=True)
         except OSError:
             return {"unavailable": "backup_folder_unreadable"}
         rows = []

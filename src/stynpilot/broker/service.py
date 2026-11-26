@@ -118,6 +118,13 @@ class BrokerService:
                     return {"ok": True, "result": self.executor.release_resume(message.get("request_id"))}
                 finally:
                     self._busy.release()
+            if op in ("vault_status", "vault_backup", "vault_drill"):
+                vault = getattr(self, "vault", None)
+                if vault is None:
+                    return {"ok": True, "result": {"side": "root", "healthy": False, "problems": ["root_vault_not_running"]}}
+                call = {"vault_status": vault.status, "vault_backup": lambda: vault.backup_now(manual=True),
+                        "vault_drill": lambda: vault.drill(manual=True)}[op]
+                return {"ok": True, "result": call()}
             if op == "runner":
                 return {"ok": True, "result": self.executor.runner_call(message.get("call"), message.get("args"))}
             if op in ("install", "rollback", "upgrade", "release", "deny", "runner_admin", "passkey_admin"):
@@ -271,6 +278,15 @@ class BrokerClient:
 
     def release_prepare(self, commit, version):
         return self._ask({"op": "release_prepare", "commit": commit, "version": version}, 30)["result"]
+
+    def vault_status(self):
+        return self._ask({"op": "vault_status"}, 30)["result"]
+
+    def vault_backup(self):
+        return self._ask({"op": "vault_backup"}, 900)["result"]
+
+    def vault_drill(self):
+        return self._ask({"op": "vault_drill"}, 900)["result"]
 
     def release_status(self, commit):
         return self._ask({"op": "release_status", "commit": commit}, 30)["result"]

@@ -16,7 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import backup, statelock, vault
+from . import backup, managed_activity, statelock, vault
 from .broker.passkeys import _append_audit
 from .requests import request_id
 
@@ -198,6 +198,10 @@ def matches(payload, details):
 
 def wake(state, rid, payload):
     """Durably reserve the gate. Only a matching atomic proof spend lets the worker advance."""
+    try:
+        managed_activity.require_idle(state)
+    except managed_activity.ActivityError as error:
+        raise ERROR(error.code) from None
     root = _folder(control(state))
     if request_id(payload)[0] != rid or not HEX.fullmatch(rid):
         raise ERROR("restore_authorization_mismatch")
@@ -397,6 +401,10 @@ def worker(v, services, checkpoint=lambda phase: None):
         barrier = statelock._open(state, "restore-admission.lock")
         try:
             fcntl.flock(barrier, fcntl.LOCK_SH)
+            try:
+                managed_activity.require_idle(state)
+            except managed_activity.ActivityError as error:
+                raise ERROR(error.code) from None
         finally:
             os.close(barrier)
         journal = _read(pending)

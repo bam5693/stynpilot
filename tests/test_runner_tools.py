@@ -119,6 +119,7 @@ class RunnerToolTests(unittest.TestCase):
         self.broker = FakeBroker()
         from contextlib import nullcontext
         from unittest.mock import Mock
+        self.lab_probe = Mock(return_value={"launch_enabled": False, "preflight_checks_passed": True})
         self.readiness = Mock(return_value={"resource_checks_passed": True})
         self.limiter = RateLimit(per_minute=1000)
         self.router, self.clients = router, clients
@@ -126,7 +127,8 @@ class RunnerToolTests(unittest.TestCase):
                                     propose=dict(clients=clients, store=self.store, approval_url="https://ryzen.example.test/app",
                                                  clock=lambda: self.now[0]),
                                     runner=dict(broker=self.broker, projects_dir=str(self.projects), clock=lambda: self.now[0],
-                                                limiter=self.limiter, inference_readiness_probe=self.readiness,
+                                                limiter=self.limiter, lab_probe=self.lab_probe,
+                                                inference_readiness_probe=self.readiness,
                                                 inference_worker_lease=nullcontext))
 
     def call(self, name, arguments, token="chatgpt"):
@@ -262,6 +264,18 @@ class RunnerToolTests(unittest.TestCase):
         outs = [self.call("runner_status", self.d()) for _ in range(5)]
         self.assertEqual([o["ok"] for o in outs], [True, True, True, False, False])
         self.assertEqual(outs[-1]["error"], "rate_limited_try_again_in_a_minute")
+
+    def test_lab_status_is_read_only_and_not_launch_authority(self):
+        names = {t.name for t in asyncio.run(self.server.list_tools())}
+        self.assertIn("dev_lab_status", names)
+        self.assertNotIn("dev_lab_start", names)
+        out = self.call("dev_lab_status", self.d(), "readonly")
+        self.assertTrue(out["ok"], out)
+        self.assertFalse(out["result"]["launch_enabled"])
+        self.assertFalse(self.call("dev_lab_status", self.d(), "stranger")["ok"])
+        self.assertFalse(self.call("dev_lab_status", {"device_id": "dtdev_OTHER"})["ok"])
+        self.lab_probe.assert_called_once_with()
+        self.assertEqual(self.broker.calls, [])
 
 
     # -- local inference: real MCP handlers, synthetic identity and model transport -------------------------------

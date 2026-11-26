@@ -115,7 +115,7 @@ def issuer():
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
-def setup():
+def setup(*, check_restore_path=True):
     issuer()
     ETC.mkdir(mode=0o700, exist_ok=True)
     write(ETC / "installer.json", {"issuer": ISSUER, "approval_client_id": "fixture", "owner": OWNER,
@@ -154,6 +154,8 @@ def setup():
         subprocess.run(["journalctl", "-b", "_SYSTEMD_USER_UNIT=stynpilot-owner.service", "--no-pager", "-n", "60"], check=False)
         raise
     write(STATE / "runner-enabled.json", {"enabled": True})
+    if not check_restore_path:
+        return None
     # Confirm real packaged path dispatch independently from the approved run.
     control = STATE / "restore-control"
     control.mkdir(mode=0o700, exist_ok=True)

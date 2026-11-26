@@ -234,6 +234,45 @@ class RestoreTests(unittest.TestCase):
             self.assertFalse(complete_checks(dict(result, **changes), __version__.replace(".dev", "~dev")))
 
 
+    def test_enospc_releases_reserved_blocks_for_durable_safe_state(self):
+        import errno
+        self.approve()
+        reserve = rr.control(self.state) / rr.RESERVE
+        self.assertGreaterEqual(reserve.stat().st_blocks * 512, rr.RESERVE_BYTES)
+        original = rr._manifest_hash(self.state)
+        real_write = rr._write
+
+        def full_write(path, data):
+            if reserve.exists() and (path.name == "safe.json" or isinstance(data, dict) and data.get("phase") == "verify_original"):
+                raise OSError(errno.ENOSPC, "filesystem full")
+            return real_write(path, data)
+
+        with mock.patch.object(rr, "_write", full_write), mock.patch.object(rr, "_trees",
+                  side_effect=OSError(errno.ENOSPC, "filesystem full")), self.assertRaises(OSError):
+            self.work()
+        self.assertFalse(reserve.exists())
+        self.assertFalse((rr.control(self.state) / "pending.json").exists())
+        self.assertTrue((rr.control(self.state) / "safe.json").exists())
+        self.assertEqual(rr._manifest_hash(self.state), original)
+        self.assertFalse(rr.safe_reply(self.state, {"op": "runner", "call": "status"})["result"]["gate_open"])
+
+    def test_repeated_worker_loss_reuses_safety_and_latches_safe_mode(self):
+        self.approve()
+        before = rr._manifest_hash(self.state)
+        with mock.patch.object(rr, "_trees", side_effect=PowerLoss):
+            for _ in range(3):
+                with self.assertRaises(PowerLoss):
+                    self.work()
+        self.assertEqual(len(list(self.tx.glob("*.stynvault"))), 1)
+        self.assertEqual(len(list(self.v.folder.glob("*.stynvault"))), 2)
+        with self.assertRaisesRegex(rr.ERROR, "restore_worker_retry_limit"):
+            self.work()
+        self.assertEqual(rr._manifest_hash(self.state), before)
+        self.assertFalse((self.tx / "staging").exists())
+        self.assertFalse((rr.control(self.state) / "pending.json").exists())
+        self.assertTrue(rr.held(self.state))
+
+
 class ApprovalBoundaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

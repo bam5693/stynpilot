@@ -4,6 +4,7 @@ The root vault, authority databases, service settings and recovery journal stay 
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -27,6 +28,9 @@ HEX = re.compile(r"[0-9a-f]{64}\Z")
 FIELDS = {"archive", "sha256", "scope", "security_sha256", "generation", "created", "version", "settings_differences"}
 ENVELOPE = {"kind", "action", "side", "device", "owner", "expires_at"}
 ERROR = vault.VaultError
+RESERVE_BYTES = 1 << 20
+RESERVE = "emergency.reserve"
+SPACE_ERRORS = (errno.ENOSPC, errno.EDQUOT)
 
 
 def control(state):
@@ -196,6 +200,22 @@ def matches(payload, details):
                                                   for k, val in details.items()))
 
 
+def _reserve(root):
+    path = root / RESERVE
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        os.posix_fallocate(fd, 0, RESERVE_BYTES)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    vault._fsync_dir(root)
+
+
+def _release_reserve(root):
+    (root / RESERVE).unlink(missing_ok=True)
+    vault._fsync_dir(root)
+
+
 def wake(state, rid, payload):
     """Durably reserve the gate. Only a matching atomic proof spend lets the worker advance."""
     try:
@@ -210,6 +230,7 @@ def wake(state, rid, payload):
         if _read(pending)["rid"] != rid:
             raise ERROR("restore_journal_conflict")
         return
+    _reserve(root)
     _write(pending, {"rid": rid, "phase": "approved"})
 
 
@@ -238,21 +259,48 @@ def _stage(v, payload, tx):
     if vault._file_sha(v.folder / payload["archive"]) != payload["sha256"]:
         raise ERROR("approved_archive_changed")
     index = v._index()
-    name = v._create(index)
-    _, live, safety_blobs, meta = v._verify(name, index, with_metadata=True)
+    plan = tx / "safety-plan.json"
+    if not plan.exists():
+        name = v._backup_name()
+        if name in index["backups"] or os.path.lexists(v.folder / name):
+            raise ERROR("backup_name_unavailable")
+        _write(plan, {"archive": name})
+    name = _read(plan)["archive"]
+    if not isinstance(name, str) or not vault.NAME.fullmatch(name) or not name.startswith("root-"):
+        raise ERROR("invalid_safety_backup_plan")
+    safety = tx / name
+    encrypted = v.folder / name
+    if not os.path.lexists(encrypted):
+        if os.path.lexists(safety):
+            raise ERROR("verified_safety_backup_changed")
+        v._create(index, name=name)
+    evidence = tx / "safety.json"
+    if evidence.exists():
+        _check_safety(tx, expected=name)
+    header, live, safety_blobs, meta = v._verify(name, index, with_metadata=True)
     del safety_blobs
-    _, archive, archive_blobs = selected(v, payload["archive"])
-    del archive_blobs
     if meta.get("incomplete") != []:
         raise ERROR("incomplete_safety_backup")
-    index["backups"][name]["verified_at"] = int(v.clock())
+    if not os.path.lexists(safety):
+        # A separate hard link keeps the exact verified encrypted inode outside retention and rotation.
+        os.link(encrypted, safety)
+        vault._fsync_dir(tx)
+    if not encrypted.samefile(safety):
+        raise ERROR("verified_safety_backup_changed")
+    if not evidence.exists():
+        _write(evidence, {"archive": name, "sha256": vault._file_sha(safety)})
+    # Recover the index if the worker died after the durable ciphertext but before indexing it.
+    index["backups"][name] = {"created": header["created"], "size": encrypted.stat().st_size,
+                              "verified_at": int(v.clock()), "excluded": meta["excluded"], "incomplete": []}
     v._save(index)
-    # A separate hard link keeps the exact verified encrypted inode outside retention and key rotation.
-    safety = tx / name
-    os.link(v.folder / name, safety)
-    vault._fsync_dir(tx)
-    _write(tx / "safety.json", {"archive": name, "sha256": vault._file_sha(safety)})
-    with tempfile.TemporaryDirectory(dir=tx) as tmp:
+    _, archive, archive_blobs = selected(v, payload["archive"])
+    del archive_blobs
+    scratch = tx / "staging"
+    if scratch.exists():
+        shutil.rmtree(scratch)
+    _folder(scratch)
+    try:
+        tmp = scratch
         stage = Path(tmp) / "new"
         _folder(stage)
         # Keep unresolved current attention and all snapshots needed by current or recovered ledger rows.
@@ -286,12 +334,15 @@ def _stage(v, payload, tx):
             if source.exists():
                 vault._write_atomic(tx, "archived-" + name, source.read_bytes())
         _rename(stage, tx / "new")
+    finally:
+        shutil.rmtree(scratch)
 
 
-def _check_safety(tx):
+def _check_safety(tx, *, expected=None):
     evidence = _read(tx / "safety.json")
     name = evidence["archive"]
-    if (not vault.NAME.fullmatch(name) or not name.startswith("root-")
+    if ((expected is not None and name != expected)
+            or not isinstance(name, str) or not vault.NAME.fullmatch(name) or not name.startswith("root-")
             or vault._file_sha(tx / name) != evidence["sha256"]):
         raise ERROR("verified_safety_backup_changed")
 
@@ -391,10 +442,12 @@ def worker(v, services, checkpoint=lambda phase: None):
     if not pending.exists():
         return
     fd = statelock._take(root, "worker.lock", fcntl.LOCK_EX, "restore_worker_running")
+    journal, rid = {}, None
     try:
         if (root / "safe.json").exists():
             services.start_safe()
             _rename(pending, root / "stalled.json")
+            _release_reserve(root)
             return
         # The path unit can wake immediately after the intent is written, before the SQLite proof spend.
         # Wait for the approving socket call (or its death) before inspecting its durable decision.
@@ -416,7 +469,7 @@ def worker(v, services, checkpoint=lambda phase: None):
                 evidence["probe"] = secrets.token_hex(32)
             else:
                 journal.pop("probe", None)
-            journal.update(phase=name, **evidence)
+            journal.update(phase=name, worker_attempts=1, **evidence)
             _write(pending, journal)
             checkpoint(name)
         def settle(success, outcome):
@@ -427,13 +480,13 @@ def worker(v, services, checkpoint=lambda phase: None):
                            ("done" if success else "failed", json.dumps(result), time.time(), rid, KIND))
             _write(root / rid / "outcome.json", result)
             pending.unlink()
-            vault._fsync_dir(root)
+            _release_reserve(root)
 
         with _db(state / "runs.sqlite3") as db:
             row = db.execute("SELECT state,result FROM runs WHERE request_id=? AND kind=?", (rid, KIND)).fetchone()
         if not row and journal["phase"] == "approved":
             pending.unlink()    # process died before spending the proof. Nothing was stopped or replaced.
-            vault._fsync_dir(root)
+            _release_reserve(root)
             return
         if not row:
             raise ERROR("missing_spent_restore_authorization")
@@ -441,6 +494,11 @@ def worker(v, services, checkpoint=lambda phase: None):
         if step in ("done", "rolled_back") and row[0] in ("done", "failed"):
             settle(step == "done", step)
             return
+        attempts = journal.get("worker_attempts", 0)
+        if type(attempts) is not int or not 0 <= attempts < (3 if step == "prepare" else 8):
+            raise ERROR("restore_worker_retry_limit")
+        journal["worker_attempts"] = attempts + 1
+        _write(pending, journal)
         payload = json.loads(row[1])
         if row[0] != "restore_queued" or request_id(payload)[0] != rid:
             raise ERROR("restore_authorization_mismatch")
@@ -513,12 +571,23 @@ def worker(v, services, checkpoint=lambda phase: None):
                       error=getattr(error, "code", "restore_" + type(error).__name__))
     except Exception as error:
         safe = {"error": getattr(error, "code", "recovery_" + type(error).__name__), "rid": locals().get("rid")}
-        _write(root / "safe.json", safe)
+        try:
+            _write(root / "safe.json", safe)
+        except OSError as storage:
+            if storage.errno not in SPACE_ERRORS:
+                raise
+            _release_reserve(root)
+            _write(root / "safe.json", safe)
+        if isinstance(journal, dict) and journal.get("phase") == "prepare" and isinstance(rid, str) and HEX.fullmatch(rid):
+            scratch = root / rid / "staging"
+            if scratch.is_dir():
+                shutil.rmtree(scratch)
         # The safe marker is sufficient for status even if the authorization database is unreadable.
         # Keep the trigger until the recovery socket can be started.
         services.start_safe()
         if pending.exists():
             _rename(pending, root / "stalled.json")
+        _release_reserve(root)
         raise
     finally:
         os.close(fd)

@@ -5,13 +5,75 @@ import fcntl
 import os
 from pathlib import Path
 import resource
+import selectors
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
 
 GIB = 1 << 30
 DEFAULT = Path.home() / ".local/share/stynpilot-dev"
+LOG_LIMIT = 8 << 20
+
+
+def boot(command, env, serial_path, log, marker, deadline, *, cut_power=False):
+    marker_line = marker.encode("ascii")
+    if time.monotonic() >= deadline:
+        return 124
+    with (serial_path.open("wb") as serial,
+          selectors.DefaultSelector() as selector,
+          subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process):
+        selector.register(process.stdout, selectors.EVENT_READ, serial)
+        selector.register(process.stderr, selectors.EVENT_READ, log)
+        saw_marker = False
+        line = b""
+        overlong_line = False
+        try:
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return 124
+                for key, _ in selector.select(remaining):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fd)
+                        continue
+                    output = key.data
+                    room = LOG_LIMIT - output.tell()
+                    output.write(chunk[:room])
+                    if len(chunk) > room:
+                        return 125
+                    if output is log:
+                        continue
+                    parts = chunk.split(b"\n")
+                    for part in parts[:-1]:
+                        if not overlong_line and line + part in (marker_line, marker_line + b"\r"):
+                            saw_marker = True
+                            if cut_power:
+                                if process.poll() is not None:
+                                    return 1
+                                process.kill()
+                                return 0 if process.wait() == -signal.SIGKILL else 1
+                        line = b""
+                        overlong_line = False
+                    if not overlong_line:
+                        line += parts[-1]
+                        if len(line) > len(marker_line) + 1:
+                            line = b""
+                            overlong_line = True
+            exit_code = process.wait(timeout=max(0, deadline - time.monotonic()))
+            return exit_code or (0 if saw_marker and not cut_power else 1)
+        except subprocess.TimeoutExpired:
+            return 124
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+
+def _terminate(signum, _frame):
+    raise SystemExit(128 + signum)
 
 
 def main():
@@ -23,6 +85,9 @@ def main():
     parser.add_argument("--marker", required=True, help="Expected serial output on successful shutdown")
     parser.add_argument("--timeout", type=int, default=900, metavar="60..3600")
     args = parser.parse_args()
+    for marker in (args.marker, args.power_cycle_marker):
+        if marker is not None and (not marker.isascii() or not marker.isidentifier() or len(marker) > 128):
+            parser.error("markers must be ASCII identifiers of up to 128 characters")
     if not 60 <= args.timeout <= 3600:
         parser.error("timeout must be 60 to 3600 seconds")
     if os.geteuid() == 0:
@@ -64,7 +129,7 @@ def main():
             command = [prepared / "bin/qemu-system-x86_64", "-L", prepared / "share/qemu", "-enable-kvm",
                        "-cpu", "host", "-smbios", "type=1,product=STYNPILOT-DISPOSABLE", "-smp", "2", "-m", "3072", "-machine", "q35",
                        "-bios", prepared / "share/ovmf/OVMF.fd", "-nic", "none", "-display", "none", "-vga", "none",
-                       "-serial", f"file:{result / 'serial.log'}", "-monitor", "none", "-no-reboot",
+                       "-serial", "stdio", "-monitor", "none", "-no-reboot",
                        "-drive", f"file={overlay},if=virtio,format=qcow2"]
             for iso in (args.seed, args.payload):
                 if iso:
@@ -72,45 +137,17 @@ def main():
                     if "," in str(path) or not path.is_file():
                         parser.error("ISO must be a regular file with a comma-free path")
                     command += ["-drive", f"file={path},media=cdrom,format=raw,readonly=on"]
-            with (result / "qemu.log").open("w") as log:
-                try:
-                    if args.power_cycle_marker:
-                        serial_path = result / "serial.log"
-                        with subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log) as first:
-                            try:
-                                deadline = time.monotonic() + args.timeout
-                                cursor = 0
-                                interrupted = False
-                                while first.poll() is None and time.monotonic() < deadline:
-                                    if serial_path.exists():
-                                        with serial_path.open(errors="replace") as serial:
-                                            serial.seek(cursor)
-                                            while line := serial.readline():
-                                                if not line.endswith("\n"):
-                                                    break
-                                                cursor = serial.tell()
-                                                if args.power_cycle_marker in line:
-                                                    first.kill()
-                                                    interrupted = True
-                                                    first.wait()
-                                                    break
-                                    time.sleep(0.2)
-                                if not interrupted or first.returncode != -9:
-                                    return 1
-                            finally:
-                                if first.poll() is None:
-                                    first.kill()
-                        serial_path.rename(result / "before-power-cut.log")
-                    process = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
-                                             stdout=log, stderr=log, timeout=args.timeout)
-                except subprocess.TimeoutExpired:
-                    return 124
-        if process.returncode:
-            return process.returncode
-        with (result / "serial.log").open(errors="replace") as serial:
-            return 0 if any(args.marker in line for line in serial) else 1
+            deadline = time.monotonic() + args.timeout
+            with (result / "qemu.log").open("wb") as log:
+                if args.power_cycle_marker:
+                    status = boot(command, env, result / "before-power-cut.log", log,
+                                  args.power_cycle_marker, deadline, cut_power=True)
+                    if status:
+                        return status
+                return boot(command, env, result / "serial.log", log, args.marker, deadline)
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _terminate)
     resource.setrlimit(resource.RLIMIT_FSIZE, (18 * GIB, 18 * GIB))
     raise SystemExit(main())

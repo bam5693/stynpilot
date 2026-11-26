@@ -10,6 +10,8 @@ Run the lab from a normal account on Ubuntu with working KVM access and Bubblewr
 
 The guest uses two vCPUs, 3 GiB of guest RAM, a 16 GiB virtual drive, serial logging, and a single-run lock. The launcher checks host memory and disk headroom, verifies the base image, attaches artifact media read-only, disables the NIC and monitor, and deletes its own disposable overlay at exit. A fresh run creates a fresh overlay from the cached base image. The serial log and emulator output survive cleanup. The optional `--power-cycle-marker` ends only that QEMU process at an explicit serial milestone and restarts the same disposable overlay once. The guest fixture must emit the milestone after its intended durable checkpoint. Run destructive scenarios only in this lab.
 
+The launcher requires each marker on its own complete serial line. A final pass also requires QEMU to exit successfully. Both boots share the configured wall-clock deadline after overlay setup. The host caps serial logs at 8 MiB per boot and QEMU diagnostics at 8 MiB total. Exit 124 records a deadline and exit 125 records an output cap. Both stop QEMU and preserve the captured evidence. Serial markers are guest assertions. Candidate identity and the host-observed exit must accompany them in a review.
+
 Docker and Compose can be reused where a scoped runtime already exists. This repository has no Node dependency or Compose project. Keep runner, daemon and user privileges unchanged when adding project-specific environments. Git remains the source of revision identity. A local Forgejo service can be used where the project already has an authorized remote.
 
 The packaged Stage 3 operation restores selected installer records using a verified archive, existing authority, vault keys, and a fresh verified safety copy. It preserves settings and owner-side state. Complete system restore, lost vault keys and lost installer authority require separate procedures.
@@ -17,3 +19,25 @@ The packaged Stage 3 operation restores selected installer records using a verif
 For a scoped source review, run ShellCheck on `tools/dev/*.sh`, Pyflakes on the modified Python files, and Bandit with Python 3.14 support on the privileged code paths. Keep the findings with the candidate logs. These checks complement the package, runtime and confinement tests.
 
 For recovery fault scenarios, build media with `tools/dev/restore-media.sh PACKAGE --fault-cases` and require the serial marker `STYNPILOT_RESTORE_FAULT_CASES_OK`. This exercises a temporary owner endpoint outage and a persistent outage in the disposable guest. For a power interruption, build media with `--power-case` and launch with `--power-cycle-marker STYNPILOT_CUT_POWER_NOW --marker STYNPILOT_POWER_RECOVERY_OK`. Preserve both serial logs. A missing marker is a failed or incomplete run.
+
+
+## Restricted MCP integration (development only)
+
+The first integration stage adds `dev_lab_status`, a read-only, paired-device
+preflight that checks fixed owner lab metadata, KVM API access, available RAM
+and free work-volume storage. It returns booleans and planned scenario names,
+not host paths or raw cache files. Cache presence is NOT artifact integrity
+verification. A successful preflight never authorizes execution; launch remains
+disabled in this stage. The fixed default location is used; a custom lab
+location needs separate owner enrollment.
+
+The planned execution vocabulary is exact lowercase 40-hex Git commit and one
+of: offline_normal, offline_release_sandbox, static_checks, reproducible_build,
+guest_boot_smoke, guest_restore, guest_restore_faults, guest_power_recovery.
+No caller-selected commands, paths, URLs, ISO files, or success markers.
+Launch, progress, output, cancellation, owner enrollment and managed cleanup
+are not yet exposed. Before implementing launch, provision trusted immutable
+launcher and cache identity, make preparation strictly cache-only, isolate
+candidate builds and tests, and run in a bounded managed cgroup with private
+results and durable recovery exclusion. The current interactive launcher is
+not itself a remote execution trust boundary.

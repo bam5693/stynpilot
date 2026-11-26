@@ -1149,7 +1149,15 @@ class Vault:
                 return nonce
         raise VaultError("nonce_generation_failed")
 
-    def _create(self, index):
+    def _backup_name(self):
+        return "%s-%s-%s%s" % (self.side, time.strftime("%Y%m%d-%H%M%S", time.gmtime(self.clock())),
+                               secrets.token_hex(4), SUFFIX)
+
+    def _create(self, index, *, name=None):
+        name = self._backup_name() if name is None else name
+        if (not NAME.fullmatch(name) or not name.startswith(self.side + "-")
+                or name in index["backups"] or os.path.lexists(self.folder / name)):
+            raise VaultError("backup_name_unavailable")
         used = self._nonces(index)                              # BEFORE a key exists: a missing log is only fine for the very first backup
         key_id, key = self._key(index, create=True)
         index["key_id"] = key_id
@@ -1164,7 +1172,6 @@ class Vault:
         aad = MAGIC + struct.pack(">H", len(header)) + header
         blob = aad + self._cipher(key).encrypt(bytes.fromhex(nonce), bundle, aad)
         del bundle
-        name = "%s-%s-%s%s" % (self.side, time.strftime("%Y%m%d-%H%M%S", time.gmtime(now)), secrets.token_hex(4), SUFFIX)
         self._record_nonce(nonce)                               # recorded BEFORE the backup can exist
         self._save(index)
         _write_atomic(self.folder, name, blob)

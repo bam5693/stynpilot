@@ -22,6 +22,12 @@ The Dev27 candidate adds `commander_request_stynpilot_credential_setup`. Its MCP
 
 Provision a GitHub fine-grained token for only the StyNpilot repository with Contents read and write. A saved credential means local provisioning succeeded. A separately approved work-branch push verifies real repository access after activation. The transport now sets `LimitCORE=0` and requests a stop on timeout. Treat a lost push response as uncertain and inspect the remote ref before repeating the operation.
 
+## Full-history intake review
+
+Dev27 is active. The archive review adds read-only HTTPS intake for an exact broker-admitted GitHub, GitLab, or Forgejo repository. It verifies the pinned branch and tag inventory and default HEAD before and after fetching into a fresh bare repository. It verifies full object integrity with strict Git fsck and publishes the bundle and independently bound receipt in a single no-replace rename after syncing both files. Restoring the receipt creates an isolated bare comparison repository with the verified default branch. The archive covers Git objects reachable from the advertised branches and tags. Hidden or deleted refs, submodule repositories, Git LFS contents, and other forge assets require separate preservation.
+
+Before adding a live MCP route, run this worker in a broker-managed transient unit with private storage, an aggregate allocation limit, and a full deadline. Enroll each exact source independently and pass its read credential through the unit. The review tests use synthetic repositories and verify the local Git fetch and archive path. Packaged HTTPS and live provider acceptance remain open.
+
 ## Milestones and versions
 
 | Milestone | Scope | Debian package |
@@ -31,7 +37,7 @@ Provision a GitHub fine-grained token for only the StyNpilot repository with Con
 | Dev23 Stage 2 | Secure key rotation | `0.1.0~dev24` released |
 | Dev23 Stage 3 | Installer-side restoration and development lab | `0.1.0~dev25` released |
 | Repository management | StyNpilot checkout, fetch and guarded native push | `0.1.0~dev26` released |
-| GitHub credential setup | Phone entry and transport hardening | `0.1.0~dev27` candidate |
+| GitHub credential setup | Phone entry and transport hardening | `0.1.0~dev27` released |
 | Dev23 Stage 4 | Owner-side restoration | Following unused increment |
 
 Dev24 off-machine backup and Dev25 repository management are milestone labels. Every separately published package consumes a version increment.

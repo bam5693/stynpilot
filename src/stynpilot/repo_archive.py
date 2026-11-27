@@ -1,6 +1,7 @@
 """Preserve and verify full branch and tag bundles in isolated bare repositories."""
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ import subprocess
 import tempfile
 from urllib.parse import urlsplit
 
-from . import repo_git
+from . import repo_git, vault
 
 MAX_BUNDLE = 512 << 20
 MAX_MANIFEST = 4 << 20
@@ -22,6 +23,7 @@ OID = re.compile(r"[a-f0-9]{40}\Z")
 DIGEST = re.compile(r"[a-f0-9]{64}\Z")
 _REPOSITORY_PATH = re.compile(r"/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*/)+[A-Za-z0-9_-][A-Za-z0-9_.-]*\.git\Z")
 _ENV = dict(repo_git._ENV, GIT_PROTOCOL_FROM_USER="0", GIT_CONFIG_COUNT="0")
+_RENAME_NOREPLACE = 1  # Linux renameat2 flag
 
 
 class ArchiveError(Exception):
@@ -85,7 +87,11 @@ def _ref_name(name):
 
 def _ref_map(rows, *, name_first=False):
     refs = {}
-    for line in rows.decode("utf-8").splitlines():
+    try:
+        lines = rows.decode("utf-8").removesuffix("\n").split("\n") if rows else []
+    except UnicodeDecodeError:
+        raise ArchiveError("archive_refs_invalid") from None
+    for line in lines:
         first, sep, second = line.partition(" ")
         name, oid = (first, second) if name_first else (second, first)
         if (not sep or not _ref_name(name)
@@ -128,7 +134,7 @@ def _bundle_digest(path, *, copy_to=None):
         return digest.hexdigest(), total
 
 
-def _restore_bundle(bundle, bare, refs):
+def _restore_bundle(bundle, bare, refs, default_head=None):
     if _ref_map(_git(None, "bundle", "list-heads", str(bundle))) != refs:
         raise ArchiveError("archive_refs_changed")
     # An empty verifier has no objects to satisfy a thin/incremental bundle.
@@ -139,7 +145,9 @@ def _restore_bundle(bundle, bare, refs):
     with (bare / "packed-refs").open("x", encoding="utf-8") as packed:
         for name, oid in refs.items():
             packed.write(f"{oid} {name}\n")
-    _git(bare, "fsck", "--connectivity-only", "--no-dangling")
+    if default_head is not None:
+        (bare / "HEAD").write_text(f"ref: {default_head}\n", encoding="utf-8")
+    _git(bare, "fsck", "--full", "--strict", "--no-dangling")
 
 
 def _verify_bundle(bundle, refs):
@@ -147,13 +155,36 @@ def _verify_bundle(bundle, refs):
         _restore_bundle(bundle, Path(scratch) / "verify.git", refs)
 
 
-def restore_comparison(archive, destination, provider, origin, expected_refs, expected_digest):
+def _publish_directory(staging, destination):
+    """Atomically commit a complete archive and fail if the destination exists."""
+    rename = ctypes.CDLL(None, use_errno=True).renameat2
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parent_fd = os.open(destination.parent, flags)
+    try:
+        if rename(parent_fd, os.fsencode(staging.name), parent_fd, os.fsencode(destination.name), _RENAME_NOREPLACE):
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), destination)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _default_head(refs, value):
+    if value is not None and (type(value) is not str or value not in refs or not value.startswith("refs/heads/")):
+        raise ArchiveError("archive_default_head_invalid")
+    return {"default_head": value} if value is not None else {}
+
+
+def restore_comparison(archive, destination, provider, origin, expected_refs, expected_digest, *, default_head=None):
     """Restore a separate bare comparison repository, with no checkout or merge.
 
     The expected identity, digest and branch/tag tips are trusted inputs from
     the archive receipt. The manifest beside the bundle cannot authorize itself.
     """
     source, refs = source_origin(provider, origin), _expected_map(expected_refs)
+    head = _default_head(refs, default_head)
     if type(expected_digest) is not str or not DIGEST.fullmatch(expected_digest):
         raise ArchiveError("archive_binding_invalid")
     archive, destination = Path(archive), Path(destination).absolute()
@@ -169,8 +200,10 @@ def restore_comparison(archive, destination, provider, origin, expected_refs, ex
         manifest = json.loads(raw) if len(raw) <= MAX_MANIFEST else None
     except (ValueError, UnicodeError):
         raise ArchiveError("archive_manifest_invalid") from None
-    if (type(manifest) is not dict or set(manifest) != {"format", "source", "refs", "bundle_sha256", "bundle_size"}
-            or manifest["format"] != 1 or manifest["source"] != source or manifest["refs"] != refs
+    fields = {"format", "source", "refs", "bundle_sha256", "bundle_size"} | head.keys()
+    if (type(manifest) is not dict or set(manifest) != fields
+            or manifest["format"] != (2 if head else 1) or manifest["source"] != source or manifest["refs"] != refs
+            or manifest.get("default_head") != default_head
             or manifest["bundle_sha256"] != expected_digest
             or type(manifest["bundle_size"]) is not int or not 0 < manifest["bundle_size"] <= MAX_BUNDLE):
         raise ArchiveError("archive_binding_invalid")
@@ -182,20 +215,21 @@ def restore_comparison(archive, destination, provider, origin, expected_refs, ex
                 digest, size = _bundle_digest(archive / "source.bundle", copy_to=copy)
             if (digest, size) != (expected_digest, manifest["bundle_size"]):
                 raise ArchiveError("archive_bundle_digest_mismatch")
-            _restore_bundle(frozen, destination, refs)
+            _restore_bundle(frozen, destination, refs, default_head)
         return manifest
     except Exception:
         shutil.rmtree(destination)
         raise
 
 
-def capture_prepared(bare, destination, provider, origin, expected_refs):
+def capture_prepared(bare, destination, provider, origin, expected_refs, *, default_head=None):
     """Archive a clean, private bare intake repository against pinned source refs.
 
     The caller owns preparation and network authorization. It must give this
     function exclusive access to the prepared repository and archive directory.
     """
     source, refs = source_origin(provider, origin), _expected_map(expected_refs)
+    head = _default_head(refs, default_head)
     bare, destination = Path(bare).resolve(strict=True), Path(destination).absolute()
     if _git(bare, "rev-parse", "--is-bare-repository", "--is-shallow-repository").splitlines() != [b"true", b"false"]:
         raise ArchiveError("archive_full_bare_repo_required")
@@ -205,23 +239,29 @@ def capture_prepared(bare, destination, provider, origin, expected_refs):
     if advertised != refs:
         raise ArchiveError("archive_refs_changed")
 
-    destination.mkdir(mode=0o700, parents=False, exist_ok=False)
+    if os.path.lexists(destination):
+        raise FileExistsError(destination)
+    staging = Path(tempfile.mkdtemp(prefix=".stynpilot-archive-", dir=destination.parent))
     try:
-        bundle = destination / "source.bundle"
+        bundle = staging / "source.bundle"
         _git(bare, "bundle", "create", str(bundle), "--branches", "--tags")
         bundle.chmod(0o600)
         digest, size = _bundle_digest(bundle)
         _verify_bundle(bundle, refs)
-        manifest = {"format": 1, "source": source, "refs": refs, "bundle_sha256": digest, "bundle_size": size}
+        manifest = {"format": 2 if head else 1, "source": source, "refs": refs,
+                    "bundle_sha256": digest, "bundle_size": size, **head}
         raw = (json.dumps(manifest, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
         if len(raw) > MAX_MANIFEST:
             raise ArchiveError("archive_manifest_limit")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-        with os.fdopen(os.open(destination / "manifest.json", flags, 0o600), "wb") as metadata:
+        with os.fdopen(os.open(staging / "manifest.json", flags, 0o600), "wb") as metadata:
             metadata.write(raw)
             metadata.flush()
             os.fsync(metadata.fileno())
+        vault._fsync_file(bundle)
+        vault._fsync_dir(staging)
+        _publish_directory(staging, destination)
         return manifest
-    except Exception:
-        shutil.rmtree(destination)
-        raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)

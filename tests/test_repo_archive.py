@@ -5,8 +5,9 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from stynpilot import repo_archive, repo_git
+from stynpilot import repo_archive, repo_git, repo_intake
 
 
 class RepositoryArchiveTests(unittest.TestCase):
@@ -106,3 +107,79 @@ class RepositoryArchiveTests(unittest.TestCase):
         with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_binding_invalid"):
             repo_archive.restore_comparison(archive, target, "github", self.origin, self.refs, "b" * 64)
         self.assertFalse(target.exists())
+
+    def test_readonly_intake_pins_origin_credentials_and_complete_fetch(self):
+        scope = ("github", self.origin)
+        target = self.root / "remote-archive"
+        fixture = "synthetic_read_only_credential"
+        calls = []
+
+        def offline_https(repository, config, deadline, action, *args):
+            calls.append(action)
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertIn(f'[http "{self.origin}"]', config.read_text())
+            self.assertNotIn(fixture, repr(args))
+            remote = args.index("--") + 1
+            self.assertEqual(args[remote], self.origin)
+            mapped = (*args[:remote], str(self.bare), *args[remote + 1:])
+            return self.git(repository, action, *mapped).encode("utf-8")
+
+        with patch.object(repo_intake, "_git", side_effect=offline_https):
+            receipt = repo_intake.intake_snapshot(target, scope, scope, self.refs, scratch=self.root,
+                                                  credential=("x-access-token", fixture), default_head="refs/heads/main")
+        self.assertEqual(calls, ["ls-remote", "ls-remote", "fetch", "ls-remote", "ls-remote"])
+        self.assertEqual(receipt["refs"], self.refs)
+        comparison = self.root / "remote-comparison.git"
+        with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_binding_invalid"):
+            repo_archive.restore_comparison(target, comparison, *scope, self.refs, receipt["bundle_sha256"],
+                                            default_head="refs/heads/review/historical")
+        repo_archive.restore_comparison(target, comparison, *scope, self.refs, receipt["bundle_sha256"],
+                                        default_head="refs/heads/main")
+        self.assertEqual(self.git(comparison, "symbolic-ref", "HEAD"), "refs/heads/main")
+        self.assertFalse(list(self.root.glob("stynpilot-intake-*")))
+        self.assertNotIn(fixture, (target / "manifest.json").read_text())
+        self.assertEqual(set(self.refs), set(self.git(self.bare, "for-each-ref", "--format=%(refname)").splitlines()))
+
+    def test_readonly_intake_rejects_wrong_source_and_ref_drift(self):
+        scope = ("github", self.origin)
+        target = self.root / "refused-archive"
+        with patch.object(repo_intake, "_git") as transport:
+            with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_intake_scope_mismatch"):
+                repo_intake.intake_snapshot(target, scope, ("github", "https://github.com/else/other.git"),
+                                            self.refs, scratch=self.root, default_head="refs/heads/main")
+            transport.assert_not_called()
+        rows = "\n".join(f"{oid}\t{name}" for name, oid in self.refs.items()).encode()
+        head = f"ref: refs/heads/main\tHEAD\n{self.refs['refs/heads/main']}\tHEAD\n".encode()
+        with patch.object(repo_intake, "_git", side_effect=[rows, head, b"", rows.split(b"\n", 1)[0]]) as transport:
+            with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_refs_changed"):
+                repo_intake.intake_snapshot(target, scope, scope, self.refs, scratch=self.root,
+                                            default_head="refs/heads/main")
+            self.assertEqual(transport.call_count, 4)
+        self.assertFalse(target.exists())
+        self.assertFalse(list(self.root.glob("stynpilot-intake-*")))
+
+    def test_archive_publication_preserves_a_destination_created_during_verification(self):
+        target = self.root / "contended-archive"
+        verify = repo_archive._verify_bundle
+
+        def complete_verification(bundle, refs):
+            self.assertFalse(target.exists())
+            verify(bundle, refs)
+            target.mkdir()
+            (target / "owner-file").write_text("preserve me")
+
+        with patch.object(repo_archive, "_verify_bundle", side_effect=complete_verification):
+            with self.assertRaises(FileExistsError):
+                repo_archive.capture_prepared(self.bare, target, "github", self.origin, self.refs)
+        self.assertEqual(["owner-file"], [part.name for part in target.iterdir()])
+        self.assertFalse(list(self.root.glob(".stynpilot-archive-*")))
+
+    def test_interrupted_archive_is_invisible_and_clean_retry_completes(self):
+        target = self.root / "interrupted-archive"
+        with patch.object(repo_archive, "_verify_bundle", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                repo_archive.capture_prepared(self.bare, target, "github", self.origin, self.refs)
+        self.assertFalse(target.exists())
+        self.assertFalse(list(self.root.glob(".stynpilot-archive-*")))
+        receipt = repo_archive.capture_prepared(self.bare, target, "github", self.origin, self.refs)
+        self.assertEqual(json.loads((target / "manifest.json").read_bytes()), receipt)

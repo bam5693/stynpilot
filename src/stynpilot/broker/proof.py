@@ -147,6 +147,12 @@ def render_summary(payload):
             return ["Stop the fixed local Ollama pilot service and settle inference reservation %s." % name,
                     "This can interrupt local AI and OpenCode. The service will remain stopped. No models, project files or backups are deleted.",
                     "Only this exact reservation can be cleared, and only after StyNpilot verifies the service is inactive, its cgroup is empty and the inference port is no longer listening.", expires]
+        if payload.get("action") == "repo_push":
+            base = payload["expected_remote"]
+            return ["Publish " + payload["repository"] + " branch " + payload["branch"] + ".",
+                    "Exact commit " + payload["commit"] + ".",
+                    "Expected remote commit " + base + "." if base != "0" * 40 else "Only create a new branch.",
+                    "This is a native, non-forced Git push. No tags, releases or other branches are changed.", expires]
         if payload.get("action") == "setup":
             return ["Set up the sandboxed command runner (one time).",
                     "This creates a locked-down system account named stynpilot-run (no login, no sudo, no network, no groups) "

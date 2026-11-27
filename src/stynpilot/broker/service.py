@@ -118,7 +118,7 @@ class BrokerService:
         payload = msg.get("payload")
         approving = isinstance(payload, dict) and (
             (msg.get("op") == "backup_admin" and payload.get("action") == "restore_root")
-            or (msg.get("op") == "runner_admin" and payload.get("action") in ("settle_inference", "lab_enroll")))
+            or (msg.get("op") == "runner_admin" and payload.get("action") in ("settle_inference", "lab_enroll", "repo_push")))
         exclusive = approving or (msg.get("op") == "runner" and msg.get("call") in
                                   ("inference_claim", "inference_finish", "lab_start", "lab_cancel", "lab_checkout", "lab_fetch"))
         try:

@@ -3,14 +3,18 @@ import hashlib
 import base64
 import html
 import io
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import re
+import ssl
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
+from urllib.parse import urlsplit
 
 # This fixture enforces the disposable DMI, root and NIC checks on import.
 sys.path.insert(0, str(Path(__file__).parent))
@@ -57,6 +61,72 @@ def artifact(case):
     fixture.write(store / "record.json", {"state": "ready", "commit": commit, "tests_failed": 0,
                                           "reproducible": True, "lab_source_sha256": digest})
     return {"repository": lab.REPOSITORY, "commit": commit, "artifact_sha256": digest}
+
+
+
+def fixture_push_origin(root, workspace, base, token):
+    """NIC-free replacement for the fixed GitHub host, with real smart HTTPS."""
+    cert, key = root / "github.crt", root / "github.key"
+    fixture.command("openssl", "req", "-new", "-newkey", "rsa:2048", "-x509", "-nodes", "-days", "2",
+                    "-subj", "/CN=github.com", "-addext", "subjectAltName=DNS:github.com",
+                    "-keyout", str(key), "-out", str(cert))
+    trust = Path("/usr/local/share/ca-certificates/stynpilot-fixture-github.crt")
+    trust.write_bytes(cert.read_bytes())
+    fixture.command("update-ca-certificates")
+    with Path("/etc/hosts").open("a") as hosts:
+        hosts.write("\n127.0.0.2 github.com\n")
+
+    remote = root / "bam5693" / "stynpilot.git"
+    remote.parent.mkdir()
+    fixture.command("git", "init", "--quiet", "--bare", str(remote))
+    fixture.command("git", "-C", str(remote), "-c", "protocol.file.allow=always", "-c",
+                    "safe.directory=" + str(workspace), "fetch", "--quiet", "--no-tags", str(workspace),
+                    base + ":refs/heads/main")
+    auth = "Basic " + base64.b64encode(("x-access-token:" + token).encode()).decode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.cgi()
+
+        def do_POST(self):
+            self.cgi()
+
+        def cgi(self):
+            target = urlsplit(self.path)
+            if target.path not in ("/bam5693/stynpilot.git/info/refs", "/bam5693/stynpilot.git/git-upload-pack",
+                                   "/bam5693/stynpilot.git/git-receive-pack"):
+                self.send_error(404)
+                return
+            if self.headers.get("Authorization") != auth:
+                self.send_error(403)
+                return
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 0 <= size <= 1 << 20:
+                self.send_error(413)
+                return
+            env = {"PATH": "/usr/bin:/bin", "GIT_PROJECT_ROOT": str(root), "GIT_HTTP_EXPORT_ALL": "1",
+                   "PATH_INFO": target.path, "QUERY_STRING": target.query, "REQUEST_METHOD": self.command,
+                   "REMOTE_USER": "isolated-fixture", "CONTENT_LENGTH": str(size),
+                   "CONTENT_TYPE": self.headers.get("Content-Type", "")}
+            result = subprocess.run(["/usr/lib/git-core/git-http-backend"], input=self.rfile.read(size), env=env,
+                                    capture_output=True, timeout=20, check=True)
+            header, body = result.stdout.split(b"\r\n\r\n", 1)
+            fields = [line.decode().split(": ", 1) for line in header.split(b"\r\n")]
+            status = next((int(value.split()[0]) for name, value in fields if name.lower() == "status"), 200)
+            self.send_response(status)
+            for name, value in fields:
+                if name.lower() not in ("status", "content-length"):
+                    self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    listener = ThreadingHTTPServer(("127.0.0.2", 443), Handler)
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(cert, key)
+    listener.socket = tls.wrap_socket(listener.socket, server_side=True)
+    threading.Thread(target=listener.serve_forever, daemon=True).start()
+    return listener, remote
 
 
 def main():
@@ -218,6 +288,40 @@ def main():
         assert git_job("git-work-switch", ["work/fixture", changed, base]) == base
         assert git_job("git-work-fast-forward", ["work/fixture", base, changed]) == changed
         assert git("rev-parse", "test/fixture") == changed and not git("status", "--porcelain")
+        push = {"repository": lab.REPOSITORY, "branch": "work/fixture", "commit": changed, "expected_remote": "0" * 40}
+        assert call("commander_request_stynpilot_push", **push)["error"] == "git_push_credential_unavailable"
+        token = "ghp_fixture_only_01234567890123456789"
+        credential = fixture.STATE / "repository-github-token"
+        credential.write_text(token)
+        credential.chmod(0o600)
+        with tempfile.TemporaryDirectory(prefix="fixture-push-") as scratch:
+            origin, remote = fixture_push_origin(Path(scratch), folder, base, token)
+            try:
+                assert call("commander_request_stynpilot_push", **dict(push, branch="main"))["error"] == "git_push_binding_invalid"
+                assert call("commander_request_stynpilot_push", client="fixture-other", **push)["error"] == "lab_enrollment_required"
+                filed_push = ok("commander_request_stynpilot_push", **push)
+                approve(filed_push["request_id"], required=True)
+                def pushed():
+                    result = fixture.broker("status", filed_push["request_id"])
+                    return result if result["state"] in ("done", "failed") else None
+                result = fixture.until(pushed, 100)
+                assert result["state"] == "done", result
+                assert fixture.command("git", "-C", str(remote), "rev-parse", "refs/heads/work/fixture") == changed
+                ok("workspace_write", workspace_name=workspace, path="second.txt", content="second\n")
+                descendant = git_job("git-work-commit", ["work/fixture", changed, "fixture push update", "second.txt"])
+                for expected, state in (("0" * 40, "failed"), (changed, "done")):
+                    filed_push = ok("commander_request_stynpilot_push",
+                                    **dict(push, commit=descendant, expected_remote=expected))
+                    approve(filed_push["request_id"], required=True)
+                    result = fixture.until(pushed, 100)
+                    assert result["state"] == state, result
+                    head = changed if state == "failed" else descendant
+                    assert fixture.command("git", "-C", str(remote), "rev-parse", "refs/heads/work/fixture") == head
+                assert fixture.command("git", "-C", str(remote), "rev-parse", "refs/heads/main") == base
+                print("STYNPILOT_PACKAGED_PUSH_MCP_OK", flush=True)
+            finally:
+                origin.shutdown()
+                origin.server_close()
         print("STYNPILOT_PACKAGED_GIT_MCP_OK", flush=True)
         assert call("dev_lab_start", **dict(fast, artifact_sha256="f" * 64))["error"] == "lab_source_not_verified"
 

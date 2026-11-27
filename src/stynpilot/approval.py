@@ -111,7 +111,8 @@ class ApprovalFlow:
         passkey = None if adds else self._passkey_options(approve, deny)      # adding a passkey is Auth0-only
         required = {"restore_root": "root_restore_requires_passkey",
                     "settle_inference": "inference_settlement_requires_passkey",
-                    "lab_enroll": "lab_enrollment_requires_passkey"}.get(payload.get("action"))
+                    "lab_enroll": "lab_enrollment_requires_passkey",
+                    "repo_push": "git_push_requires_passkey"}.get(payload.get("action"))
         with self._lock:
             self._sweep()
             if len(self._views) >= MAX_VIEWS:

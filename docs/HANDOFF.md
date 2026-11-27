@@ -8,6 +8,14 @@ Dev23 Stage 3 targets `0.1.0~dev25` on `codex/dev23-stage3-root-restore`, based 
 
 ChatGPT independently reviews the exact candidate recorded in the private master plan. A booted disposable guest is the next integration boundary for systemd, owner-endpoint health and the full confinement probe together. Live restoration is outside the review procedure.
 
+## Dev26 repository management review
+
+The Dev26 candidate combines verified StyNpilot checkout and fetch, offline branch and commit operations, and a passkey-approved native work-branch push. Push binds the repository, local branch, exact commit, and expected remote head. A missing expected remote head is encoded as forty zeroes for branch creation. Native Git performs the update without force, and an independent transport verifies the resulting remote ref.
+
+The transport needs a separate owner-provisioned GitHub credential with write access limited to the StyNpilot repository. Store it as the installer-owned mode-0600 file `repository-github-token` in the installer state directory. The workspace runner never receives it. The release signing credential stays separate.
+
+After independent review and activation, prepare an exact GitHub revision with the live release authority, obtain its `checkout_bundle_sha256`, and consume it through `workspace_fetch_stynpilot`. Confirm the exact new local ref and compare the workspace HEAD before and after. Preserve occupied workspaces. The NIC-free packaged fixture tests the combined MCP workflow against a disposable HTTPS smart-Git origin and synthetic credential.
+
 ## Milestones and versions
 
 | Milestone | Scope | Debian package |
@@ -15,7 +23,8 @@ ChatGPT independently reviews the exact candidate recorded in the private master
 | Dev22 | Encrypted backup vaults, verification and drills | `0.1.0~dev22` |
 | Dev23 Stage 1 | Retention policy and periodic verification | `0.1.0~dev23` |
 | Dev23 Stage 2 | Secure key rotation | `0.1.0~dev24` released |
-| Dev23 Stage 3 | Installer-side restoration | `0.1.0~dev25` candidate |
+| Dev23 Stage 3 | Installer-side restoration and development lab | `0.1.0~dev25` released |
+| Repository management | StyNpilot checkout, fetch and guarded native push | `0.1.0~dev26` candidate |
 | Dev23 Stage 4 | Owner-side restoration | Following unused increment |
 
 Dev24 off-machine backup and Dev25 repository management are milestone labels. Every separately published package consumes a version increment.

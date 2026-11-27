@@ -17,7 +17,7 @@ ORIGIN = "https://github.com/bam5693/stynpilot.git"
 BRANCH, COMMIT = "git-work-branch", "git-work-commit"
 SWITCH, FAST_FORWARD = "git-work-switch", "git-work-fast-forward"
 RECIPES = frozenset((BRANCH, COMMIT, SWITCH, FAST_FORWARD))
-FETCH = "git-verified-fetch"
+FETCH, EXPORT = "git-verified-fetch", "git-approved-export"
 MUTATIONS = RECIPES | {FETCH}
 BUNDLE_LIMIT = 32 << 20
 BUNDLE_REF = "refs/heads/stynpilot-import"
@@ -31,8 +31,15 @@ _CONFIG = {
 _IN_PROGRESS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-apply", "rebase-merge", "sequencer")
 _ENV = {
     "PATH": "/usr/bin:/bin", "HOME": "/tmp", "LC_ALL": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
+    "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1",
 }
+
+
+def validate_push(branch, commit, expected):
+    if (type(branch) is not str or not _REF.fullmatch(branch)
+            or type(commit) is not str or not _SHA.fullmatch(commit) or commit == "0" * 40
+            or type(expected) is not str or not _SHA.fullmatch(expected)):
+        raise WorkspaceError("git_push_binding_invalid")
 
 
 def read_bundle(commit, digest, stream):
@@ -63,7 +70,7 @@ def validate(recipe, args, workspace):
 
 
 def run(recipe, args, folder):
-    if recipe == FETCH:
+    if recipe in (FETCH, EXPORT):
         if Path(folder).name != WORKSPACE or len(args) != 2:
             raise WorkspaceError("git_workspace_not_bound")
     else:
@@ -87,11 +94,10 @@ def run(recipe, args, folder):
         "--git-dir=.git", "--work-tree=.",
     ]
 
-    def git(*argv, hooks=None, file_transport=False):
+    def git(*argv, hooks=None, complete_history=False):
         config = ["-c", "core.hooksPath=" + str(hooks)] if hooks else []
-        if file_transport:
-            config += ["-c", "protocol.file.allow=always"]
-        result = subprocess.run(command + config + list(argv), cwd=folder, env=_ENV, stdin=subprocess.DEVNULL,
+        env = dict(_ENV, GIT_SHALLOW_FILE="/dev/null") if complete_history else _ENV
+        result = subprocess.run(command + config + list(argv), cwd=folder, env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20, check=False)
         if result.returncode != 0:
             raise WorkspaceError("git_operation_refused")
@@ -115,8 +121,21 @@ def run(recipe, args, folder):
             bundle.write_bytes(data)
             if git("bundle", "list-heads", str(bundle)).splitlines() != [f"{commit} {BUNDLE_REF}".encode("ascii")]:
                 raise WorkspaceError("checkout_commit_mismatch")
-            git("fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head",
-                "--no-auto-maintenance", "--", str(bundle), BUNDLE_REF, file_transport=True)
+            git("bundle", "unbundle", str(bundle))
+            if git("rev-parse", "--is-shallow-repository") == b"true\n":
+                # Bundles can fill in history for existing shallow roots.
+                # Clear Git's boundary only while holding its native lock
+                # and only if every reachable object walks without it.
+                lock = metadata / "shallow.lock"
+                with lock.open("xb"):
+                    try:
+                        git("rev-list", "--objects", "--quiet", "--all", "HEAD", commit, complete_history=True)
+                    except WorkspaceError:
+                        pass  # Another shallow root still needs ancestry.
+                    else:
+                        (metadata / "shallow").unlink()
+                    finally:
+                        lock.unlink()
         if git("rev-parse", "--verify", commit + "^{commit}").strip() != commit.encode("ascii"):
             raise WorkspaceError("checkout_commit_mismatch")
         ref = VERIFIED_REF_PREFIX + commit
@@ -126,6 +145,22 @@ def run(recipe, args, folder):
         if found != [f"{commit} {ref}".encode("ascii")]:
             git("update-ref", "--no-deref", ref, commit, "0" * 40)
         return commit
+
+    if recipe == EXPORT:
+        validate_push(branch, expected, "0" * 40)
+        ref = "refs/heads/" + branch
+        if git("show-ref", "--verify", "--hash", ref).strip().decode("ascii") != expected:
+            raise WorkspaceError("git_push_commit_mismatch")
+        if git("rev-parse", "--is-shallow-repository") != b"false\n":
+            raise WorkspaceError("git_push_full_history_required")
+        with tempfile.TemporaryDirectory(prefix="stynpilot-git-export-") as scratch:
+            archive = Path(scratch) / "push.bundle"
+            git("bundle", "create", str(archive), ref)
+            if git("bundle", "list-heads", str(archive)).splitlines() != [f"{expected} {ref}".encode("ascii")]:
+                raise WorkspaceError("git_push_commit_mismatch")
+            if not 0 < archive.stat().st_size <= BUNDLE_LIMIT:
+                raise WorkspaceError("git_push_bundle_invalid")
+            return archive.read_bytes()
 
     if git("rev-parse", "--verify", "HEAD").strip().decode("ascii") != expected:
         raise WorkspaceError("git_head_changed")
@@ -207,7 +242,11 @@ def run(recipe, args, folder):
 
 def main():
     try:
-        print(run(sys.argv[1], sys.argv[2:], Path.cwd()))
+        result = run(sys.argv[1], sys.argv[2:], Path.cwd())
+        if sys.argv[1] == EXPORT:
+            sys.stdout.buffer.write(result)
+        else:
+            print(result)
     except WorkspaceError as error:
         print(error.code)
         return 1

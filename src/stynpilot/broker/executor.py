@@ -447,6 +447,8 @@ class Executor:
                 raise ExecutionDenied("inference_settlement_requires_passkey")
             if payload.get("action") == "lab_enroll":
                 raise ExecutionDenied("lab_enrollment_requires_passkey")
+            if payload.get("action") == "repo_push":
+                raise ExecutionDenied("git_push_requires_passkey")
         self._used_passkey(passkey, rid, decision)
         self.runs.consume(challenge=challenge, request_id=rid, decision=decision, proof=fingerprint, kind=kind)
         return rid
@@ -694,14 +696,35 @@ class Executor:
     _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}\Z")
     _RUNNER_KEYS = {"kind", "action", "name", "owner", "device", "expires_at"}
 
+    def _git_push_ready(self, client, repository, branch, commit, expected):
+        from .. import repo_git
+        from .repo_push import Transport
+        try:
+            repo_git.validate_push(branch, commit, expected)
+        except repo_git.WorkspaceError as error:
+            raise ExecutionDenied(error.code) from None
+        if self.jobs is None or self.lab is None or self.passkeys is None:
+            raise ExecutionDenied("git_push_unavailable")
+        if not self.lab.enrollment(client, repository)["enrolled"]:
+            raise ExecutionDenied("lab_enrollment_required")
+        if not any(row["path"] == self._workspace_path(repo_git.WORKSPACE) for row in self.jobs.workspaces()):
+            raise ExecutionDenied("workspace_not_enrolled")
+        if not Transport(self.dir).ready():
+            raise ExecutionDenied("git_push_credential_unavailable")
+        return {"ready": True}
+
     def _check_runner_payload(self, payload):
         action = payload.get("action")
         lab_request = action == "lab_enroll"
         if self.jobs is None and not lab_request:
             raise ExecutionDenied("runner_not_available")
-        fields = self._RUNNER_KEYS | {"client", "repository", "profile"} if lab_request else self._RUNNER_KEYS
+        fields = set(self._RUNNER_KEYS)
+        if lab_request:
+            fields |= {"client", "repository", "profile"}
+        if action == "repo_push":
+            fields |= {"client", "repository", "branch", "commit", "expected_remote"}
         if (set(payload) != fields or payload.get("kind") != "runner"
-                or action not in ("setup", "enroll", "unenroll", "settle_inference", "lab_enroll")
+                or action not in ("setup", "enroll", "unenroll", "settle_inference", "lab_enroll", "repo_push")
                 or payload.get("owner") != self.owner or payload.get("device") != self.device):
             raise ExecutionDenied("runner_request_invalid")
         name = payload.get("name")
@@ -720,6 +743,11 @@ class Executor:
                 raise ExecutionDenied("lab_executor_unavailable")
             if state["enrolled"]:
                 raise ExecutionDenied("lab_already_enrolled")
+        if action == "repo_push":
+            if name != "stynpilot":
+                raise ExecutionDenied("git_workspace_not_bound")
+            self._git_push_ready(payload["client"], payload["repository"], payload["branch"],
+                                 payload["commit"], payload["expected_remote"])
         if action == "settle_inference":
             if not managed_activity.ID.fullmatch(name):
                 raise ExecutionDenied("activity_claim_invalid")
@@ -775,6 +803,18 @@ class Executor:
         action = payload["action"]
         if action == "lab_enroll":
             return self.lab.enroll(payload["client"])
+        if action == "repo_push":
+            from .. import repo_git
+            from .repo_push import Transport
+            if managed_activity.held(self.dir):
+                raise JobError("managed_activity_busy")
+            commit, branch = payload["commit"], payload["branch"]
+            try:
+                bundle = self.jobs.export_push(self._workspace_path(repo_git.WORKSPACE), branch, commit)
+                Transport(self.dir).publish(bundle, branch, commit, payload["expected_remote"])
+            except repo_git.WorkspaceError as error:
+                raise JobError(error.code) from None
+            return {"ok": True, "action": action, "repository": payload["repository"], "branch": branch, "commit": commit}
         if action == "setup":
             info = self.jobs.setup()
             test = self.jobs.selftest()
@@ -827,6 +867,7 @@ class Executor:
             "lab_prepare": (self._lab_prepare, ("client", "repository", "commit", "version")),
             "lab_checkout": (self._lab_checkout, ("client", "repository", "commit", "bundle_sha256")),
             "lab_fetch": (self._lab_fetch, ("client", "repository", "commit", "bundle_sha256")),
+            "lab_push_ready": (self._git_push_ready, ("client", "repository", "branch", "commit", "expected")),
             "lab_start": (self.lab.start, ("client", "repository", "commit", "artifact_sha256", "scenario")),
             "lab_jobs": (self.lab.jobs, ("client",)),
             "lab_job_status": (self.lab.status, ("client", "job")),

@@ -50,9 +50,9 @@ class JobError(Exception):
 class SystemdBackend:
     enforces_limits = True          # the self-test must SEE the limits from inside, or it fails
 
-    def start(self, job_id, argv, workspace, limits, run_user, masked=(), io_devices=(), stdin=subprocess.DEVNULL):
+    def start(self, job_id, argv, workspace, limits, run_user, masked=(), io_devices=(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE):
         cmd = runner.unit_command(job_id, argv, workspace, run_user=run_user, masked=masked, io_devices=io_devices, **limits)
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=stdin, env=_ENV,
+        return subprocess.Popen(cmd, stdout=stdout, stderr=subprocess.STDOUT, stdin=stdin, env=_ENV,
                                 start_new_session=True)
 
     def cancel(self, job_id, proc):
@@ -70,10 +70,10 @@ class LocalBackend:
     """Root sandbox only: same argv, same fixed environment, real uid/gid drop, no systemd."""
     enforces_limits = False
 
-    def start(self, job_id, argv, workspace, limits, run_user, masked=(), io_devices=(), stdin=subprocess.DEVNULL):
+    def start(self, job_id, argv, workspace, limits, run_user, masked=(), io_devices=(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE):
         pw = pwd.getpwnam(run_user)
         cmd = ["setpriv", "--reuid=%d" % pw.pw_uid, "--regid=%d" % pw.pw_gid, "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--inh-caps=-all", "--"] + list(argv)
-        return subprocess.Popen(cmd, cwd=workspace, env=dict(runner.ENV), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        return subprocess.Popen(cmd, cwd=workspace, env=dict(runner.ENV), stdout=stdout, stderr=subprocess.STDOUT,
                                 stdin=stdin, start_new_session=True)
 
     def cancel(self, job_id, proc):
@@ -250,6 +250,40 @@ class JobRunner:
         argv = [self.python, "-IB", "-c", runner._GIT_WORKER[-1], repo_git.FETCH, commit, digest]
         job = self._start(real, repo_git.FETCH, argv, limits, 90, input_data=bundle)
         return {"job_id": job["job_id"], "verified_ref": repo_git.VERIFIED_REF_PREFIX + commit}
+
+    def export_push(self, workspace, branch, commit):
+        self.require_ready()
+        real = self._workspace_ok(workspace)
+        with self._ws_lock:
+            with self._lock:
+                if not self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
+                    raise JobError("workspace_not_enrolled")
+                busy = set(self._user_of.values())
+                user = next((account for account in self.pool if account not in busy), None)
+                if user is None or self._db.execute(
+                    "select 1 from jobs where workspace=? and state='running'", (real,)
+                ).fetchone():
+                    raise JobError("workspace_git_busy")
+            done = self._ask("grant", name=os.path.basename(real))
+            masked = self._safe_masked(real, [real + "/" + p for p in done["protected"]])
+            argv = [self.python, "-IB", "-c", runner._GIT_WORKER[-1], repo_git.EXPORT, branch, commit]
+            limits = {"seconds": 55, "memory_mb": 768, "tasks": 32, "writes": False}
+            job = secrets.token_hex(16)
+            with tempfile.TemporaryFile() as stream:
+                proc = self.backend.start(job, argv, real, limits, user, masked=masked, stdout=stream)
+                try:
+                    if proc.wait(timeout=65) != 0:
+                        raise JobError("git_push_export_refused")
+                except subprocess.TimeoutExpired:
+                    self.backend.cancel(job, proc)
+                    raise JobError("git_push_export_timed_out") from None
+                stream.seek(0)
+                bundle = stream.read(repo_git.BUNDLE_LIMIT + 1)
+            if not bundle.startswith(b"# v2 git bundle\n") and not bundle.startswith(b"# v3 git bundle\n"):
+                raise JobError("git_push_bundle_invalid")
+            if len(bundle) > repo_git.BUNDLE_LIMIT:
+                raise JobError("git_push_bundle_invalid")
+            return bundle
 
     def workspaces(self):
         return [dict(r) for r in self._db.execute("select * from workspaces order by path")]

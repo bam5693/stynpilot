@@ -135,6 +135,25 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
         return lab_call("workspace_fetch_stynpilot", device_id, "lab_fetch", repository=repository,
                         commit=commit, bundle_sha256=bundle_sha256)
 
+    @server.tool(name="commander_request_stynpilot_push", title="Request approval for one exact StyNpilot work-branch push",
+                 annotations=FILES_A_REQUEST,
+                 description="Request an independent passkey approval to publish one exact local work/test branch commit. Supply its current remote SHA, or forty zeros for a new branch. Fast-forward only.")
+    def request_repo_push(device_id: str, repository: str, branch: str, commit: str, expected_remote: str) -> dict:
+        def work(owner):
+            proposer = ctx.proposer
+            broker.runner("lab_push_ready", {"client": proposer.client, "repository": repository,
+                                             "branch": branch, "commit": commit, "expected": expected_remote})
+            expires = now() + timedelta(hours=1)
+            payload = {"kind": "runner", "action": "repo_push", "name": "stynpilot", "owner": owner,
+                       "device": device_id, "client": proposer.client, "repository": repository,
+                       "branch": branch, "commit": commit, "expected_remote": expected_remote,
+                       "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            result, _ = store.submit(kind="runner", software="stynpilot-repository-push", device=device_id,
+                                     owner=owner, proposer=proposer, payload=payload,
+                                     summary=render_summary(payload), expires=expires.timestamp())
+            return receipt(result)
+        return run("commander_request_stynpilot_push", device_id, work, write=True)
+
     @server.tool(name="dev_lab_start", title="Start an authorized offline test job", annotations=WORKS,
                  description="Start a fixed test for an exact commit and the installer-verified lab_source_sha256 from its release build record.")
     def dev_lab_start(device_id: str, repository: str, commit: str, artifact_sha256: str, scenario: str = "offline_normal") -> dict:

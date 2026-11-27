@@ -42,6 +42,7 @@ from pathlib import Path
 from ..ledger import LedgerError
 from .executor import ExecutionDenied
 from .lab import CALLS as LAB_CALLS
+from .repository_auth import ACTIONS as REPOSITORY_ACTIONS
 
 MAX_MESSAGE = 256 * 1024
 _HEX64 = re.compile(r"[a-f0-9]{64}\Z")
@@ -118,7 +119,8 @@ class BrokerService:
         payload = msg.get("payload")
         approving = isinstance(payload, dict) and (
             (msg.get("op") == "backup_admin" and payload.get("action") == "restore_root")
-            or (msg.get("op") == "runner_admin" and payload.get("action") in ("settle_inference", "lab_enroll", "repo_push"))
+            or (msg.get("op") == "runner_admin" and payload.get("action") in
+                ("settle_inference", "lab_enroll", "repo_push", *REPOSITORY_ACTIONS))
             or (msg.get("op") == "repository_credential_install" and payload.get("action") == "repo_credential"))
         exclusive = approving or (msg.get("op") == "runner" and msg.get("call") in
                                   ("inference_claim", "inference_finish", "lab_start", "lab_cancel", "lab_checkout", "lab_fetch"))

@@ -34,6 +34,14 @@ The authenticated client can list its archives, page refs and commit links, insp
 
 The private-history follow-up applies the existing secret-name policy to historical paths and redacts recognized credentials in the entire returned text. Contents of the original blob and bundle stay byte-identical. Protected paths are withheld from tree and comparison output. Redaction is heuristic, and private-archive grants remain an explicit owner decision. The read routes recheck retained storage and refuse inspection if recovery is unresolved or the store is unsafe or exceeds capacity.
 
+## Private repository authorization review
+
+Dev29 adds passkey-approved, client-specific and expiring private repository grants. The GitLab adapter uses an owner browser device sign-in, exact configured provider and repository, a pinned dedicated project-only provider account, and `read_repository` scope. The installer verifies the provider application, account and scope before retaining a credential. It renews on demand and requires a new sign-in after an uncertain refresh. The phone can revoke a grant or suspend and resume private access through new approved requests. Secrets stay in installer state, outside MCP, logs and the workspace runner. Push uses its separately approved policy and credentials.
+
+The broker must have an independently verified project-only GitLab account and a public device-flow application registered for `read_repository`. Their public identifiers and the exact HTTPS repository are set in the root-only `repository-authorization.json`. Without an enrolled source, the managed path refuses access. A GitLab grant pools no privileges across accounts. The repository readiness tool verifies native private Git read access without transmitting the credential or repository content to the client. The full private bundle transfer into the owner archive store is a separate remaining integration.
+
+GitHub App installation credentials can be narrowed to one repository with Contents read-only. Forgejo's OAuth authorization follows the user account's full rights, so this build leaves it disabled. A repository-specific Forgejo provider grant still needs an approved credential lifecycle. No broad OAuth or PAT fallback is offered by the new path. Run `restore-media.sh PACKAGE --repository-auth-case` for the disposable GitLab HTTPS fixture, owner passkey and MCP test with archive regression checks.
+
 ## Milestones and versions
 
 | Milestone | Scope | Debian package |
@@ -45,6 +53,7 @@ The private-history follow-up applies the existing secret-name policy to histori
 | Repository management | StyNpilot checkout, fetch and guarded native push | `0.1.0~dev26` released |
 | GitHub credential setup | Phone entry and transport hardening | `0.1.0~dev27` released |
 | Repository archives | Scoped archive inspection and adoption | `0.1.0~dev28` candidate |
+| Private repository authorization | Phone passkey grant and guided GitLab read authorization | `0.1.0~dev29` candidate |
 | Dev23 Stage 4 | Owner-side restoration | Following unused increment |
 
 Dev24 off-machine backup and Dev25 repository management are milestone labels. Every separately published package consumes a version increment.

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import json
 import os
 import re
 import threading
@@ -194,6 +195,46 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
                  description="Cancel your lab job through the installer. The recovery reservation is released only after the entire unit is quiescent.")
     def dev_lab_cancel(device_id: str, job_id: str) -> dict:
         return lab_call("dev_lab_cancel", device_id, "lab_cancel", job=job_id)
+
+    @server.tool(name="commander_request_repository_access", title="Request owner approval for private repository access",
+                 annotations=FILES_A_REQUEST,
+                 description="File authorize, revoke, suspend or resume for private repository access. Authorize supports read and fetch grants. New access requires the owner's phone passkey and provider sign-in. Push is separate.")
+    def repository_access_request(device_id: str, action: str, repository: str = "",
+                                  operations: list[str] | None = None, days: int = 0) -> dict:
+        def work(owner):
+            if action not in ("authorize", "revoke", "suspend", "resume"):
+                return _error("repository_grant_invalid")
+            modes = operations if operations is not None else []
+            if action == "authorize":
+                if modes not in (["read"], ["fetch"], ["read", "fetch"]) or not 1 <= days <= 30:
+                    return _error("repository_operation_not_supported")
+            elif modes or days:
+                return _error("repository_grant_invalid")
+            if (action in ("authorize", "revoke")) != bool(repository):
+                return _error("repository_grant_invalid")
+            profile = (broker.runner("repository_target", {"repository": repository}) if repository else
+                       {"origin": "", "authorization_profile": ""})
+            proposer = ctx.proposer
+            expires = now() + timedelta(minutes=20)
+            payload = {"kind": "runner", "action": "repository_" + action, "name": "repository-access", "owner": owner,
+                       "device": device_id, "client": proposer.client, "repository": repository,
+                       "operations": modes, "days": days, **profile,
+                       "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            binding = hashlib.sha256(json.dumps([proposer.client, repository, modes, days, profile], sort_keys=True)
+                                     .encode()).hexdigest()[:24]
+            result, _ = store.submit(kind="runner", software="repository-" + action + "-" + binding, device=device_id, owner=owner,
+                                     proposer=proposer, payload=payload, summary=render_summary(payload), expires=expires.timestamp())
+            return receipt(result)
+        return run("commander_request_repository_access", device_id, work, write=True)
+
+    @server.tool(name="repository_access_grants", title="List your private repository grants", annotations=READ_ONLY)
+    def repository_access_grants(device_id: str) -> dict:
+        return lab_call("repository_access_grants", device_id, "repository_grants")
+
+    @server.tool(name="repository_private_readiness", title="Verify your private repository read grant",
+                 annotations=READ_ONLY, description="Check the configured repository's private Git read endpoint. Returns no credential or source data.")
+    def repository_private_readiness(device_id: str, repository: str) -> dict:
+        return lab_call("repository_private_readiness", device_id, "repository_probe", repository=repository)
 
     if archive_store is not None:
         def inspect(tool, device_id, method, *args):

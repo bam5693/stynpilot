@@ -322,7 +322,9 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         response = JSONResponse({"ok": True, "state": outcome["state"], "next": "/approve/status/" + outcome["request_id"]},
                                 headers={"Cache-Control": "no-store"})
         try:
-            keep = flow.status(outcome["request_id"]).get("kind") == "passkey"       # the enrollment page needs this browser session
+            rid = outcome["request_id"]
+            payload = flow.store.payload(rid) or {}
+            keep = flow.status(rid).get("kind") == "passkey" or payload.get("action") == "repository_authorize"
         except Exception:
             keep = False
         if not keep:
@@ -420,6 +422,13 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
             extra += "<p>Reason: <code>%s</code></p>" % html.escape(str(result["stopped"])[:80])
         if record.get("kind") == "passkey" and state == "done" and result.get("enrollment_open"):
             extra += "<p><a href='/approve/enroll/%s'>Create the passkey now</a> (fingerprint or screen lock).</p>" % html.escape(rid)
+        if state == "done" and result.get("action") == "repository_authorize":
+            try:
+                csrf = await run_in_threadpool(flow.repository_session, rid, request.cookies.get(COOKIE, ""))
+            except ApprovalError:
+                extra += "<p>Continue provider sign-in in the browser that approved this request.</p>"
+            else:
+                extra += repository_form(rid, csrf, False)
         if result.get("kid"):
             extra += "<p>Passkey short ID: <code>%s</code></p>" % html.escape(str(result["kid"]))
         if result.get("limits"):
@@ -437,7 +446,35 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         return _page("Status", "%s<h1>%s</h1><p>%s</p>%s" % (refresh, html.escape(state.replace("_", " ").title()),
                                                           html.escape(_STATUS_TEXT.get(state, state)), extra))
 
+    def repository_form(rid, csrf, poll):
+        return ("<form method=post action='/approve/repository/%s'><input type=hidden name=csrf value='%s'>"
+                "<button name=step value='%s'>%s</button></form>"
+                % (html.escape(rid), html.escape(csrf), "check" if poll else "start",
+                   "Check connection after sign-in" if poll else "Connect repository"))
+
+    async def repository(request):
+        rid = request.path_params["rid"]
+        if not _RID.fullmatch(rid) or request.headers.get("origin") != allowed_origin:
+            return _page("Refused", "<p>Refused.</p>", 403)
+        raw = await request.body()
+        if len(raw) > MAX_FORM:
+            return _page("Refused", "<p>Refused.</p>", 413)
+        form = urllib.parse.parse_qs(raw.decode("ascii"), max_num_fields=3)
+        csrf, step = form.get("csrf", [""])[0], form.get("step", [""])[0]
+        if step not in ("start", "check"):
+            return _page("Refused", "<p>Refused.</p>", 403)
+        result = await run_in_threadpool(flow.repository_connect, rid, request.cookies.get(COOKIE, ""), csrf, step == "check")
+        if result.get("state") == "connected":
+            response = _page("Repository connected", "<h1>Repository connected</h1><p>You can return to your conversation.</p>")
+            response.delete_cookie(COOKIE, path="/approve")
+            return response
+        url = html.escape(result["url"], quote=True)
+        return _page("Connect repository", "<h1>Connect repository</h1><p><a target=_blank rel='noopener noreferrer' href='%s'>"
+                     "Open provider sign-in</a>. Sign in with the dedicated project account, then return here.</p>%s"
+                     % (url, repository_form(rid, csrf, True)))
+
     return Starlette(routes=[Route("/approve/choose", wrap(choose), methods=["POST"]),
+                             Route("/approve/repository/{rid}", wrap(repository), methods=["POST"]),
                              Route("/approve/passkey", wrap(passkey, may_have_acted=True), methods=["POST"]),
                              Route("/approve/enroll/finish", wrap(enroll_finish), methods=["POST"]),
                              Route("/approve/enroll/{rid}", wrap(enroll), methods=["GET"]),

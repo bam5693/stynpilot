@@ -23,7 +23,7 @@ def git(*argv):
                                     "user.email=a@example.invalid", "-C", str(path), *argv],
                                    env=repo_git._ENV).decode().strip()
 git("init", "-q", "-b", "main")
-(path / "README").write_text("first\n")
+(path / "README").write_text("first\n" + ("password=only-in-old-commit\n" if sys.argv[2] == "redact" else ""))
 git("add", "README"); git("commit", "-qm", "first"); git("tag", "-am", "first", "v1")
 old = git("rev-parse", "HEAD")
 (path / "README").write_text("second\n"); git("commit", "-qam", "second")
@@ -40,10 +40,12 @@ print(json.dumps([old, new, rows]))
 '''
 
 
-def main():
-    key = fixture.setup(check_restore_path=False, lab=True)
+def main(key=None, *, require_redaction=False):
+    if key is None:
+        key = fixture.setup(check_restore_path=False, lab=True)
     old, new, rows = json.loads(fixture.as_owner("/usr/bin/python3", "-IB", "-c", SEED,
-                                                  str(fixture.HOME / "archive-fixture")).stdout)
+                                                  str(fixture.HOME / "archive-fixture"),
+                                                  "redact" if require_redaction else "original").stdout)
     ids = []
     for i, (path, manifest, bundle) in enumerate(rows):
         command = ["/usr/bin/stynpilot", "archive-adopt", "--config", str(fixture.CONFIG), "--archive", path,
@@ -82,7 +84,12 @@ def main():
         assert ok("refs", archive_id=ids[0], limit=1)["next_offset"] == 1
         assert ok("history", archive_id=ids[0], commit=new, limit=1)["items"][0]["parents"] == [old]
         assert ok("tree", archive_id=ids[0], commit=new)["items"][0]["path"] == "README"
-        assert ok("file", archive_id=ids[0], commit=old, path="README")["text"] == "first\n"
+        historical = ok("file", archive_id=ids[0], commit=old, path="README")
+        if require_redaction:
+            assert historical["text"].startswith("first\n") and "only-in-old-commit" not in historical["text"]
+            assert historical["redacted"] == {"secret-assignment": 1}
+        else:
+            assert historical["text"] == "first\n"
         pair = dict(left_archive_id=ids[0], left_commit=old, right_archive_id=ids[1], right_commit=new)
         assert ok("compare", **pair)["total"] == 1
         assert call("compare", client="fixture-other", **pair)["error"] == "archive_not_found"

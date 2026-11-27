@@ -663,6 +663,14 @@ def build_installer(config, *, jwks, jwks_loader=None, run_command=apt.real_run,
     # An existing durable claim forbids silently recreating a missing fence.
     if (require_root and config.state_dir == Path("/var/lib/stynpilot-installer")
             and config.socket_path == Path("/run/stynpilot/installer.sock")):
+        from .broker import repository_auth
+        from . import repo_archive, vault
+        if executor.passkeys is not None:
+            try:
+                targets = repository_auth.load_targets(Path("/etc/stynpilot/repository-authorization.json"))
+                executor.repositories = repository_auth.Store(config.state_dir, targets)
+            except (OSError, ValueError, repo_archive.ArchiveError, repository_auth.AuthorizationError, vault.VaultError) as error:
+                logging.getLogger("stynpilot.repository").warning("repository authorization unavailable: %s", type(error).__name__)
         from . import inference_fence, managed_activity
         if executor.authority is not None and executor.lab is None:
             from .broker.lab import LabJobs

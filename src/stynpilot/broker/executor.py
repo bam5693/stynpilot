@@ -59,7 +59,7 @@ from .. import backup, release, vault
 from . import apt
 from .. import runner as runner_policy
 from .jobs import JobError
-from . import lab
+from . import lab, repository_auth
 from .selftest import clean_diagnostics
 from .passkeys import PasskeyError
 from .release_authority import AuthorityError, _write_private
@@ -231,6 +231,7 @@ class Executor:
         self.passkeys = passkeys                  # PasskeyStore or None (passkeys not configured)
         self.authority = authority                # release_authority.Authority or None (release publishing not configured)
         self.lab = lab_jobs
+        self.repositories = None
         self._sleep = sleep
         self._builds = {}
         self._build_lock = threading.Lock()
@@ -460,6 +461,8 @@ class Executor:
                 raise ExecutionDenied("lab_enrollment_requires_passkey")
             if payload.get("action") == "repo_push":
                 raise ExecutionDenied("git_push_requires_passkey")
+            if payload.get("action") in repository_auth.ACTIONS:
+                raise ExecutionDenied("repository_access_requires_passkey")
         self._used_passkey(passkey, rid, decision)
         self.runs.consume(challenge=challenge, request_id=rid, decision=decision, proof=fingerprint, kind=kind)
         return rid
@@ -733,6 +736,8 @@ class Executor:
 
     def _check_runner_payload(self, payload):
         action = payload.get("action")
+        if action in repository_auth.ACTIONS:
+            return self._check_repository_payload(payload)
         lab_request = action == "lab_enroll"
         if self.jobs is None and not lab_request:
             raise ExecutionDenied("runner_not_available")
@@ -794,6 +799,31 @@ class Executor:
             raise ExecutionDenied("runner_not_set_up")
         return payload
 
+    def _check_repository_payload(self, payload):
+        action, repository = payload["action"], payload.get("repository")
+        if self.repositories is None or self.passkeys is None:
+            raise ExecutionDenied("repository_authorization_unavailable")
+        fields = self._RUNNER_KEYS | {"client", "repository", "operations", "days", "origin", "authorization_profile"}
+        if (set(payload) != fields or payload["owner"] != self.owner or payload["device"] != self.device
+                or payload["name"] != "repository-access"):
+            raise ExecutionDenied("repository_grant_invalid")
+        try:
+            self.repositories.validate(action, payload["client"], repository, payload["operations"], payload["days"])
+            expected = self.repositories.describe(repository) if repository else {"origin": "", "authorization_profile": ""}
+        except repository_auth.AuthorizationError as error:
+            raise ExecutionDenied(error.code) from None
+        if any(payload[key] != value for key, value in expected.items()):
+            raise ExecutionDenied("repository_authorization_profile_changed")
+        try:
+            expires = datetime.strptime(payload["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            raise ExecutionDenied("repository_grant_invalid") from None
+        if not 0 < (expires - datetime.now(timezone.utc)).total_seconds() <= 3600:
+            raise ExecutionDenied("plan_invalid_or_expired")
+        if self.needs_attention() or self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
+            raise ExecutionDenied("repository_grant_decision_unavailable")
+        return payload
+
     def runner_admin(self, payload, proof_token, challenge):
         """Execute owner-approved runner changes through the single proof gate."""
         if type(payload) is dict and payload.get("action") == "repo_credential":
@@ -810,7 +840,8 @@ class Executor:
                 rid = self._decide(payload, proof_token, challenge, "approve", "runner")
                 try:
                     result = self._runner_do(payload)
-                except (JobError, runner_policy.RunnerError, managed_activity.ActivityError, lab.LabError) as stopped:
+                except (JobError, runner_policy.RunnerError, managed_activity.ActivityError, lab.LabError,
+                        repository_auth.AuthorizationError) as stopped:
                     result = {"ok": False, "stopped": stopped.code, "changed_anything": None, "action": payload["action"]}
                 except Exception as error:
                     result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__, "changed_anything": None,
@@ -849,6 +880,9 @@ class Executor:
 
     def _runner_do(self, payload):
         action = payload["action"]
+        if action in repository_auth.ACTIONS:
+            return self.repositories.apply(action, payload["client"], payload["repository"], payload["operations"],
+                                           payload["days"], payload_hash(payload)[0])
         if action == "lab_enroll":
             return self.lab.enroll(payload["client"])
         if action == "repo_push":
@@ -897,6 +931,8 @@ class Executor:
             raise ExecutionDenied("runner_call_invalid")
         if call in lab.CALLS:
             return self._lab_call(call, args)
+        if call in {"repository_target", "repository_grants", "repository_connect", "repository_probe"}:
+            return self._repository_call(call, args)
         if self.jobs is None:
             raise ExecutionDenied("runner_not_available")
         self._settle_upgrades()
@@ -906,6 +942,21 @@ class Executor:
             return self._runner_green(call, args)
         except (JobError, runner_policy.RunnerError) as stopped:
             raise ExecutionDenied(stopped.code) from None
+
+    def _repository_call(self, call, args):
+        if self.repositories is None or self.passkeys is None:
+            raise ExecutionDenied("repository_authorization_unavailable")
+        methods = {"repository_target": (self.repositories.describe, ("repository",)),
+                   "repository_grants": (self.repositories.status, ("client",)),
+                   "repository_probe": (self.repositories.probe, ("client", "repository")),
+                   "repository_connect": (self.repositories.connect, ("request_id", "poll"))}
+        method, keys = methods[call]
+        if set(args) != set(keys):
+            raise ExecutionDenied("repository_grant_invalid")
+        try:
+            return method(*(args[key] for key in keys))
+        except (OSError, repository_auth.AuthorizationError, vault.VaultError) as error:
+            raise ExecutionDenied(getattr(error, "code", "repository_state_untrusted")) from None
 
     def _lab_call(self, call, args):
         if self.lab is None or self.passkeys is None:

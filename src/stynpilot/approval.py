@@ -115,6 +115,8 @@ class ApprovalFlow:
                     "lab_enroll": "lab_enrollment_requires_passkey",
                     "repo_push": "git_push_requires_passkey",
                     "repo_credential": "repository_credential_requires_passkey"}.get(payload.get("action"))
+        if payload.get("action") in ("repository_authorize", "repository_revoke", "repository_suspend", "repository_resume"):
+            required = "repository_access_requires_passkey"
         with self._lock:
             self._sweep()
             if len(self._views) >= MAX_VIEWS:
@@ -278,6 +280,28 @@ class ApprovalFlow:
         if item is None:
             raise ApprovalError("page_expired")
         return item["request_id"]
+
+    def repository_session(self, rid, view):
+        with self._lock:
+            self._sweep()
+            item = self._views.get(view if type(view) is str else "")
+            if item is None or not item.get("used") or item["request_id"] != rid:
+                raise ApprovalError("repository_sign_in_not_for_this_browser")
+            csrf = item["csrf"]
+        status = self.status(rid)
+        result = status.get("result") or {}
+        if status["state"] != "done" or result.get("action") != "repository_authorize":
+            raise ApprovalError("repository_sign_in_not_for_this_browser")
+        return csrf
+
+    def repository_connect(self, rid, view, csrf, poll):
+        expected = self.repository_session(rid, view)
+        if type(csrf) is not str or not hmac.compare_digest(csrf, expected):
+            raise ApprovalError("csrf_check_failed")
+        try:
+            return self.broker.runner("repository_connect", {"request_id": rid, "poll": poll})
+        except Exception as error:
+            raise ApprovalError(getattr(error, "code", "repository_sign_in_unavailable")) from None
 
     # -- passkey enrollment: after an enrollment request is approved, the phone creates the key -------------------------------
     def enroll_page(self, request_id, session=""):

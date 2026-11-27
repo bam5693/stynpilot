@@ -144,6 +144,18 @@ def render_summary(payload):
     if payload.get("kind") == "runner":
         expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
         name = str(payload.get("name"))
+        if payload.get("action") == "repository_authorize":
+            return ["Authorize %s for %s." % (payload["client"], payload["origin"]),
+                    "Approved operations %s for %d days." % (", ".join(payload["operations"]), payload["days"]),
+                    "Continue in the provider browser with the dedicated project-only account. This approval never authorizes a push.", expires]
+        if payload.get("action") == "repository_revoke":
+            return ["Revoke %s's private repository grant for %s." % (payload["client"], payload["origin"]),
+                    "This clears the local grant and credential. Existing archives and repository files stay in place.", expires]
+        if payload.get("action") == "repository_suspend":
+            return ["Suspend all new private repository operations through StyNpilot.",
+                    "Existing archives stay in place. Resuming requires another owner approval.", expires]
+        if payload.get("action") == "repository_resume":
+            return ["Resume private repository operations under existing unexpired grants.", expires]
         if payload.get("action") == "lab_enroll":
             return ["Authorize AI client %s to run the fixed offline development test profile %s for repository %s."
                     % (payload["client"], payload["profile"], payload["repository"]),

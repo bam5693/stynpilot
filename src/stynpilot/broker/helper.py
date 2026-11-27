@@ -41,7 +41,7 @@ class SystemdHelper:
     def __init__(self, owner_user, python="/usr/bin/python3"):
         self.owner_user, self.python = owner_user, python
 
-    def call(self, request, timeout=DEFAULT_TIMEOUT):
+    def call(self, request, timeout=DEFAULT_TIMEOUT, *, data=None):
         """One owner-side operation with a HARD deadline: systemd itself ends the unit at ``timeout`` (RuntimeMaxSec), and if the
         client is still hanging a little later the unit is stopped by name and the call fails. A slow measurement is a failed one."""
         writable = request.get("home") if request.get("op") == "prepare" else request.get("projects")
@@ -52,9 +52,12 @@ class SystemdHelper:
                "-p", "ProtectKernelModules=yes", "-p", "RestrictAddressFamilies=AF_UNIX", "-p", "TimeoutStopSec=5"]
         if writable:
             cmd += ["-p", "ReadWritePaths=" + str(writable)]
-        cmd += ["--", self.python, "-I", HELPER, json.dumps(request)]
+        if data is not None:
+            cmd += ["-p", "MemoryMax=768M", "-p", "MemorySwapMax=0", "-p", "TasksMax=32",
+                    "-p", "CPUQuota=200%", "-p", "LimitFSIZE=64M", "-p", "KillMode=control-group", "-p", "UMask=0077"]
+        cmd += ["--", self.python, "-IB", HELPER, json.dumps(request)]
         try:
-            done = subprocess.run(cmd, capture_output=True, timeout=timeout + SLACK, env=_ENV, check=False)
+            done = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout + SLACK, env=_ENV, check=False)
         except subprocess.TimeoutExpired:
             try:
                 subprocess.run(["systemctl", "kill", "--signal=SIGKILL", unit + ".service"], capture_output=True, timeout=STOP_WAIT,
@@ -72,12 +75,12 @@ class LocalHelper:
     def __init__(self, owner_uid, owner_gid=None, python=None):
         self.owner_uid, self.owner_gid, self.python = owner_uid, owner_gid, python or sys.executable
 
-    def call(self, request, timeout=DEFAULT_TIMEOUT):
+    def call(self, request, timeout=DEFAULT_TIMEOUT, *, data=None):
         gid = self.owner_gid if self.owner_gid is not None else self.owner_uid
         cmd = ["setpriv", "--reuid=%d" % self.owner_uid, "--regid=%d" % gid, "--clear-groups", "--no-new-privs", "--bounding-set=-all",
                "--inh-caps=-all", "--", self.python, "-I", HELPER, json.dumps(request)]
         try:
-            done = subprocess.run(cmd, capture_output=True, timeout=timeout, env=dict(_ENV), check=False, cwd="/")
+            done = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout, env=dict(_ENV), check=False, cwd="/")
         except subprocess.TimeoutExpired:
             raise HelperError("projects_helper_timed_out") from None
         except OSError:

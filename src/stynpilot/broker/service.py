@@ -120,7 +120,7 @@ class BrokerService:
             (msg.get("op") == "backup_admin" and payload.get("action") == "restore_root")
             or (msg.get("op") == "runner_admin" and payload.get("action") in ("settle_inference", "lab_enroll")))
         exclusive = approving or (msg.get("op") == "runner" and msg.get("call") in
-                                  ("inference_claim", "inference_finish", "lab_start", "lab_cancel"))
+                                  ("inference_claim", "inference_finish", "lab_start", "lab_cancel", "lab_checkout", "lab_fetch"))
         try:
             with root_restore.admission(state, exclusive=exclusive):
                 if (root_restore.control(state) / "safe.json").exists():

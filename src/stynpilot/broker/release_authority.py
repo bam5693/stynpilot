@@ -43,6 +43,7 @@ from cryptography.hazmat.primitives import serialization
 from .. import release
 from .. import dev_lab_source, vault
 from ..release import ReleaseError
+from ..repo_git import BUNDLE_LIMIT, BUNDLE_REF
 
 API_HOST, UPLOAD_HOST = "api.github.com", "uploads.github.com"
 CLONE_URL = "https://github.com/%s.git" % release.REPOSITORY
@@ -274,7 +275,7 @@ class Authority:
         if rec is None:
             return {"state": "not_started"}
         return {k: rec[k] for k in ("state", "version", "why", "sha256", "size", "tests_passed", "tests_failed", "tests_skipped",
-                                    "reproducible", "commit", "started", "finished", "detail", "lab_source_sha256") if k in rec}
+                                    "reproducible", "commit", "started", "finished", "detail", "lab_source_sha256", "checkout_bundle_sha256") if k in rec}
 
     def prepare_check(self, commit, version):
         """Refuse an unusable request up front (before any background work)."""
@@ -433,7 +434,7 @@ class Authority:
                "-c", "protocol.https.allow=always", "-c", "advice.detachedHead=false"]
         ph = lambda name, argv, **kw: self._phase(commit, name, argv, work, **kw)
         steps = ((["/usr/bin/git", "init", "-q", "src"], False), (git + ["-C", "src", "remote", "add", "origin", self.clone_url], False),
-                 (git + ["-C", "src", "fetch", "-q", "--depth", "1", "origin", commit], True),
+                 (git + ["-C", "src", "fetch", "-q", "--no-tags"] + ([] if self.retain_lab_source else ["--depth", "1"]) + ["origin", commit], True),
                  (git + ["-C", "src", "checkout", "-q", "--detach", "FETCH_HEAD"], False))
         for n, (argv, net) in enumerate(steps):
             code, _ = ph("git%d" % n, argv, seconds=GIT_TIMEOUT, network=net, memory_mb=1024, tasks=64)
@@ -442,7 +443,7 @@ class Authority:
         code, out = ph("head", git + ["-C", "src", "rev-parse", "HEAD"], seconds=30, memory_mb=256, tasks=16)
         if code != 0 or out.strip().splitlines()[-1:] != [commit]:
             raise AuthorityError("could_not_fetch_that_exact_commit")
-        lab_digest = None
+        lab_digest = bundle_digest = None
         if self.retain_lab_source:
             code, _ = ph("lab-archive", git + ["-C", "src", "archive", "--format=tar",
                                               "--output=../lab-source.tar", commit],
@@ -454,6 +455,20 @@ class Authority:
             lab_digest = hashlib.sha256(source).hexdigest()
             vault._write_atomic(d, "lab-source.tar", source)
             del source
+            # Capture only the independently fetched revision, before tests
+            # or package code can mutate the workspace. A complete bundle is
+            # needed so an empty checkout can verify the commit ancestry.
+            for label, arguments in (
+                ("checkout-ref", ["update-ref", BUNDLE_REF, commit]),
+                ("checkout-bundle", ["bundle", "create", "../checkout.bundle", BUNDLE_REF]),
+            ):
+                code, _ = ph(label, git + ["-C", "src"] + arguments, seconds=60, memory_mb=512, tasks=32)
+                if code:
+                    raise AuthorityError("checkout_bundle_capture_failed")
+            bundle = self._read_lab_archive(work, "checkout.bundle", BUNDLE_LIMIT)
+            bundle_digest = hashlib.sha256(bundle).hexdigest()
+            vault._write_atomic(d, "checkout.bundle", bundle)
+            del bundle
         code, out = ph("version", ["/usr/bin/python3", "-I", "-c", _VERSION_SCRIPT], seconds=30, memory_mb=256, tasks=16)
         if code != 0 or out.strip().replace(".dev", "~dev") != version:
             raise AuthorityError("source_version_differs_from_requested_version")
@@ -500,20 +515,20 @@ class Authority:
         record = {"sha256": hashes[0], "size": len(datas[0]), "reproducible": True, "tests_passed": passed, "tests_failed": failed,
                   "tests_skipped": skipped, "deb": target.name}
         if lab_digest is not None:
-            record["lab_source_sha256"] = lab_digest
+            record.update(lab_source_sha256=lab_digest, checkout_bundle_sha256=bundle_digest)
         return record
 
-    def _read_lab_archive(self, work):
+    def _read_lab_archive(self, work, name="lab-source.tar", limit=dev_lab_source.MAX_ARCHIVE):
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
         top = os.open(work, flags | os.O_DIRECTORY)
         try:
-            fd = os.open("lab-source.tar", flags | os.O_NONBLOCK, dir_fd=top)
+            fd = os.open(name, flags | os.O_NONBLOCK, dir_fd=top)
             with os.fdopen(fd, "rb") as source:
                 info = os.fstat(fd)
                 if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                        or info.st_uid != self.build_uid or not 0 < info.st_size <= dev_lab_source.MAX_ARCHIVE):
+                        or info.st_uid != self.build_uid or not 0 < info.st_size <= limit):
                     raise AuthorityError("lab_source_archive_invalid")
-                data = source.read(dev_lab_source.MAX_ARCHIVE + 1)
+                data = source.read(limit + 1)
                 if len(data) != info.st_size:
                     raise AuthorityError("lab_source_archive_invalid")
                 return data
@@ -538,6 +553,26 @@ class Authority:
             return data
         except (OSError, vault.VaultError):
             raise AuthorityError("lab_source_archive_unavailable") from None
+        finally:
+            os.close(lock)
+
+    def checkout_bundle(self, commit, digest):
+        if (type(commit) is not str or not _HEX40.fullmatch(commit) or type(digest) is not str
+                or not dev_lab_source.SHA256.fullmatch(digest) or self.repository != release.REPOSITORY):
+            raise AuthorityError("checkout_binding_invalid")
+        lock = self._take_lock()
+        try:
+            record = self.status(commit)
+            if (record.get("state") != "ready" or record.get("commit") != commit
+                    or record.get("tests_failed") != 0 or record.get("reproducible") is not True
+                    or record.get("checkout_bundle_sha256") != digest):
+                raise AuthorityError("checkout_bundle_not_verified")
+            data = vault._read_private(self._dir(commit) / "checkout.bundle", BUNDLE_LIMIT)
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise AuthorityError("checkout_bundle_digest_mismatch")
+            return data
+        except (OSError, vault.VaultError):
+            raise AuthorityError("checkout_bundle_unavailable") from None
         finally:
             os.close(lock)
 

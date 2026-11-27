@@ -23,6 +23,7 @@ import signal
 import sqlite3
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -49,9 +50,9 @@ class JobError(Exception):
 class SystemdBackend:
     enforces_limits = True          # the self-test must SEE the limits from inside, or it fails
 
-    def start(self, job_id, argv, workspace, limits, run_user, masked=(), io_devices=()):
+    def start(self, job_id, argv, workspace, limits, run_user, masked=(), io_devices=(), stdin=subprocess.DEVNULL):
         cmd = runner.unit_command(job_id, argv, workspace, run_user=run_user, masked=masked, io_devices=io_devices, **limits)
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=_ENV,
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=stdin, env=_ENV,
                                 start_new_session=True)
 
     def cancel(self, job_id, proc):
@@ -69,11 +70,11 @@ class LocalBackend:
     """Root sandbox only: same argv, same fixed environment, real uid/gid drop, no systemd."""
     enforces_limits = False
 
-    def start(self, job_id, argv, workspace, limits, run_user, masked=(), io_devices=()):
+    def start(self, job_id, argv, workspace, limits, run_user, masked=(), io_devices=(), stdin=subprocess.DEVNULL):
         pw = pwd.getpwnam(run_user)
         cmd = ["setpriv", "--reuid=%d" % pw.pw_uid, "--regid=%d" % pw.pw_gid, "--clear-groups", "--no-new-privs", "--bounding-set=-all", "--inh-caps=-all", "--"] + list(argv)
         return subprocess.Popen(cmd, cwd=workspace, env=dict(runner.ENV), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+                                stdin=stdin, start_new_session=True)
 
     def cancel(self, job_id, proc):
         _kill_group(proc)
@@ -223,6 +224,33 @@ class JobRunner:
                     raise
         return {"workspace": path, "removed": True}
 
+    def import_checkout(self, workspace, commit, digest, bundle):
+        self.require_ready()
+        real = self._workspace_ok(workspace)
+        with self._ws_lock:
+            with self._lock:
+                if not self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
+                    raise JobError("workspace_not_enrolled")
+                if self._db.execute("select 1 from jobs where workspace=? and state='running'", (real,)).fetchone():
+                    raise JobError("workspace_git_busy")
+            base = self._measure(real, local=False)
+            if base["free"] < self.disk_start_free:
+                raise JobError("not_enough_free_disk_space_to_start_a_job")
+            request = {"op": "import_checkout", "home": self.home, "projects": self.projects_dir,
+                       "name": os.path.basename(real), "commit": commit, "digest": digest}
+            try:
+                return self.helper.call(request, timeout=90, data=bundle)
+            except HelperError as error:
+                raise JobError(error.code) from None
+
+    def fetch_checkout(self, workspace, commit, digest, bundle):
+        self.require_ready()
+        real = self._workspace_ok(workspace)
+        limits = {"seconds": 90, "memory_mb": 768, "tasks": 32, "writes": True}
+        argv = [self.python, "-IB", "-c", runner._GIT_WORKER[-1], repo_git.FETCH, commit, digest]
+        job = self._start(real, repo_git.FETCH, argv, limits, 90, input_data=bundle)
+        return {"job_id": job["job_id"], "verified_ref": repo_git.VERIFIED_REF_PREFIX + commit}
+
     def workspaces(self):
         return [dict(r) for r in self._db.execute("select * from workspaces order by path")]
 
@@ -268,7 +296,7 @@ class JobRunner:
             return True
         return False
 
-    def _start(self, real, label, argv, limits, seconds, need_enrolled=True, masked=None, run_user=None):
+    def _start(self, real, label, argv, limits, seconds, need_enrolled=True, masked=None, run_user=None, input_data=None):
         self.ensure_user()
         with self._ws_lock:
             if need_enrolled:
@@ -276,7 +304,7 @@ class JobRunner:
                     running = self._db.execute(
                         "select recipe from jobs where workspace=? and state='running'", (real,)
                     ).fetchall()
-                    if running and (label in repo_git.RECIPES or any(row["recipe"] in repo_git.RECIPES for row in running)):
+                    if running and (label in repo_git.MUTATIONS or any(row["recipe"] in repo_git.MUTATIONS for row in running)):
                         raise JobError("workspace_git_busy")
                     if not self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
                         raise JobError("workspace_not_enrolled")
@@ -303,7 +331,14 @@ class JobRunner:
                 self._user_of[job_id] = user
                 self._info[job_id] = {"base": base, "masked": masked}
                 try:
-                    proc = self.backend.start(job_id, argv, real, limits, user, masked=masked, io_devices=base["devices"])
+                    kwargs = {"masked": masked, "io_devices": base["devices"]}
+                    if input_data is None:
+                        proc = self.backend.start(job_id, argv, real, limits, user, **kwargs)
+                    else:
+                        with tempfile.TemporaryFile() as stream:
+                            stream.write(input_data)
+                            stream.seek(0)
+                            proc = self.backend.start(job_id, argv, real, limits, user, stdin=stream, **kwargs)
                 except OSError:
                     self._db.execute("update jobs set state='failed', ended=? where id=?", (int(self.clock()), job_id))
                     self._user_of.pop(job_id, None)

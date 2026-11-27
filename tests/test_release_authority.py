@@ -61,6 +61,8 @@ class FakeMachine:
                 self.fetched = args[-1]
             elif "rev-parse" in args:
                 return 0, "...\n" + (self.commit or self.fetched) + "\n"
+            elif "bundle" in args:
+                (work / "checkout.bundle").write_bytes(b"fixture git bundle")
             elif "archive" in args:
                 (work / "lab-source.tar").write_bytes(self.LAB_SOURCE)
             return 0, ""
@@ -195,6 +197,13 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(self.auth.lab_artifact(COMMIT, digest), self.machine.LAB_SOURCE)
         with self.assertRaisesRegex(AuthorityError, "lab_source_not_verified"):
             self.auth.lab_artifact(COMMIT, "1" * 64)
+        bundle_sha = record["checkout_bundle_sha256"]
+        self.assertEqual(self.auth.checkout_bundle(COMMIT, bundle_sha), b"fixture git bundle")
+        with self.assertRaisesRegex(AuthorityError, "checkout_bundle_not_verified"):
+            self.auth.checkout_bundle(COMMIT, "1" * 64)
+        (self.auth._dir(COMMIT) / "checkout.bundle").write_bytes(b"changed")
+        with self.assertRaisesRegex(AuthorityError, "checkout_bundle_digest_mismatch"):
+            self.auth.checkout_bundle(COMMIT, bundle_sha)
 
     def test_a_good_build_is_recorded_with_everything_the_owner_will_see(self):
         got = self.prepared()

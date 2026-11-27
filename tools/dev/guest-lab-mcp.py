@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 
 # This fixture enforces the disposable DMI, root and NIC checks on import.
@@ -161,12 +162,52 @@ def main():
             assert (result["exit_code"] == 0) == succeeds, (result, output)
             return output
 
-        git("init", "--quiet", "--initial-branch=main", "--template=")
-        git("remote", "add", "origin", "https://github.com/bam5693/stynpilot.git")
-        ok("workspace_write", workspace_name=workspace, path="base.txt", content="base\n")
-        git("add", "--", "base.txt")
-        git("commit", "--quiet", "-m", "fixture base")
-        base = git("rev-parse", "HEAD")
+        repo = lab.REPOSITORY
+
+        def seed_bundle(source, commit, bundle):
+            fixture.command("/usr/bin/git", "-C", str(source), "update-ref", "refs/heads/stynpilot-import", commit)
+            fixture.command("/usr/bin/git", "-C", str(source), "bundle", "create", str(bundle), "refs/heads/stynpilot-import")
+            data = bundle.read_bytes()
+            digest = hashlib.sha256(data).hexdigest()
+            record = fixture.STATE / "release/builds" / commit
+            record.mkdir(mode=0o700)
+            path = record / "checkout.bundle"
+            path.write_bytes(data)
+            path.chmod(0o600)
+            fixture.write(record / "record.json", {"state": "ready", "commit": commit, "tests_failed": 0,
+                                                  "reproducible": True, "checkout_bundle_sha256": digest})
+            return {"repository": repo, "commit": commit, "bundle_sha256": digest}
+
+        with tempfile.TemporaryDirectory(prefix="fixture-source-") as scratch:
+            source, bundle = Path(scratch) / "source", Path(scratch) / "fixture.bundle"
+            source.mkdir()
+            def source_git(*args):
+                return fixture.command("/usr/bin/git", "-C", str(source), "-c", "user.name=Bundle fixture",
+                                       "-c", "user.email=fixture@example.invalid", *args)
+            source_git("init", "--quiet", "--initial-branch=main", "--template=")
+            (source / "base.txt").write_text("base\n")
+            source_git("add", "--", "base.txt")
+            source_git("commit", "--quiet", "-m", "fixture base")
+            base = source_git("rev-parse", "HEAD").strip()
+            prepared = seed_bundle(source, base, bundle)
+            assert call("workspace_checkout_stynpilot", **dict(prepared, bundle_sha256="f" * 64))["error"] == "checkout_bundle_not_verified"
+            assert ok("workspace_checkout_stynpilot", **prepared)["commit"] == base
+            assert call("workspace_checkout_stynpilot", **prepared)["error"] == "checkout_workspace_not_empty"
+            assert git("rev-parse", "HEAD") == base
+            (source / "base.txt").write_text("upstream\n")
+            source_git("commit", "--quiet", "-am", "fixture upstream")
+            upstream = source_git("rev-parse", "HEAD").strip()
+            imported = ok("workspace_fetch_stynpilot", **seed_bundle(source, upstream, bundle))
+            def fetched():
+                result = ok("job_status", job_id=imported["job_id"])
+                return result if result["state"] != "running" else None
+            result = fixture.until(fetched, 30)
+            output = ok("job_output", job_id=imported["job_id"])["text"].strip()
+            assert result["exit_code"] == 0, (result, output)
+            assert output == upstream, output
+            assert imported["verified_ref"] == "refs/stynpilot/verified/" + upstream
+            assert git("rev-parse", imported["verified_ref"]) == upstream and git("rev-parse", "HEAD") == base
+        print("STYNPILOT_PACKAGED_REPO_READ_OK", flush=True)
         assert git_job("git-work-branch", ["work/fixture", base]) == base
         assert git_job("git-work-branch", ["test/fixture", base]) == base
         ok("workspace_write", workspace_name=workspace, path="new.txt", content="new\n")
@@ -176,7 +217,7 @@ def main():
         assert changed == git("rev-parse", "HEAD") and git("show", changed + ":new.txt") == "new"
         assert git_job("git-work-switch", ["work/fixture", changed, base]) == base
         assert git_job("git-work-fast-forward", ["work/fixture", base, changed]) == changed
-        assert git("rev-parse", "main") == base and not git("status", "--porcelain")
+        assert git("rev-parse", "test/fixture") == changed and not git("status", "--porcelain")
         print("STYNPILOT_PACKAGED_GIT_MCP_OK", flush=True)
         assert call("dev_lab_start", **dict(fast, artifact_sha256="f" * 64))["error"] == "lab_source_not_verified"
 

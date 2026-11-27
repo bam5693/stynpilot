@@ -126,7 +126,7 @@ class LabBrokerTests(unittest.TestCase):
     def test_lab_can_prepare_current_version_only_after_enrollment(self):
         self.executor.authority = Mock()
         self.executor.authority.status.return_value = {
-            "state": "ready", "version": "0.1.0~dev25", "lab_source_sha256": DIGEST}
+            "state": "ready", "version": "0.1.0~dev25", "lab_source_sha256": DIGEST, "checkout_bundle_sha256": DIGEST}
         arguments = {"repository": lab.REPOSITORY, "commit": COMMIT, "version": "0.1.0~dev25"}
         self.assertEqual(self.call("lab_prepare", **arguments)["error"], "lab_enrollment_required")
         self.jobs.enroll("assistant")

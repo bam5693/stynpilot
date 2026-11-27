@@ -123,6 +123,18 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
     def dev_lab_prepare(device_id: str, repository: str, commit: str, version: str) -> dict:
         return lab_call("dev_lab_prepare", device_id, "lab_prepare", repository=repository, commit=commit, version=version)
 
+    @server.tool(name="workspace_checkout_stynpilot", title="Check out the verified StyNpilot revision", annotations=WORKS,
+                 description="Populate the empty enrolled StyNpilot workspace from an exact successful lab build and its checkout_bundle_sha256. Uses the existing lab grant and never replaces files in an occupied workspace.")
+    def workspace_checkout_stynpilot(device_id: str, repository: str, commit: str, bundle_sha256: str) -> dict:
+        return lab_call("workspace_checkout_stynpilot", device_id, "lab_checkout", repository=repository,
+                        commit=commit, bundle_sha256=bundle_sha256)
+
+    @server.tool(name="workspace_fetch_stynpilot", title="Fetch a verified StyNpilot revision into the workspace", annotations=WORKS,
+                 description="Import a successful lab build's exact revision into the enrolled StyNpilot checkout. Uses its checkout_bundle_sha256 and creates a local verified ref without switching the branch.")
+    def workspace_fetch_stynpilot(device_id: str, repository: str, commit: str, bundle_sha256: str) -> dict:
+        return lab_call("workspace_fetch_stynpilot", device_id, "lab_fetch", repository=repository,
+                        commit=commit, bundle_sha256=bundle_sha256)
+
     @server.tool(name="dev_lab_start", title="Start an authorized offline test job", annotations=WORKS,
                  description="Start a fixed test for an exact commit and the installer-verified lab_source_sha256 from its release build record.")
     def dev_lab_start(device_id: str, repository: str, commit: str, artifact_sha256: str, scenario: str = "offline_normal") -> dict:

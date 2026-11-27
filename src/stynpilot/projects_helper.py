@@ -22,9 +22,10 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from stynpilot import safefs  # noqa: E402
+from stynpilot import repo_git, safefs  # noqa: E402
 
 MAX_ENTRIES = 50000
 MAX_DEPTH = 64
@@ -400,8 +401,67 @@ def op_protected(request):
     return {"path": path, "protected": scan_protected(path)}
 
 
+def op_import_checkout(request):
+    """Import the broker's exact bundle as the owner, without network or existing Git config."""
+    if request.get("name") != repo_git.WORKSPACE:
+        raise Refuse("git_workspace_not_bound")
+    commit, digest = request.get("commit"), request.get("digest")
+    if (type(commit) is not str or not re.fullmatch(r"[a-f0-9]{40}", commit)
+            or type(digest) is not str or not re.fullmatch(r"[a-f0-9]{64}", digest)):
+        raise Refuse("checkout_binding_invalid")
+    path = _workspace(request)
+    if os.listdir(path):
+        # A lost response may be retried, but occupied workspaces are never
+        # inspected by Git with owner privileges or changed by this operation.
+        raise Refuse("checkout_workspace_not_empty")
+    try:
+        data = repo_git.read_bundle(commit, digest, sys.stdin.buffer)
+    except repo_git.WorkspaceError as error:
+        raise Refuse(error.code) from None
+    with tempfile.TemporaryDirectory(prefix=".stynpilot-checkout-", dir=request["projects"]) as scratch:
+        bundle = os.path.join(scratch, "checkout.bundle")
+        with open(bundle, "xb") as output:
+            output.write(data)
+        del data
+        target = os.path.join(scratch, "worktree")
+        os.mkdir(target, 0o700)
+        ref = repo_git.BUNDLE_REF
+        command = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                   "-c", "protocol.allow=never", "-c", "protocol.file.allow=always", "-C", target]
+
+        def git(*args):
+            result = subprocess.run(command + list(args), env=repo_git._ENV, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=35, check=False)
+            if result.returncode:
+                raise Refuse("checkout_git_refused")
+            return result.stdout
+
+        try:
+            git("init", "--quiet", "--template=")
+            if git("bundle", "list-heads", bundle).splitlines() != [f"{commit} {ref}".encode("ascii")]:
+                raise Refuse("checkout_commit_mismatch")
+            git("fetch", "--no-tags", "--no-recurse-submodules", "--", bundle, ref)
+            if git("rev-parse", "--verify", "FETCH_HEAD^{commit}").strip() != commit.encode("ascii"):
+                raise Refuse("checkout_commit_mismatch")
+            entries = git("ls-tree", "-rlz", commit).split(b"\0")[:-1]
+            sizes = [entry.split(b"\t", 1)[0].split()[-1] for entry in entries]
+            if (not entries or len(entries) > MAX_ENTRIES or any(not size.isdigit() for size in sizes)
+                    or sum(map(int, sizes)) > (64 << 20)):
+                raise Refuse("checkout_tree_exceeds_limits")
+            git("checkout", "--quiet", "--detach", "--no-recurse-submodules", commit)
+            git("remote", "add", "origin", repo_git.ORIGIN)
+        except subprocess.SubprocessError:
+            raise Refuse("checkout_git_timed_out") from None
+        # POSIX refuses to replace a nonempty directory, even if a file was
+        # added during import. The source was created by the same owner.
+        os.replace(target, path)
+    return {"workspace": repo_git.WORKSPACE, "repository": "bam5693/stynpilot", "commit": commit}
+
+
+
+
 OPS = {"prepare": op_prepare, "check": op_check, "home_names": op_home_names, "disk": op_disk, "enroll": op_enroll,
-       "grant": op_grant, "unenroll": op_unenroll, "protected": op_protected}
+       "grant": op_grant, "unenroll": op_unenroll, "protected": op_protected, "import_checkout": op_import_checkout}
 
 
 def main(argv):

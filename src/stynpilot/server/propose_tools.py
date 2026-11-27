@@ -48,7 +48,7 @@ RUNNER_WRITE_TOOLS = frozenset({"commander_prepare_stynpilot_release", "commande
                                 "commander_backup_now", "commander_backup_drill", "commander_request_backup_retention",
                                 "commander_request_backup_key_rotation", "commander_request_root_restore",
                                 "local_ai_submit", "local_ai_status", "local_ai_cancel", "commander_request_local_ai_settlement",
-                                "commander_request_dev_lab_enrollment", "dev_lab_prepare", "dev_lab_start", "dev_lab_jobs",
+                                "commander_request_dev_lab_enrollment", "workspace_checkout_stynpilot", "workspace_fetch_stynpilot", "dev_lab_prepare", "dev_lab_start", "dev_lab_jobs",
                                 "dev_lab_job_status", "dev_lab_job_output", "dev_lab_cancel"})
 PROPOSE_ONLY_TOOLS = frozenset({"commander_request_software_install", "commander_software_install_status",
                                 "commander_request_software_rollback", "commander_request_stynpilot_upgrade"}) | RUNNER_WRITE_TOOLS

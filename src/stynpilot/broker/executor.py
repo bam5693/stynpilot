@@ -825,6 +825,8 @@ class Executor:
         methods = {
             "lab_enrollment": (self.lab.enrollment, ("client", "repository")),
             "lab_prepare": (self._lab_prepare, ("client", "repository", "commit", "version")),
+            "lab_checkout": (self._lab_checkout, ("client", "repository", "commit", "bundle_sha256")),
+            "lab_fetch": (self._lab_fetch, ("client", "repository", "commit", "bundle_sha256")),
             "lab_start": (self.lab.start, ("client", "repository", "commit", "artifact_sha256", "scenario")),
             "lab_jobs": (self.lab.jobs, ("client",)),
             "lab_job_status": (self.lab.status, ("client", "job")),
@@ -840,8 +842,26 @@ class Executor:
                 if any(thread.is_alive() for thread in self._builds.values()):
                     raise ExecutionDenied("another_build_is_running")
             return method(*(args[key] for key in keys))
-        except (lab.LabError, dev_lab_policy.LabError, AuthorityError, managed_activity.ActivityError, vault.VaultError) as error:
+        except (JobError, lab.LabError, dev_lab_policy.LabError, AuthorityError, managed_activity.ActivityError, vault.VaultError) as error:
             raise ExecutionDenied(error.code) from None
+
+    def _workspace_git_bundle(self, client, repository, commit, bundle_sha256):
+        if not self.lab.enrollment(client, repository)["enrolled"]:
+            raise ExecutionDenied("lab_enrollment_required")
+        if self.jobs is None:
+            raise ExecutionDenied("runner_not_available")
+        self._no_other_change()
+        if managed_activity.held(self.dir):
+            raise ExecutionDenied("managed_activity_busy")
+        return self.authority.checkout_bundle(commit, bundle_sha256)
+
+    def _lab_checkout(self, client, repository, commit, bundle_sha256):
+        bundle = self._workspace_git_bundle(client, repository, commit, bundle_sha256)
+        return self.jobs.import_checkout(self._workspace_path("stynpilot"), commit, bundle_sha256, bundle)
+
+    def _lab_fetch(self, client, repository, commit, bundle_sha256):
+        bundle = self._workspace_git_bundle(client, repository, commit, bundle_sha256)
+        return self.jobs.fetch_checkout(self._workspace_path("stynpilot"), commit, bundle_sha256, bundle)
 
     def _lab_prepare(self, client, repository, commit, version):
         if not self.lab.enrollment(client, repository)["enrolled"]:
@@ -1010,7 +1030,7 @@ class Executor:
                 if state.get("state") == "building" and (not allow_current or (active and active.is_alive())):
                     return state
                 if (allow_current and state.get("state") == "ready" and state.get("version") == version
-                        and state.get("lab_source_sha256")):
+                        and state.get("lab_source_sha256") and state.get("checkout_bundle_sha256")):
                     return state
                 authority.prepare_check(commit, version)
                 self._builds = {sha: thread for sha, thread in self._builds.items() if thread.is_alive()}

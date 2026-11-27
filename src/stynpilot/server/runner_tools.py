@@ -561,8 +561,11 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
                               "the owner's other files, limited time/memory/processes. args are the recipe's few allowed options. Returns a "
                               "job_id; poll job_status and read job_output. Refused until the live sandbox self-test has passed. "
                               "For the enrolled StyNpilot checkout only: git-work-branch takes [new_branch, expected_head_sha]. "
-                              "git-work-commit takes [current_branch, expected_head_sha, message, tracked_file, ...]. "
-                              "Use work/ or test/ branch names and a full SHA. Neither recipe sends anything to a remote."))
+                              "git-work-commit takes [current_branch, expected_head_sha, message, file, ...]. "
+                              "git-work-switch takes [target_branch, expected_head_sha, expected_target_sha]. "
+                              "git-work-fast-forward takes [current_branch, expected_head_sha, local_target_sha]. "
+                              "Switch and fast-forward require a clean workspace. Use work/ or test/ names and full SHAs. "
+                              "These Git recipes run offline."))
     def job_run(device_id: str, workspace_name: str, recipe: str, args: list[str] | None = None) -> dict:
         def work(owner):
             workspace(workspace_name)

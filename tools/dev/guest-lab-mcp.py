@@ -117,21 +117,67 @@ def main():
         keys.open_window(enrollment, "Lab guest approver", "fixture")
         key = keys.complete(enrollment, auth.register(bytes.fromhex(keys.begin(enrollment)["challenge"])))
         keys.activate(key["kid"], key["label"], key["pub"], enrollment, "fixture")
-        with httpx.Client(base_url="http://127.0.0.1:18444", headers={"Host": HOST}, timeout=20, trust_env=False) as phone:
-            page = phone.get("/approve/" + filed["request_id"])
-            page.raise_for_status()
-            assert "Approval requires an enrolled passkey" in page.text
-            options = json.loads(html.unescape(re.search("data-o='([^']+)'", page.text).group(1)))
-            nonce = base64.urlsafe_b64decode(options["challenge"]["approve"] + "==")
-            proof = json.dumps(auth.assert_(nonce))
-            cookie = {COOKIE: options["view"]}
-            response = phone.post("/approve/passkey", cookies=cookie, headers={"Origin": "https://" + HOST},
-                                  json={"view": options["view"], "csrf": options["csrf"],
-                                        "decision": "approve", "assertion": proof})
-            assert response.json()["ok"], response.text
+        def approve(request_id, *, required=False):
+            with httpx.Client(base_url="http://127.0.0.1:18444", headers={"Host": HOST}, timeout=20, trust_env=False) as phone:
+                page = phone.get("/approve/" + request_id)
+                page.raise_for_status()
+                if required:
+                    assert "Approval requires an enrolled passkey" in page.text
+                options = json.loads(html.unescape(re.search("data-o='([^']+)'", page.text).group(1)))
+                nonce = base64.urlsafe_b64decode(options["challenge"]["approve"] + "==")
+                proof = json.dumps(auth.assert_(nonce))
+                cookie = {COOKIE: options["view"]}
+                response = phone.post("/approve/passkey", cookies=cookie, headers={"Origin": "https://" + HOST},
+                                      json={"view": options["view"], "csrf": options["csrf"],
+                                            "decision": "approve", "assertion": proof})
+                assert response.json()["ok"], response.text
+        approve(filed["request_id"], required=True)
         fixture.until(lambda: fixture.broker("status", filed["request_id"])["state"] == "done", 20)
         assert ok("commander_request_dev_lab_enrollment", repository=lab.REPOSITORY)["already_enrolled"]
         print("GUEST_LAB_PASSKEY_ENROLLED", flush=True)
+        workspace = "stynpilot"
+        requested = ok("commander_request_workspace_authorization", name=workspace)
+        approve(requested["request_id"])
+        fixture.until(lambda: fixture.broker("status", requested["request_id"])["state"] == "done", 20)
+        selftest = ok("runner_selftest")
+        assert len(selftest["passed"]) == 21 and not selftest["failed"], selftest
+        folder = fixture.HOME / "StyNpilot-Projects" / workspace
+
+        def git(*args):
+            return fixture.as_owner(
+                "/usr/bin/git", "-C", str(folder), "-c", "core.hooksPath=/dev/null",
+                "-c", "user.name=Guest fixture", "-c", "user.email=fixture@example.invalid", *args,
+            ).stdout.strip()
+
+        def git_job(recipe, args, *, succeeds=True):
+            job = ok("job_run", workspace_name=workspace, recipe=recipe, args=args)["job_id"]
+
+            def git_terminal():
+                result = ok("job_status", job_id=job)
+                return result if result["state"] != "running" else None
+
+            result = fixture.until(git_terminal, 30)
+            output = ok("job_output", job_id=job)["text"].strip()
+            assert (result["exit_code"] == 0) == succeeds, (result, output)
+            return output
+
+        git("init", "--quiet", "--initial-branch=main", "--template=")
+        git("remote", "add", "origin", "https://github.com/bam5693/stynpilot.git")
+        ok("workspace_write", workspace_name=workspace, path="base.txt", content="base\n")
+        git("add", "--", "base.txt")
+        git("commit", "--quiet", "-m", "fixture base")
+        base = git("rev-parse", "HEAD")
+        assert git_job("git-work-branch", ["work/fixture", base]) == base
+        assert git_job("git-work-branch", ["test/fixture", base]) == base
+        ok("workspace_write", workspace_name=workspace, path="new.txt", content="new\n")
+        dirty = git_job("git-work-switch", ["work/fixture", base, base], succeeds=False)
+        assert dirty == "git_workspace_dirty", dirty
+        changed = git_job("git-work-commit", ["test/fixture", base, "fixture new file", "new.txt"])
+        assert changed == git("rev-parse", "HEAD") and git("show", changed + ":new.txt") == "new"
+        assert git_job("git-work-switch", ["work/fixture", changed, base]) == base
+        assert git_job("git-work-fast-forward", ["work/fixture", base, changed]) == changed
+        assert git("rev-parse", "main") == base and not git("status", "--porcelain")
+        print("STYNPILOT_PACKAGED_GIT_MCP_OK", flush=True)
         assert call("dev_lab_start", **dict(fast, artifact_sha256="f" * 64))["error"] == "lab_source_not_verified"
 
         def terminal(job_id):

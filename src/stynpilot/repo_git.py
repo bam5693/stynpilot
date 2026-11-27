@@ -14,7 +14,8 @@ from .workspace import WorkspaceError, parts_of
 WORKSPACE = "stynpilot"
 ORIGIN = "https://github.com/bam5693/stynpilot.git"
 BRANCH, COMMIT = "git-work-branch", "git-work-commit"
-RECIPES = frozenset((BRANCH, COMMIT))
+SWITCH, FAST_FORWARD = "git-work-switch", "git-work-fast-forward"
+RECIPES = frozenset((BRANCH, COMMIT, SWITCH, FAST_FORWARD))
 _REF = re.compile(r"(?:work|test)/[a-z0-9][a-z0-9_-]{0,63}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _CONFIG = {
@@ -29,10 +30,13 @@ _ENV = {
 
 
 def validate(recipe, args, workspace):
-    valid_count = (len(args) == 2 if recipe == BRANCH else 4 <= len(args) <= 11)
+    fixed_count = {BRANCH: 2, SWITCH: 3, FAST_FORWARD: 3}
+    valid_count = len(args) == fixed_count[recipe] if recipe in fixed_count else recipe == COMMIT and 4 <= len(args) <= 11
     if Path(workspace).name != WORKSPACE:
         raise WorkspaceError("git_workspace_not_bound")
     if not valid_count or not _REF.fullmatch(args[0]) or not _SHA.fullmatch(args[1]):
+        raise WorkspaceError("git_request_invalid")
+    if recipe in (SWITCH, FAST_FORWARD) and not _SHA.fullmatch(args[2]):
         raise WorkspaceError("git_request_invalid")
     if recipe == COMMIT:
         message, *paths = args[2:]
@@ -59,6 +63,7 @@ def run(recipe, args, folder):
         "/usr/bin/git", "--no-pager", "--literal-pathspecs",
         "-c", "safe.directory=" + str(folder), "-c", "core.hooksPath=/dev/null",
         "-c", "core.fsmonitor=false", "-c", "protocol.allow=never", "-c", "commit.gpgSign=false",
+        "-c", "submodule.recurse=false",
         "-c", "user.name=StyNpilot workspace", "-c", "user.email=workspace@stynpilot.invalid",
         "--git-dir=.git", "--work-tree=.",
     ]
@@ -85,42 +90,77 @@ def run(recipe, args, folder):
         raise WorkspaceError("git_head_changed")
 
     if recipe == BRANCH:
-        git("switch", "--no-track", "--no-recurse-submodules", "--create", branch, expected)
+        git("switch", "--no-track", "--no-recurse-submodules", "--no-overwrite-ignore", "--create", branch, expected)
+        return expected
+
+    ref = "refs/heads/" + branch
+    if recipe in (SWITCH, FAST_FORWARD):
+        target = args[2]
+        if git("status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignore-submodules=none"):
+            raise WorkspaceError("git_workspace_dirty")
+        if recipe == SWITCH:
+            if git("show-ref", "--hash", "--verify", ref).strip().decode("ascii") != target:
+                raise WorkspaceError("git_target_changed")
+            git("switch", "--no-guess", "--no-recurse-submodules", "--no-overwrite-ignore", "--", branch)
+            if git("rev-parse", "--verify", "HEAD").strip().decode("ascii") != target:
+                raise WorkspaceError("git_target_changed")
+            return target
+        if git("symbolic-ref", "--quiet", "HEAD").strip().decode("ascii") != ref:
+            raise WorkspaceError("git_work_branch_required")
+        if git("rev-parse", "--verify", target + "^{commit}").strip().decode("ascii") != target:
+            raise WorkspaceError("git_target_not_commit")
+        git("merge-base", "--is-ancestor", expected, target)
+        if target == expected:
+            return expected
+        operation = ("merge", "--ff-only", "--no-autostash", "--no-edit", "--no-overwrite-ignore", target)
     else:
-        if git("symbolic-ref", "--quiet", "HEAD").strip().decode("ascii") != "refs/heads/" + branch:
+        if git("symbolic-ref", "--quiet", "HEAD").strip().decode("ascii") != ref:
             raise WorkspaceError("git_work_branch_required")
         message, *paths = args[2:]
+        added = []
         for path in paths:
             node = folder
             for part in parts_of(path):
                 node /= part
                 if node.is_symlink():
                     raise WorkspaceError("git_path_invalid")
-            if node.exists():
+            exists = node.exists()
+            if exists:
                 info = node.lstat()
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     raise WorkspaceError("git_path_invalid")
-            if git("ls-files", "--cached", "-z", "--", path) != path.encode() + b"\0":
-                raise WorkspaceError("git_tracked_file_required")
-        # Git invokes this guard while the ref transaction is locked. It
-        # stops a native caller's concurrent branch switch or head advance
-        # from redirecting the commit after the worker's initial validation.
-        with tempfile.TemporaryDirectory(prefix="stynpilot-git-hooks-") as hooks:
-            guard = Path(hooks) / "reference-transaction"
-            guard.write_text(
-                "#!/usr/bin/python3 -I\n"
-                "import sys\n"
-                "if sys.argv[1] != 'prepared':\n"
-                "    raise SystemExit(0)\n"
-                "entry = sys.stdin.read(4097).split()\n"
-                "if entry == ['0' * 40, '0' * 40, 'AUTO_MERGE']:\n"
-                "    raise SystemExit(0)\n"
-                "raise SystemExit(0 if len(entry) == 3 and "
-                f"entry[0] == {expected!r} and entry[2] == {'refs/heads/' + branch!r} else 1)\n",
-                encoding="ascii",
-            )
-            guard.chmod(0o700)
-            git("commit", "--only", "--no-gpg-sign", "-m", message, "--", *paths, hooks=hooks)
+            indexed = git("ls-files", "--cached", "-z", "--", path)
+            if not indexed and exists:
+                added.append(path)
+            elif indexed != path.encode() + b"\0":
+                raise WorkspaceError("git_path_invalid")
+        if added:
+            # Intent-to-add is Git's recoverable placeholder for an untracked
+            # file. It doesn't stage contents or alter unrelated index entries.
+            git("add", "--intent-to-add", "--", *added)
+        operation = ("commit", "--only", "--no-gpg-sign", "-m", message, "--", *paths)
+    # Git invokes this guard while the ref transaction is locked. It
+    # stops a native caller's concurrent branch switch or head advance
+    # from redirecting the commit after the worker's initial validation.
+    with tempfile.TemporaryDirectory(prefix="stynpilot-git-hooks-") as hooks:
+        guard = Path(hooks) / "reference-transaction"
+        guard.write_text(
+            "#!/usr/bin/python3 -I\n"
+            "import sys\n"
+            "if sys.argv[1] != 'prepared':\n"
+            "    raise SystemExit(0)\n"
+            "entry = sys.stdin.read(4097).split()\n"
+            "if entry == ['0' * 40, '0' * 40, 'AUTO_MERGE']:\n"
+            "    raise SystemExit(0)\n"
+            f"if {recipe == FAST_FORWARD!r} and len(entry) == 3 and "
+            f"entry[1:] == [{expected!r}, 'ORIG_HEAD']:\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(0 if len(entry) == 3 and "
+            f"entry[0] == {expected!r} and entry[2] == {ref!r} else 1)\n",
+            encoding="ascii",
+        )
+        guard.chmod(0o700)
+        git(*operation, hooks=hooks)
     return git("rev-parse", "--verify", "HEAD").strip().decode("ascii")
 
 

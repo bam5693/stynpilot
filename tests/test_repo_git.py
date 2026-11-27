@@ -65,7 +65,7 @@ class WorkspaceGitTests(unittest.TestCase):
         self.assertEqual(self.base, self.git("rev-parse", "work/one"))
         self.assertEqual("tested change\n", (self.folder / "first.txt").read_text())
 
-    def test_rejects_wrong_origin_unsafe_config_and_untracked_file(self):
+    def test_rejects_wrong_origin_unsafe_config_and_missing_file(self):
         self.git("remote", "set-url", "origin", "https://example.invalid/other.git")
         with self.assertRaisesRegex(WorkspaceError, "origin_mismatch"):
             repo_git.run(repo_git.BRANCH, ["work/one", self.base], self.folder)
@@ -75,10 +75,37 @@ class WorkspaceGitTests(unittest.TestCase):
             repo_git.run(repo_git.BRANCH, ["work/one", self.base], self.folder)
         self.git("config", "--unset", "include.path")
         self.run_recipe(repo_git.BRANCH, "work/one", self.base)
-        (self.folder / "new.txt").write_text("new\n")
-        with self.assertRaisesRegex(WorkspaceError, "tracked_file_required"):
+        with self.assertRaisesRegex(WorkspaceError, "git_path_invalid"):
             repo_git.run(repo_git.COMMIT, ["work/one", self.base, "new", "new.txt"], self.folder)
         self.assertEqual(self.base, self.git("rev-parse", "HEAD"))
+
+    def test_commits_explicit_new_file_and_preserves_unrelated_staging(self):
+        self.run_recipe(repo_git.BRANCH, "work/one", self.base)
+        (self.folder / "new.txt").write_text("new\n")
+        (self.folder / "other.txt").write_text("leave untracked\n")
+        (self.folder / "second.txt").write_text("staged separately\n")
+        self.git("add", "second.txt")
+        new = self.run_recipe(repo_git.COMMIT, "work/one", self.base, "new file", "new.txt")
+        self.assertEqual("new", self.git("show", new + ":new.txt"))
+        self.assertEqual("second.txt", self.git("diff", "--cached", "--name-only"))
+        self.assertEqual("other.txt", self.git("ls-files", "--others", "--exclude-standard"))
+
+    def test_switch_and_fast_forward_are_exact_and_preserve_dirty_workspace(self):
+        self.run_recipe(repo_git.BRANCH, "work/one", self.base)
+        self.run_recipe(repo_git.BRANCH, "test/two", self.base)
+        (self.folder / "first.txt").write_text("tested change\n")
+        with self.assertRaisesRegex(WorkspaceError, "workspace_dirty"):
+            self.run_recipe(repo_git.SWITCH, "work/one", self.base, self.base)
+        new = self.run_recipe(repo_git.COMMIT, "test/two", self.base, "descendant", "first.txt")
+        with self.assertRaisesRegex(WorkspaceError, "target_changed"):
+            self.run_recipe(repo_git.SWITCH, "work/one", new, new)
+        self.assertEqual(self.base, self.run_recipe(repo_git.SWITCH, "work/one", new, self.base))
+        self.assertEqual(new, self.run_recipe(repo_git.FAST_FORWARD, "work/one", self.base, new))
+        self.assertEqual("tested change", (self.folder / "first.txt").read_text().strip())
+        self.assertEqual(self.base, self.git("rev-parse", "main"))
+        with self.assertRaises(WorkspaceError):
+            self.run_recipe(repo_git.FAST_FORWARD, "work/one", new, self.base)
+        self.assertEqual(new, self.git("rev-parse", "HEAD"))
 
     def test_rejects_protected_refs_paths_and_other_workspaces(self):
         for branch in ("main", "refs/heads/work/one", "work/-flag", "work/../main"):

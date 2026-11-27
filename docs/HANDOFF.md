@@ -28,6 +28,10 @@ Dev27 is active. The archive review adds read-only HTTPS intake for an exact bro
 
 Before adding a live MCP route, run this worker in a broker-managed transient unit with private storage, an aggregate allocation limit, and a full deadline. Enroll each exact source independently and pass its read credential through the unit. The review tests use synthetic repositories and verify the local Git fetch and archive path. Packaged HTTPS and live provider acceptance remain open.
 
+The Dev28 review adds read-only MCP access to existing imported archives. An owner uses `stynpilot archive-adopt` with the approved manifest digest, bundle digest and enrolled client name. Adoption reconstructs an isolated bare repository offline, reserves capacity before staging, and atomically publishes the verified files and client grant. It does not run Git hooks, select a development baseline, update a worktree, contact a remote or accept archive paths from MCP. Startup reconciles an interrupted adoption before opening the MCP listener. An unavailable archive store does not prevent the rest of the owner service from starting.
+
+The authenticated client can list its archives, page refs and commit links, inspect a commit tree, read small text files, and compare two commit trees when it has access to both archives. This mode covers inspection. The separate remote intake worker still requires provider authorization and an approved broker route. Test the package with `tools/dev/restore-media.sh PACKAGE --archive-mcp-case` and require `STYNPILOT_PACKAGED_ARCHIVE_MCP_OK` and `FIXTURE_EXIT=0` from the disposable guest.
+
 ## Milestones and versions
 
 | Milestone | Scope | Debian package |
@@ -38,6 +42,7 @@ Before adding a live MCP route, run this worker in a broker-managed transient un
 | Dev23 Stage 3 | Installer-side restoration and development lab | `0.1.0~dev25` released |
 | Repository management | StyNpilot checkout, fetch and guarded native push | `0.1.0~dev26` released |
 | GitHub credential setup | Phone entry and transport hardening | `0.1.0~dev27` released |
+| Repository archives | Scoped archive inspection and adoption | `0.1.0~dev28` candidate |
 | Dev23 Stage 4 | Owner-side restoration | Following unused increment |
 
 Dev24 off-machine backup and Dev25 repository management are milestone labels. Every separately published package consumes a version increment.

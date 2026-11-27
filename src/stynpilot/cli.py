@@ -40,6 +40,12 @@ def main(argv=None):
     res = sub.add_parser("restore")
     res.add_argument("--config", default=DEFAULT_OWNER_CONFIG)
     res.add_argument("--archive", required=True)
+    adopt = sub.add_parser("archive-adopt", help="owner only: adopt a verified source archive and grant exact clients read access")
+    adopt.add_argument("--config", default=DEFAULT_OWNER_CONFIG)
+    adopt.add_argument("--archive", required=True)
+    adopt.add_argument("--manifest-sha256", required=True)
+    adopt.add_argument("--bundle-sha256", required=True)
+    adopt.add_argument("--client", action="append", required=True, help="an enrolled client name, repeatable")
     sub.add_parser("version")
     args = parser.parse_args(argv)
     from .service import ConfigError, OwnerConfig
@@ -56,6 +62,17 @@ def main(argv=None):
             from . import doctor
             print(doctor.render(doctor.check_authorization()))
             return 0
+        elif args.command == "archive-adopt":
+            import json
+            from .archive_store import Store
+            config = OwnerConfig.from_file(Path(args.config).expanduser())
+            enrolled = {client["name"]: client["client_id"] for client in config.enrolled_clients}
+            if any(name not in enrolled for name in args.client):
+                raise ConfigError("archive_client_not_enrolled")
+            result = Store(config.state_dir / "repository-archives").adopt(
+                args.archive, manifest_sha256=args.manifest_sha256, bundle_sha256=args.bundle_sha256,
+                clients=[enrolled[name] for name in args.client])
+            print(json.dumps(result, sort_keys=True))
         elif args.command == "setup-system":
             from . import setup_wizard
             return setup_wizard.finish_system(Path.home(), os.getuid())

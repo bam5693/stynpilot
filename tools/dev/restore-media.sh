@@ -4,7 +4,7 @@ set -eu
 umask 077
 test "$#" -ge 1 && test "$#" -le 2
 if [ "$#" -eq 2 ]; then
-    case "$2" in --fault-cases|--power-case|--limits-case|--oom-case|--upgrade-case|--lab-mcp-case) ;; *) exit 2;; esac
+    case "$2" in --fault-cases|--power-case|--limits-case|--oom-case|--upgrade-case|--lab-mcp-case|--archive-mcp-case) ;; *) exit 2;; esac
 fi
 package=$(realpath "$1")
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -19,6 +19,9 @@ cp "$package" "$run/payload/repo/"
     cp ./*.deb "$run/payload/repo/"
 )
 cp "$repo/tools/dev/guest-limits.py" "$repo/tools/dev/guest-restore.py" "$repo/tests/legacy_pairing.py" "$repo/tests/softauth.py" "$run/payload/"
+if [ "${2-}" = --archive-mcp-case ]; then
+    cp "$repo/tools/dev/guest-archive-mcp.py" "$run/payload/"
+fi
 if [ "${2-}" = --lab-mcp-case ]; then
     cp "$repo/tools/dev/guest-lab-mcp.py" "$run/payload/"
     (
@@ -71,6 +74,9 @@ fi
 if [[ -e /mnt/stynpilot-fixture/lab-mcp-case ]]; then
     "${apt_local[@]}" -y --no-install-recommends install bubblewrap python3-pytest
     fixture=(/usr/bin/python3 -IB /mnt/stynpilot-fixture/guest-lab-mcp.py)
+fi
+if [[ -e /mnt/stynpilot-fixture/archive-mcp-case ]]; then
+    fixture=(/usr/bin/python3 -IB /mnt/stynpilot-fixture/guest-archive-mcp.py)
 fi
 if ! "${fixture[@]}"; then
     journalctl -b -u stynpilot-installer.service -u stynpilot-restore.service -u stynpilot-restore.path -u 'run-*.service' -u 'stynpilot-lab-*.service' --no-pager -n 160

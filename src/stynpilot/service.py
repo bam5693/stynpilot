@@ -18,6 +18,7 @@ The approval worker is the single background thread inside ApprovalFlow(backgrou
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import stat
@@ -471,7 +472,14 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
                                          extra_deny=[config.state_dir, config.pairing_db, config.broker_socket]),
                     diagnostics=Diagnostics(), system=SystemStatus(backup_dir=config.state_dir / "backups", vault=service.vault),
                     vault=service.vault, broker=broker)
-        runner_tools = dict(broker=broker, projects_dir=os.path.join(home, "StyNpilot-Projects"), vault=service.vault)
+        from . import archive_store, repo_archive
+        archives = archive_store.Store(state / "repository-archives")
+        try:
+            archives.reconcile()
+        except (OSError, repo_archive.ArchiveError) as error:
+            logging.getLogger("stynpilot.archive").warning("archive recovery held: %s", getattr(error, "code", type(error).__name__))
+        runner_tools = dict(broker=broker, projects_dir=os.path.join(home, "StyNpilot-Projects"), vault=service.vault,
+                            archive_store=archives)
         service.mcp = (start_mcp or run.start)(router=router, public_host=config.mcp_public_host,
                                                port=config.mcp_port, propose=propose, diag=diag, runner=runner_tools)
     except Exception:

@@ -559,7 +559,10 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
                  description=("Run ONE approved recipe (see runner_status: python-unittest, pytest, make, npm-test, cargo-test, ruff-check, "
                               "git-status, git-diff, git-log) inside an authorized project, in the locked-down sandbox: no network, no view of "
                               "the owner's other files, limited time/memory/processes. args are the recipe's few allowed options. Returns a "
-                              "job_id; poll job_status and read job_output. Refused until the live sandbox self-test has passed."))
+                              "job_id; poll job_status and read job_output. Refused until the live sandbox self-test has passed. "
+                              "For the enrolled StyNpilot checkout only: git-work-branch takes [new_branch, expected_head_sha]. "
+                              "git-work-commit takes [current_branch, expected_head_sha, message, tracked_file, ...]. "
+                              "Use work/ or test/ branch names and a full SHA. Neither recipe sends anything to a remote."))
     def job_run(device_id: str, workspace_name: str, recipe: str, args: list[str] | None = None) -> dict:
         def work(owner):
             workspace(workspace_name)

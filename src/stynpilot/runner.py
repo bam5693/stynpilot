@@ -22,7 +22,8 @@ import os
 import re
 from dataclasses import dataclass
 
-from . import safefs
+from . import repo_git, safefs
+from .workspace import WorkspaceError
 
 RUN_USER = "stynpilot-run"
 MAX_ARGS, MAX_ARG_LEN = 12, 200
@@ -110,6 +111,10 @@ class Recipe:
 
 _GIT = ("/usr/bin/git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
         "-c", "protocol.allow=never", "-c", "core.pager=cat")
+_GIT_WORKER = ("/usr/bin/python3", "-IB", "-c",
+               "import sys;sys.pycache_prefix='/usr/lib/stynpilot/.source-only';"
+               "sys.path.insert(0,'/usr/lib/stynpilot/lib');"
+               "from stynpilot.repo_git import main;raise SystemExit(main())")
 RECIPES = {r.id: r for r in (
     Recipe("python-unittest", "Python unittest", ("/usr/bin/python3", "-m", "unittest"),
            flags=frozenset({"-v", "-q", "-b", "-f"}), valued=(("-s", "relpath"), ("-t", "relpath"), ("-k", "expr")),
@@ -122,6 +127,10 @@ RECIPES = {r.id: r for r in (
     Recipe("cargo-test", "cargo test", ("/usr/bin/cargo", "test", "--offline"), flags=frozenset({"-q", "--release"}), positional="word"),
     Recipe("ruff-check", "ruff check", ("/usr/bin/ruff", "check", "--no-cache"), flags=frozenset({"--statistics"}),
            positional="relpath", seconds=300, writes=False),
+    Recipe(repo_git.BRANCH, "Create and switch to a StyNpilot work branch",
+           _GIT_WORKER + (repo_git.BRANCH,), max_extra=2, seconds=60),
+    Recipe(repo_git.COMMIT, "Commit selected tracked files on a StyNpilot work branch",
+           _GIT_WORKER + (repo_git.COMMIT,), max_extra=11, seconds=120),
     Recipe("git-status", "git status", _GIT + ("status", "--short", "--branch"), max_extra=0, seconds=60, writes=False),
     Recipe("git-diff", "git diff", _GIT + ("diff", "--no-ext-diff", "--no-textconv"),
            flags=frozenset({"--stat", "--cached", "--name-only"}), positional="relpath", seconds=60, writes=False),
@@ -155,6 +164,12 @@ def build_argv(recipe_id, args, workspace):
     for a in args:
         if type(a) is not str or not a or len(a) > MAX_ARG_LEN or any(ord(c) < 32 or ord(c) == 127 for c in a):
             raise RunnerError("argument_invalid")
+    if recipe_id in repo_git.RECIPES:
+        try:
+            repo_git.validate(recipe_id, args, workspace)
+        except WorkspaceError as error:
+            raise RunnerError(error.code) from None
+        return recipe.argv + tuple(args)
     out, i, valued = list(recipe.argv), 0, dict(recipe.valued)
     if out[0] == "/usr/bin/git":
         # The folder belongs to the owner and git runs as the locked-down account: git refuses that ("dubious

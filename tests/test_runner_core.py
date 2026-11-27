@@ -79,8 +79,11 @@ class Recipes(unittest.TestCase):
         (Path(self.ws) / "tests").mkdir()
         (Path(self.ws) / "tests" / "test_a.py").write_text("")
 
-    def test_every_recipe_builds_with_no_arguments_and_uses_an_absolute_binary(self):
+    def test_default_recipes_build_with_no_arguments_and_use_an_absolute_binary(self):
         for rid, recipe in runner.RECIPES.items():
+            if rid in runner.repo_git.RECIPES:
+                refused(self, build_argv, rid, [], self.ws)
+                continue
             argv = build_argv(rid, [], self.ws)
             self.assertTrue(os.path.isabs(argv[0]), rid)
             expected = recipe.argv if recipe.argv[0] != "/usr/bin/git" else (

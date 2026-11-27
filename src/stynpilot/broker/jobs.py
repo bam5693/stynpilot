@@ -27,7 +27,7 @@ import threading
 import time
 from pathlib import Path
 
-from .. import redact, runner, safefs
+from .. import redact, repo_git, runner, safefs
 from . import apt
 from ..projects_helper import block_devices
 from .helper import MEASURE_TIMEOUT, SLACK, STOP_WAIT, HelperError, LocalHelper, SystemdHelper
@@ -273,6 +273,11 @@ class JobRunner:
         with self._ws_lock:
             if need_enrolled:
                 with self._lock:
+                    running = self._db.execute(
+                        "select recipe from jobs where workspace=? and state='running'", (real,)
+                    ).fetchall()
+                    if running and (label in repo_git.RECIPES or any(row["recipe"] in repo_git.RECIPES for row in running)):
+                        raise JobError("workspace_git_busy")
                     if not self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
                         raise JobError("workspace_not_enrolled")
                 # Look at everything that exists NOW: ordinary files get sandbox access, protected names lose it and are hidden.

@@ -41,6 +41,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives import serialization
 
 from .. import release
+from .. import dev_lab_source, vault
 from ..release import ReleaseError
 
 API_HOST, UPLOAD_HOST = "api.github.com", "uploads.github.com"
@@ -177,7 +178,7 @@ def _write_private(path, data, *, replace=False):
 class Authority:
     def __init__(self, state_dir, *, run=default_run, http=default_http, clock=time.time, build_prefix=None, build_uid=None,
                  clone_url=CLONE_URL, repository=release.REPOSITORY, work_root=None, sandbox=None, mount_work=False,
-                 tmpfs_mb=2048, inspect=None, fetch=None, host_ns=None):
+                 tmpfs_mb=2048, inspect=None, fetch=None, host_ns=None, retain_lab_source=False):
         self.host_ns = list(HOST_NS if host_ns is None else host_ns)
         self.mountinfo = "/proc/self/mountinfo"
         self.root = Path(state_dir) / "release"
@@ -194,6 +195,7 @@ class Authority:
         # account inside the S3 sandbox; inspect(path, version) raises unless the upgrade path would accept the package.
         self.sandbox, self.mount_work, self.tmpfs_mb, self.inspect = sandbox, mount_work, tmpfs_mb, inspect
         self.fetch = fetch or default_fetch
+        self.retain_lab_source = retain_lab_source
         self.last_phase = None
         self.keyfile, self.tokenfile = self.root / "signing-ed25519.pem", self.root / "github-token"
 
@@ -272,7 +274,7 @@ class Authority:
         if rec is None:
             return {"state": "not_started"}
         return {k: rec[k] for k in ("state", "version", "why", "sha256", "size", "tests_passed", "tests_failed", "tests_skipped",
-                                    "reproducible", "commit", "started", "finished", "detail") if k in rec}
+                                    "reproducible", "commit", "started", "finished", "detail", "lab_source_sha256") if k in rec}
 
     def prepare_check(self, commit, version):
         """Refuse an unusable request up front (before any background work)."""
@@ -440,6 +442,18 @@ class Authority:
         code, out = ph("head", git + ["-C", "src", "rev-parse", "HEAD"], seconds=30, memory_mb=256, tasks=16)
         if code != 0 or out.strip().splitlines()[-1:] != [commit]:
             raise AuthorityError("could_not_fetch_that_exact_commit")
+        lab_digest = None
+        if self.retain_lab_source:
+            code, _ = ph("lab-archive", git + ["-C", "src", "archive", "--format=tar",
+                                              "--output=../lab-source.tar", commit],
+                         seconds=60, memory_mb=256, tasks=16)
+            if code != 0:
+                raise AuthorityError("lab_source_archive_failed")
+            # Capture the exact checkout before running any code from it.
+            source = self._read_lab_archive(work)
+            lab_digest = hashlib.sha256(source).hexdigest()
+            vault._write_atomic(d, "lab-source.tar", source)
+            del source
         code, out = ph("version", ["/usr/bin/python3", "-I", "-c", _VERSION_SCRIPT], seconds=30, memory_mb=256, tasks=16)
         if code != 0 or out.strip().replace(".dev", "~dev") != version:
             raise AuthorityError("source_version_differs_from_requested_version")
@@ -483,8 +497,49 @@ class Authority:
         target = d / ("stynpilot_%s_all.deb" % version)
         _write_private(target, datas[0])
         self._inspect(target, version)
-        return {"sha256": hashes[0], "size": len(datas[0]), "reproducible": True, "tests_passed": passed, "tests_failed": failed,
-                "tests_skipped": skipped, "deb": target.name}
+        record = {"sha256": hashes[0], "size": len(datas[0]), "reproducible": True, "tests_passed": passed, "tests_failed": failed,
+                  "tests_skipped": skipped, "deb": target.name}
+        if lab_digest is not None:
+            record["lab_source_sha256"] = lab_digest
+        return record
+
+    def _read_lab_archive(self, work):
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        top = os.open(work, flags | os.O_DIRECTORY)
+        try:
+            fd = os.open("lab-source.tar", flags | os.O_NONBLOCK, dir_fd=top)
+            with os.fdopen(fd, "rb") as source:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or info.st_uid != self.build_uid or not 0 < info.st_size <= dev_lab_source.MAX_ARCHIVE):
+                    raise AuthorityError("lab_source_archive_invalid")
+                data = source.read(dev_lab_source.MAX_ARCHIVE + 1)
+                if len(data) != info.st_size:
+                    raise AuthorityError("lab_source_archive_invalid")
+                return data
+        finally:
+            os.close(top)
+
+    def lab_artifact(self, commit, digest):
+        """Take a bounded copy from the installer's own verified build record."""
+        if (type(commit) is not str or not _HEX40.fullmatch(commit) or type(digest) is not str
+                or not dev_lab_source.SHA256.fullmatch(digest) or self.repository != release.REPOSITORY):
+            raise AuthorityError("lab_source_binding_invalid")
+        lock = self._take_lock()
+        try:
+            record = self.status(commit)
+            if (record.get("state") != "ready" or record.get("commit") != commit
+                    or record.get("tests_failed") != 0 or record.get("reproducible") is not True
+                    or record.get("lab_source_sha256") != digest):
+                raise AuthorityError("lab_source_not_verified")
+            data = vault._read_private(self._dir(commit) / "lab-source.tar", dev_lab_source.MAX_ARCHIVE)
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise AuthorityError("lab_source_digest_mismatch")
+            return data
+        except (OSError, vault.VaultError):
+            raise AuthorityError("lab_source_archive_unavailable") from None
+        finally:
+            os.close(lock)
 
     def _inspect(self, path, version):
         if self.inspect is None:

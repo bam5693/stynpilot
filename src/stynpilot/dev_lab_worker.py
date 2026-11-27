@@ -53,14 +53,15 @@ def _require_containment():
 
 
 def _stage_support(wheel, scratch):
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-    with os.fdopen(os.open(wheel, flags), "rb") as source:
-        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+    if wheel is not None:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        with os.fdopen(os.open(wheel, flags), "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise LabError("lab_worker_dependency_invalid")
+            content = source.read(WHEEL_MAX + 1)
+        if len(content) > WHEEL_MAX or hashlib.sha256(content).hexdigest() != WHEEL_DIGEST:
             raise LabError("lab_worker_dependency_invalid")
-        content = source.read(WHEEL_MAX + 1)
-    if len(content) > WHEEL_MAX or hashlib.sha256(content).hexdigest() != WHEEL_DIGEST:
-        raise LabError("lab_worker_dependency_invalid")
-    (scratch / "mcp.whl").write_bytes(content)
+        (scratch / "mcp.whl").write_bytes(content)
     (scratch / "passwd").write_text(
         "root:x:0:0:root:/root:/usr/sbin/nologin\n"
         "lab:x:1000:1000:lab:/tmp:/usr/sbin/nologin\n"
@@ -69,9 +70,9 @@ def _stage_support(wheel, scratch):
     (scratch / "group").write_text("root:x:0:\nlab:x:1000:\nnogroup:x:65534:\n", encoding="ascii")
 
 
-def _command(source, scenario):
+def _command(source, scenario, *, wheel):
     scratch = source.parent
-    return [
+    base = [
         "/usr/bin/bwrap", "--unshare-all", "--unshare-user", "--uid", "1000", "--gid", "1000",
         "--disable-userns", "--die-with-parent", "--new-session",
         "--clearenv", "--cap-drop", "ALL",
@@ -87,14 +88,18 @@ def _command(source, scenario):
         "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/run",
         "--size", str(256 << 20), "--tmpfs", "/tmp",
         "--ro-bind", str(source), "/work/src",
-        "--ro-bind", str(scratch / "mcp.whl"), "/work/mcp.whl",
         "--setenv", "HOME", "/tmp", "--setenv", "PATH", "/usr/bin:/bin",
-        "--setenv", "LANG", "C.UTF-8", "--setenv", "PYTHONPATH", "/work/src/src:/tmp/vendor",
+        "--setenv", "LANG", "C.UTF-8", "--setenv", "PYTHONPATH",
+        "/work/src/src:/tmp/vendor" if wheel else "/work/src/src:/usr/lib/stynpilot/vendor",
         "--setenv", "PYTHONDONTWRITEBYTECODE", "1", "--setenv", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1",
-        "--chdir", "/work/src", "--", "/bin/sh", "-ec",
-        '/usr/bin/python3 -I -m zipfile -e /work/mcp.whl /tmp/vendor; exec "$@"',
-        "lab-worker", *_RECIPES[scenario],
+        "--chdir", "/work/src",
     ]
+    if wheel:
+        base += ["--ro-bind", str(scratch / "mcp.whl"), "/work/mcp.whl", "--", "/bin/sh", "-ec",
+                 '/usr/bin/python3 -I -m zipfile -e /work/mcp.whl /tmp/vendor; exec "$@"', "lab-worker"]
+    else:
+        base.append("--")
+    return base + _RECIPES[scenario]
 
 
 def _execute(argv, stop):
@@ -147,9 +152,34 @@ def run(archive, scratch_parent, commit, digest, scenario, *, wheel, stop=lambda
             return {**request, "state": "cancelled", "exit_code": None, "output": ""}
         source = stage(archive, scratch, commit, digest)
         _stage_support(wheel, source.parent)
-        state, code, raw = _execute(_command(source, scenario), stop)
+        state, code, raw = _execute(_command(source, scenario, wheel=wheel is not None), stop)
     evidence, _ = redact(raw.decode("utf-8", "replace"))
+    evidence = evidence[:OUTPUT_LIMIT]
     return {**request, "state": state, "exit_code": code, "output": evidence}
+
+
+def _signals():
+    import threading
+
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    return stop.is_set
+
+
+def installed(commit, digest):
+    """Trusted systemd entry point. Artifact and scratch paths are fixed."""
+    import json
+
+    if (not Path("/run/stynpilot-lab-dispatch").is_file()
+            or not Path("/usr/lib/stynpilot/vendor/mcp/__init__.py").is_file()):
+        raise LabError("lab_worker_dependency_invalid")
+    stop = _signals()
+    with tempfile.TemporaryDirectory(prefix="stynpilot-lab-", dir="/tmp") as work:
+        result = run("/run/stynpilot-lab-source.tar", work, commit, digest,
+                     "offline_normal", wheel=None, stop=stop)
+    print(json.dumps(result))
+    return 0 if result["state"] == "passed" else 1
 
 
 def main():
@@ -164,17 +194,9 @@ def main():
     parser.add_argument("scenario", choices=tuple(_RECIPES))
     parser.add_argument("--wheel", type=Path, required=True)
     args = parser.parse_args()
-    cancelled = False
-
-    def stop(_signum, _frame):
-        nonlocal cancelled
-        cancelled = True
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
     try:
         result = run(args.archive, args.scratch, args.commit, args.digest, args.scenario,
-                     wheel=args.wheel, stop=lambda: cancelled)
+                     wheel=args.wheel, stop=_signals())
     except (LabError, OSError, ValueError, EOFError, tarfile.TarError) as error:
         parser.exit(2, getattr(error, "code", "lab_worker_input_invalid") + "\n")
     print(json.dumps(result))

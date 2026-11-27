@@ -109,14 +109,17 @@ class ApprovalFlow:
         view, csrf = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
         adds = payload.get("kind") == "passkey" and payload.get("action") in ("enroll", "activate")
         passkey = None if adds else self._passkey_options(approve, deny)      # adding a passkey is Auth0-only
+        required = {"restore_root": "root_restore_requires_passkey",
+                    "settle_inference": "inference_settlement_requires_passkey",
+                    "lab_enroll": "lab_enrollment_requires_passkey"}.get(payload.get("action"))
         with self._lock:
             self._sweep()
             if len(self._views) >= MAX_VIEWS:
                 raise ApprovalError("too_many_open_approval_pages")
-            self._views[view] = {"request_id": request_id, "csrf": csrf, "passkey_required": payload.get("action") == "restore_root",
+            self._views[view] = {"request_id": request_id, "csrf": csrf, "passkey_required": required,
                                  "challenges": {"approve": approve, "deny": deny},
                                  "used": False, "attempts": 0, "expires": self.clock() + VIEW_LIFETIME}
-        return {"passkey_required": payload.get("action") == "restore_root", "passkey": passkey, "status_url": "/approve/status/" + request_id, "view": view, "csrf": csrf, "request_id": request_id, "kind": payload.get("kind", "install"),
+        return {"passkey_required": bool(required), "passkey": passkey, "status_url": "/approve/status/" + request_id, "view": view, "csrf": csrf, "request_id": request_id, "kind": payload.get("kind", "install"),
                 "summary": list(approve["summary"]), "summary_sha256": approve["summary_sha256"],
                 "fingerprint": request_id[:12], "choices": ["approve", "deny"],
                 "expires_in": VIEW_LIFETIME}
@@ -186,7 +189,7 @@ class ApprovalFlow:
             if item["used"]:
                 raise ApprovalError("already_chosen")
             if decision == "approve" and item.get("passkey_required"):
-                raise ApprovalError("root_restore_requires_passkey")
+                raise ApprovalError(item["passkey_required"])
             item["used"] = True
             state, verifier = secrets.token_urlsafe(24), secrets.token_urlsafe(48)
             challenge = item["challenges"][decision]

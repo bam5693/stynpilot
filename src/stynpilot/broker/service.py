@@ -26,15 +26,22 @@ Requests run one at a time. Messages are capped at 256 KiB.
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
+import logging
 import os
 import re
+import secrets
+import selectors
 import socket
+import stat
 import struct
 import threading
 from pathlib import Path
 
 from ..ledger import LedgerError
 from .executor import ExecutionDenied
+from .lab import CALLS as LAB_CALLS
 
 MAX_MESSAGE = 256 * 1024
 _HEX64 = re.compile(r"[a-f0-9]{64}\Z")
@@ -59,6 +66,36 @@ def _read_line(conn):
 
 READ_TIMEOUT = 15
 MAX_CONNECTIONS = 16
+_SYSTEM_SOCKET = Path("/run/stynpilot/installer.sock")
+_TRANSPORT_KEY = "installer-transport.key"
+
+
+def _transport_address(key):
+    return "\0stynpilot-installer-" + hashlib.sha256(key).hexdigest()
+
+
+def _transport_proof(key, nonce):
+    return hmac.digest(key, b"stynpilot-installer-v1\0" + nonce, "sha256").hex().encode()
+
+
+def _transport_key(socket_path):
+    parent = Path(socket_path).parent
+    top = os.open(parent, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        if os.fstat(top).st_mode & 0o022:
+            raise PermissionError("untrusted installer directory")
+        fd = os.open(_TRANSPORT_KEY, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=top)
+        with os.fdopen(fd, "rb") as file:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o377 or info.st_size != 32 or info.st_nlink != 1):
+                raise PermissionError("untrusted installer connection key")
+            key = file.read(33)
+            if len(key) != 32:
+                raise PermissionError("invalid installer connection key")
+            return key
+    finally:
+        os.close(top)
 
 
 class BrokerService:
@@ -68,6 +105,9 @@ class BrokerService:
         self.path, self.executor, self.allowed_uid = Path(socket_path), executor, allowed_uid
         self._busy = threading.Lock()
         self._sock = None
+        self._abstract = None
+        self._transport = None
+        self._lab_boot_pending = False
 
     def handle(self, message):
         from .. import root_restore, statelock
@@ -78,9 +118,11 @@ class BrokerService:
         payload = msg.get("payload")
         approving = isinstance(payload, dict) and (
             (msg.get("op") == "backup_admin" and payload.get("action") == "restore_root")
-            or (msg.get("op") == "runner_admin" and payload.get("action") == "settle_inference"))
+            or (msg.get("op") == "runner_admin" and payload.get("action") in ("settle_inference", "lab_enroll")))
+        exclusive = approving or (msg.get("op") == "runner" and msg.get("call") in
+                                  ("inference_claim", "inference_finish", "lab_start", "lab_cancel"))
         try:
-            with root_restore.admission(state, exclusive=approving or (msg.get("op") == "runner" and msg.get("call") in ("inference_claim", "inference_finish"))):
+            with root_restore.admission(state, exclusive=exclusive):
                 if (root_restore.control(state) / "safe.json").exists():
                     return root_restore.safe_reply(state, msg)
                 if root_restore.held(state):
@@ -153,6 +195,8 @@ class BrokerService:
                         "vault_drill": lambda: vault.drill(manual=True)}[op]
                 return {"ok": True, "result": call()}
             if op == "runner":
+                if self._lab_boot_pending and message.get("call") in ("lab_start", "lab_prepare"):
+                    return {"ok": False, "error": "lab_restart_reconciling"}
                 return {"ok": True, "result": self.executor.runner_call(message.get("call"), message.get("args"))}
             if op == "restore_preview":
                 details = self.executor.vault._run("restore_preview", args={"archive": message.get("archive")})
@@ -197,15 +241,48 @@ class BrokerService:
         os.chmod(self.path, 0o600)
         sock.listen(8)
         self._sock = sock
+        if os.geteuid() == 0 and self.path == _SYSTEM_SOCKET and self.allowed_uid != 0:
+            self._bind_alternate()
         return sock
 
-    def serve_one(self, conn):
+    def _bind_alternate(self):
+        """The same owner-UID boundary across differing mount namespaces.
+
+        The key authenticates the installer to its owner before any approval or
+        request is transmitted. It never appears in the abstract socket name or
+        goes over the socket. The pathname socket remains available.
+        """
+        key = secrets.token_bytes(32)
+        alternate = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        temp = self.path.parent / (".transport-" + secrets.token_hex(8))
+        try:
+            alternate.bind(_transport_address(key))
+            alternate.listen(8)
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+            with os.fdopen(fd, "wb") as file:
+                file.write(key)
+                if os.geteuid() != self.allowed_uid:
+                    os.fchown(file.fileno(), self.allowed_uid, -1)
+            os.replace(temp, self.path.parent / _TRANSPORT_KEY)
+        except OSError:
+            alternate.close()
+            temp.unlink(missing_ok=True)
+            logging.getLogger("stynpilot.broker").warning("alternate installer transport unavailable")
+        else:
+            self._transport, self._abstract = key, alternate
+
+    def serve_one(self, conn, alternate=False):
         with conn:
             try:
                 if peer_uid(conn) != self.allowed_uid:
                     conn.sendall(json.dumps({"ok": False, "error": "caller_not_enrolled_owner"}).encode() + b"\n")
                     return
                 conn.settimeout(READ_TIMEOUT)             # a slow or silent client can't hold a worker
+                if alternate:
+                    nonce = _read_line(conn)
+                    if not re.fullmatch(rb"[0-9a-f]{64}", nonce):
+                        return
+                    conn.sendall(_transport_proof(self._transport, nonce) + b"\n")
                 line = _read_line(conn)
                 conn.settimeout(None)                     # the work itself (an install) may take a long time
                 try:
@@ -222,25 +299,61 @@ class BrokerService:
         """One thread per connection (bounded). Read-only status checks stay available while an install
         runs; the ``_busy`` lock still allows only ONE change (and no new decisions) at a time."""
         sock = self._sock or self.bind()
+        lab = getattr(self.executor, "lab", None)
+        if lab is not None:
+            self._lab_boot_pending = True
+            threading.Thread(target=self._watch_lab, args=(sock, lab), name="stynpilot-lab-reconcile", daemon=True).start()
         slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
-        while True:
-            try:
-                conn, _ = sock.accept()
-            except OSError:
-                return
-            if not slots.acquire(blocking=False):
-                with conn:
-                    conn.sendall(b'{"error": "too_many_connections", "ok": false}\n')
-                continue
+        with selectors.DefaultSelector() as listeners:
+            listeners.register(sock, selectors.EVENT_READ, False)
+            if self._abstract is not None:
+                listeners.register(self._abstract, selectors.EVENT_READ, True)
+            while sock.fileno() >= 0:
+                for listener, _ in listeners.select(1):
+                    try:
+                        conn, _ = listener.fileobj.accept()
+                        if peer_uid(conn) != self.allowed_uid:
+                            with conn:
+                                conn.sendall(b'{"error": "caller_not_enrolled_owner", "ok": false}\n')
+                            continue
+                        if not slots.acquire(blocking=False):
+                            with conn:
+                                conn.sendall(b'{"error": "too_many_connections", "ok": false}\n')
+                            continue
+                    except OSError:
+                        continue
 
-            def work(conn=conn):
-                try:
-                    self.serve_one(conn)
-                except Exception:
-                    pass
-                finally:
-                    slots.release()
-            threading.Thread(target=work, name="stynpilot-broker-conn", daemon=True).start()
+                    def work(conn=conn, alternate=listener.data):
+                        try:
+                            self.serve_one(conn, alternate)
+                        except OSError:
+                            pass
+                        finally:
+                            slots.release()
+                    threading.Thread(target=work, name="stynpilot-broker-conn", daemon=True).start()
+
+    def _watch_lab(self, sock, lab):
+        from .. import managed_activity, root_restore, statelock
+        import time
+
+        startup = True
+        previous_error = None
+        while sock.fileno() >= 0:
+            try:
+                if startup or managed_activity.held(lab.state):
+                    with root_restore.admission(lab.state, exclusive=True):
+                        lab.reconcile(startup=startup)
+                        startup = False
+                        self._lab_boot_pending = False
+                        previous_error = None
+            except statelock.Busy:
+                pass
+            except Exception as error:
+                code = getattr(error, "code", type(error).__name__)
+                if code != previous_error:
+                    logging.getLogger("stynpilot.lab").warning("lab reconciliation held: %s", code)
+                    previous_error = code
+            time.sleep(1)
 
 
 class BrokerLedger:
@@ -265,7 +378,17 @@ def call(socket_path, message, timeout=1800):
     """Client side, used by the owner's StyNpilot service."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(timeout)
-        conn.connect(str(socket_path))
+        try:
+            conn.connect(str(socket_path))
+        except PermissionError:
+            if Path(socket_path) != _SYSTEM_SOCKET:
+                raise
+            key = _transport_key(socket_path)
+            nonce = secrets.token_hex(32).encode()
+            conn.connect(_transport_address(key))
+            conn.sendall(nonce + b"\n")
+            if not hmac.compare_digest(_read_line(conn), _transport_proof(key, nonce)):
+                raise PermissionError("installer transport authentication failed")
         conn.sendall(json.dumps(message).encode() + b"\n")
         return json.loads(_read_line(conn).decode("utf-8"))
 
@@ -285,7 +408,9 @@ class BrokerClient:
     def _ask(self, message, timeout=1800):
         try:
             reply = call(self.socket_path, message, timeout=timeout)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as error:
+            logging.getLogger("stynpilot.broker").warning("installer socket unavailable type=%s errno=%s",
+                                                        type(error).__name__, getattr(error, "errno", None))
             raise BrokerRefused("installer_unavailable") from None
         if not reply.get("ok"):
             raise BrokerRefused(str(reply.get("error", "installer_refused")))
@@ -344,7 +469,8 @@ class BrokerClient:
 
     def runner(self, call, args=None):
         """GREEN runner operations on the owner-only socket (no approval): status, self-test, run, jobs, output, cancel."""
-        return self._ask({"op": "runner", "call": call, "args": args or {}}, 5 if call == "inference_validate" else 120)["result"]
+        timeout = 5 if call == "inference_validate" else 45 if call in LAB_CALLS else 120
+        return self._ask({"op": "runner", "call": call, "args": args or {}}, timeout)["result"]
 
     def passkey_admin(self, payload, proof, challenge):
         return self._ask({"op": "passkey_admin", "payload": payload, "proof": proof, "challenge": challenge}, 60)["result"]

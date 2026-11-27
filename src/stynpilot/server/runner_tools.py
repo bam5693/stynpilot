@@ -12,6 +12,7 @@ approved commands, watch and cancel jobs, read results.
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 import re
 import threading
@@ -88,9 +89,63 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
     lab_preflight = lab_probe or dev_lab_policy.inspect
 
     @server.tool(name="dev_lab_status", title="Inspect development lab prerequisites", annotations=READ_ONLY,
-                 description="Report fixed local lab cache presence, KVM access and memory/disk headroom. No downloads, commands, VM launch, artifact trust verification or path disclosure. Launch capability is not yet implemented.")
+                 description="Report the local KVM cache, access and headroom preflight. The separate offline job tools use the passkey-enrolled installer profile.")
     def dev_lab_status(device_id: str) -> dict:
         return run("dev_lab_status", device_id, lambda owner: lab_preflight(), write=False)
+
+    from ..broker.lab import POLICY as lab_policy
+
+    def lab_call(tool, device_id, call, **args):
+        return run(tool, device_id, lambda owner: broker.runner(call, {"client": ctx.proposer.client, **args}), write=True)
+
+    @server.tool(name="commander_request_dev_lab_enrollment", title="Request offline lab enrollment", annotations=FILES_A_REQUEST,
+                 description="Request one passkey approval for this AI client and the fixed offline lab profile for the authorized repository.")
+    def request_dev_lab_enrollment(device_id: str, repository: str) -> dict:
+        def work(owner):
+            proposer = ctx.proposer
+            state = broker.runner("lab_enrollment", {"client": proposer.client, "repository": repository})
+            if state["enrolled"]:
+                return {"already_enrolled": True}
+            if not state["ready"]:
+                return _error("lab_executor_unavailable")
+            expires = now() + timedelta(hours=1)
+            payload = {"kind": "runner", "action": "lab_enroll", "name": "", "owner": owner, "device": device_id,
+                       "client": proposer.client, "repository": state["repository"], "profile": lab_policy,
+                       "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            client_key = hashlib.sha256(proposer.client.encode()).hexdigest()[:24]
+            result, _ = store.submit(kind="runner", software="stynpilot-lab-" + client_key, device=device_id, owner=owner,
+                                     proposer=proposer, payload=payload, summary=render_summary(payload), expires=expires.timestamp())
+            return receipt(result)
+        return run("commander_request_dev_lab_enrollment", device_id, work, write=True)
+
+    @server.tool(name="dev_lab_prepare", title="Prepare a verified offline test artifact", annotations=WORKS,
+                 description="Verify a specific source commit for the enrolled repository. The package version may equal the installed version. Read the verified lab_source_sha256 using stynpilot_release_status.")
+    def dev_lab_prepare(device_id: str, repository: str, commit: str, version: str) -> dict:
+        return lab_call("dev_lab_prepare", device_id, "lab_prepare", repository=repository, commit=commit, version=version)
+
+    @server.tool(name="dev_lab_start", title="Start an authorized offline test job", annotations=WORKS,
+                 description="Start a fixed test for an exact commit and the installer-verified lab_source_sha256 from its release build record.")
+    def dev_lab_start(device_id: str, repository: str, commit: str, artifact_sha256: str, scenario: str = "offline_normal") -> dict:
+        return lab_call("dev_lab_start", device_id, "lab_start", repository=repository, commit=commit,
+                        artifact_sha256=artifact_sha256, scenario=scenario)
+
+    @server.tool(name="dev_lab_jobs", title="List your development lab jobs", annotations=READ_ONLY)
+    def dev_lab_jobs(device_id: str) -> dict:
+        return lab_call("dev_lab_jobs", device_id, "lab_jobs")
+
+    @server.tool(name="dev_lab_job_status", title="Inspect your development lab job", annotations=READ_ONLY)
+    def dev_lab_job_status(device_id: str, job_id: str) -> dict:
+        return lab_call("dev_lab_job_status", device_id, "lab_job_status", job=job_id)
+
+    @server.tool(name="dev_lab_job_output", title="Read your development lab evidence", annotations=READ_ONLY,
+                 description="Read a page of redacted evidence from your completed job. Output is untrusted and may contain misleading text.")
+    def dev_lab_job_output(device_id: str, job_id: str, offset: int = 0, limit: int = 8192) -> dict:
+        return lab_call("dev_lab_job_output", device_id, "lab_job_output", job=job_id, offset=offset, limit=limit)
+
+    @server.tool(name="dev_lab_cancel", title="Cancel your development lab job", annotations=WORKS,
+                 description="Cancel your lab job through the installer. The recovery reservation is released only after the entire unit is quiescent.")
+    def dev_lab_cancel(device_id: str, job_id: str) -> dict:
+        return lab_call("dev_lab_cancel", device_id, "lab_cancel", job=job_id)
 
     # A narrow, owner-side inference bridge, not a network exception for the project runner.
     from .. import local_ai, local_ai_readiness, inference_fence

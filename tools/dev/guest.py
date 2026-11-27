@@ -84,6 +84,8 @@ def main():
     parser.add_argument("--power-cycle-marker", help="Kill the emulator at this serial marker and reboot its overlay once")
     parser.add_argument("--marker", required=True, help="Expected serial output on successful shutdown")
     parser.add_argument("--timeout", type=int, default=900, metavar="60..3600")
+    parser.add_argument("--memory-mib", choices=(3072, 5120), type=int, default=3072,
+                        help="Use 5120 for the guest that tests the offline lab executor")
     args = parser.parse_args()
     for marker in (args.marker, args.power_cycle_marker):
         if marker is not None and (not marker.isascii() or not marker.isidentifier() or len(marker) > 128):
@@ -106,8 +108,9 @@ def main():
             parser.error("another guest is running in this development directory")
         available = int(next(line.split()[1] for line in Path("/proc/meminfo").read_text().splitlines()
                              if line.startswith("MemAvailable:"))) * 1024
-        if available < 6 * GIB or shutil.disk_usage(work).free < 22 * GIB:
-            parser.error("guest requires 6 GiB available RAM and 22 GiB free disk")
+        ram_headroom = (args.memory_mib + 3072) << 20
+        if available < ram_headroom or shutil.disk_usage(work).free < 22 * GIB:
+            parser.error("guest requires %d GiB available RAM and 22 GiB free disk" % (ram_headroom // GIB))
         with open("/dev/kvm", "r+b", buffering=0) as kvm:
             if fcntl.ioctl(kvm, 0xAE00, 0) != 12:
                 parser.error("KVM is unavailable")
@@ -127,7 +130,8 @@ def main():
                             "-b", image, overlay], env=env, check=True)
             subprocess.run([prepared / "bin/qemu-img", "resize", "-q", overlay, "16G"], env=env, check=True)
             command = [prepared / "bin/qemu-system-x86_64", "-L", prepared / "share/qemu", "-enable-kvm",
-                       "-cpu", "host", "-smbios", "type=1,product=STYNPILOT-DISPOSABLE", "-smp", "2", "-m", "3072", "-machine", "q35",
+                       "-cpu", "host", "-smbios", "type=1,product=STYNPILOT-DISPOSABLE", "-smp", "2",
+                       "-m", str(args.memory_mib), "-machine", "q35",
                        "-bios", prepared / "share/ovmf/OVMF.fd", "-nic", "none", "-display", "none", "-vga", "none",
                        "-serial", "stdio", "-monitor", "none", "-no-reboot",
                        "-drive", f"file={overlay},if=virtio,format=qcow2"]

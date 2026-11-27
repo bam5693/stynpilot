@@ -268,7 +268,7 @@ class RunnerToolTests(unittest.TestCase):
     def test_lab_status_is_read_only_and_not_launch_authority(self):
         names = {t.name for t in asyncio.run(self.server.list_tools())}
         self.assertIn("dev_lab_status", names)
-        self.assertNotIn("dev_lab_start", names)
+        self.assertLessEqual({"dev_lab_start", "dev_lab_jobs", "dev_lab_job_status", "dev_lab_job_output", "dev_lab_cancel"}, names)
         out = self.call("dev_lab_status", self.d(), "readonly")
         self.assertTrue(out["ok"], out)
         self.assertFalse(out["result"]["launch_enabled"])
@@ -276,6 +276,17 @@ class RunnerToolTests(unittest.TestCase):
         self.assertFalse(self.call("dev_lab_status", {"device_id": "dtdev_OTHER"})["ok"])
         self.lab_probe.assert_called_once_with()
         self.assertEqual(self.broker.calls, [])
+
+    def test_lab_tools_require_propose_and_derive_client_from_authenticated_session(self):
+        arguments = self.d(repository="bam5693/stynpilot", commit="a"*40, artifact_sha256="b"*64)
+        self.assertFalse(self.call("dev_lab_start", arguments, "readonly")["ok"])
+        self.assertEqual(self.broker.calls, [])
+        self.assertTrue(self.call("dev_lab_start", arguments, "chatgpt")["ok"])
+        self.assertEqual(self.broker.calls[-1], ("lab_start", {"client": "chatgpt-connector",
+                         "repository": "bam5693/stynpilot", "commit": "a"*40,
+                         "artifact_sha256": "b"*64, "scenario": "offline_normal"}))
+        self.assertTrue(self.call("dev_lab_jobs", self.d(), "claude")["ok"])
+        self.assertEqual(self.broker.calls[-1], ("lab_jobs", {"client": "claude-connector"}))
 
 
     # -- local inference: real MCP handlers, synthetic identity and model transport -------------------------------

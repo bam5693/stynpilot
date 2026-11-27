@@ -605,6 +605,7 @@ def build_authority(config, state_dir=None, **options):
                                    network=network, run_user=account.pw_name, resolver=network)
 
     options.setdefault("work_root", BUILD_ROOT)
+    options.setdefault("retain_lab_source", True)
     return Authority(state_dir or config.state_dir, sandbox=sandbox, mount_work=True, build_uid=account.pw_uid, **options)
 
 
@@ -655,6 +656,9 @@ def build_installer(config, *, jwks, jwks_loader=None, run_command=apt.real_run,
     if (require_root and config.state_dir == Path("/var/lib/stynpilot-installer")
             and config.socket_path == Path("/run/stynpilot/installer.sock")):
         from . import inference_fence, managed_activity
+        if executor.authority is not None and executor.lab is None:
+            from .broker.lab import LabJobs
+            executor.lab = LabJobs(config.state_dir, executor.authority, owner=config.owner, device=config.device)
         try:
             inference_fence.provision(config.owner_uid, allow_create=not managed_activity.held(config.state_dir))
         except (OSError, KeyError, managed_activity.ActivityError):

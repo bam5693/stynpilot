@@ -85,8 +85,8 @@ def until(predicate, seconds=210):
 
 
 def issuer():
-    public = jwt.algorithms.RSAAlgorithm.to_jwk(rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key(),
-                                                as_dict=True)
+    signing_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public = jwt.algorithms.RSAAlgorithm.to_jwk(signing_key.public_key(), as_dict=True)
     public.update(kid="fixture", alg="RS256", use="sig")
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -113,34 +113,42 @@ def issuer():
     server = ThreadingHTTPServer(("127.0.0.1", 443), Handler)
     server.socket = context.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    return signing_key
 
 
-def setup(*, check_restore_path=True):
-    issuer()
+def setup(*, check_restore_path=True, lab=False):
+    signing_key = issuer()
     ETC.mkdir(mode=0o700, exist_ok=True)
     write(ETC / "installer.json", {"issuer": ISSUER, "approval_client_id": "fixture", "owner": OWNER,
                                   "device": DEVICE, "owner_uid": UID, "state_dir": str(STATE), "socket_path": SOCKET})
     write(ETC / "passkeys.json", {"passkey_rp_id": "owner.example.test", "passkey_origin": "https://owner.example.test"})
+    if lab:
+        write(ETC / "release.json", {"build_user": "nobody"})
     for path in (CONFIG.parent, CONFIG.parent.parent, HOME / ".local", HOME / ".local/state",
                  HOME / "StyNpilot-Projects"):
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chown(path, UID, GID)
-    pairing = make_pairing_db(HOME / ".local/state/pairing", [(DEVICE, OWNER, 10**10, None, ["system.read"])])
+    scopes = ["system.read", "workspace.propose"] if lab else ["system.read"]
+    pairing = make_pairing_db(HOME / ".local/state/pairing", [(DEVICE, OWNER, 10**10, None, scopes)])
     for path in (pairing, pairing.parent):
         os.chown(path, UID, GID)
     write(CONFIG, {"issuer": ISSUER, "approval_client_id": "fixture", "authorize_endpoint": ISSUER + "authorize",
                    "token_endpoint": ISSUER + "token", "approval_public_host": "owner.example.test", "approval_port": 18444,
                    "mcp_public_host": "owner.example.test", "mcp_port": 18443,
                    "state_dir": str(HOME / ".local/state/stynpilot"), "broker_socket": SOCKET, "pairing_db": str(pairing),
-                   "enrolled_clients": [{"client_id": "fixture", "name": "synthetic", "kind": "chatgpt"}]}, UID, GID)
+                   "enrolled_clients": [{"client_id": "fixture", "name": "synthetic", "kind": "chatgpt"}]
+                   + ([{"client_id": "fixture-other", "name": "synthetic-other", "kind": "claude"}] if lab else [])}, UID, GID)
     as_owner("/usr/bin/stynpilot", "service", "provision", "--config", str(CONFIG))
     command("loginctl", "enable-linger", OWNER_USER.pw_name)
     command("systemctl", "start", f"user@{UID}.service")
     as_owner("systemctl", "--user", "daemon-reload")
-    as_owner("systemctl", "--user", "start", "stynpilot-owner.service")
+    if not lab:
+        as_owner("systemctl", "--user", "start", "stynpilot-owner.service")
     command("systemctl", "daemon-reload")
     command("systemctl", "start", "stynpilot-installer.service")
     until(lambda: broker("runner", "status"), 30)
+    if lab:
+        as_owner("systemctl", "--user", "start", "stynpilot-owner.service")
     try:
         until(lambda: as_owner("systemctl", "--user", "is-active", "--quiet", "stynpilot-owner.service"), 12)
         from stynpilot.upgrade_worker import endpoint_answers
@@ -155,7 +163,7 @@ def setup(*, check_restore_path=True):
         raise
     write(STATE / "runner-enabled.json", {"enabled": True})
     if not check_restore_path:
-        return None
+        return signing_key if lab else None
     # Confirm real packaged path dispatch independently from the approved run.
     control = STATE / "restore-control"
     control.mkdir(mode=0o700, exist_ok=True)

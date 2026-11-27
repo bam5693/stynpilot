@@ -51,7 +51,7 @@ from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .. import catalog, impact, managed_activity, root_restore, statelock
+from .. import catalog, dev_lab_policy, impact, managed_activity, root_restore, statelock
 from ..ledger import InstallLedger, LedgerError
 from ..plan import PlanError, validate_plan
 from ..requests import request_id as payload_hash
@@ -59,6 +59,7 @@ from .. import backup, release, vault
 from . import apt
 from .. import runner as runner_policy
 from .jobs import JobError
+from . import lab
 from .selftest import clean_diagnostics
 from .passkeys import PasskeyError
 from .release_authority import AuthorityError, _write_private
@@ -194,7 +195,7 @@ class Executor:
     def __init__(self, *, state_dir, owner, device, verifier, run=apt.real_run, require_root=True,
                  sources_root="/etc/apt", file_root="/", owner_uid=None, release_keys=None, fetch_release=None,
                  launch_worker=None, upgrade_options=None, jobs=None, passkeys=None,
-                 allow_remote_activation=False, authority=None, sleep=time.sleep, root_vault=None):
+                 allow_remote_activation=False, authority=None, sleep=time.sleep, root_vault=None, lab_jobs=None):
         self.dir = Path(state_dir)
         self.vault = None                                      # the root backup vault (dev22), set by the installer at start
         if require_root and not apt.is_root():
@@ -229,8 +230,10 @@ class Executor:
         self.allow_remote_activation = allow_remote_activation
         self.passkeys = passkeys                  # PasskeyStore or None (passkeys not configured)
         self.authority = authority                # release_authority.Authority or None (release publishing not configured)
+        self.lab = lab_jobs
         self._sleep = sleep
         self._builds = {}
+        self._build_lock = threading.Lock()
         if jobs is not None:
             jobs.reconcile()
         # A run still marked "running" means the installer died mid-change. We can't know what state
@@ -439,9 +442,11 @@ class Executor:
     def _decide(self, payload, proof_token, challenge, decision, kind):
         rid, _ = payload_hash(payload)
         fingerprint, passkey = self._prove(rid, proof_token, challenge, decision)
-        if (decision == "approve" and payload.get("kind") == "runner"
-                and payload.get("action") == "settle_inference" and passkey is None):
-            raise ExecutionDenied("inference_settlement_requires_passkey")
+        if decision == "approve" and payload.get("kind") == "runner" and passkey is None:
+            if payload.get("action") == "settle_inference":
+                raise ExecutionDenied("inference_settlement_requires_passkey")
+            if payload.get("action") == "lab_enroll":
+                raise ExecutionDenied("lab_enrollment_requires_passkey")
         self._used_passkey(passkey, rid, decision)
         self.runs.consume(challenge=challenge, request_id=rid, decision=decision, proof=fingerprint, kind=kind)
         return rid
@@ -690,15 +695,31 @@ class Executor:
     _RUNNER_KEYS = {"kind", "action", "name", "owner", "device", "expires_at"}
 
     def _check_runner_payload(self, payload):
-        if self.jobs is None:
-            raise ExecutionDenied("runner_not_available")
         action = payload.get("action")
-        if (set(payload) != self._RUNNER_KEYS or payload.get("kind") != "runner" or action not in ("setup", "enroll", "unenroll", "settle_inference")
+        lab_request = action == "lab_enroll"
+        if self.jobs is None and not lab_request:
+            raise ExecutionDenied("runner_not_available")
+        fields = self._RUNNER_KEYS | {"client", "repository", "profile"} if lab_request else self._RUNNER_KEYS
+        if (set(payload) != fields or payload.get("kind") != "runner"
+                or action not in ("setup", "enroll", "unenroll", "settle_inference", "lab_enroll")
                 or payload.get("owner") != self.owner or payload.get("device") != self.device):
             raise ExecutionDenied("runner_request_invalid")
         name = payload.get("name")
-        if type(name) is not str or (name != "" if action == "setup" else not self._NAME.fullmatch(name)):
+        if type(name) is not str or (name != "" if action in ("setup", "lab_enroll") else not self._NAME.fullmatch(name)):
             raise ExecutionDenied("runner_request_invalid")
+        if lab_request:
+            if self.lab is None or self.passkeys is None:
+                raise ExecutionDenied("lab_unavailable")
+            if payload["profile"] != lab.POLICY:
+                raise ExecutionDenied("lab_profile_invalid")
+            try:
+                state = self.lab.enrollment(payload["client"], payload["repository"])
+            except lab.LabError as error:
+                raise ExecutionDenied(error.code) from None
+            if not state["ready"]:
+                raise ExecutionDenied("lab_executor_unavailable")
+            if state["enrolled"]:
+                raise ExecutionDenied("lab_already_enrolled")
         if action == "settle_inference":
             if not managed_activity.ID.fullmatch(name):
                 raise ExecutionDenied("activity_claim_invalid")
@@ -717,7 +738,7 @@ class Executor:
             raise ExecutionDenied("owner_intervention_required")
         if self.runs.status(payload_hash(payload)[0])["state"] != "not_started":
             raise ExecutionDenied("already_decided_or_used")
-        if action != "setup" and not self.jobs.enabled():
+        if action not in ("setup", "lab_enroll") and not self.jobs.enabled():
             raise ExecutionDenied("runner_not_set_up")
         return payload
 
@@ -735,7 +756,7 @@ class Executor:
                 rid = self._decide(payload, proof_token, challenge, "approve", "runner")
                 try:
                     result = self._runner_do(payload)
-                except (JobError, runner_policy.RunnerError, managed_activity.ActivityError) as stopped:
+                except (JobError, runner_policy.RunnerError, managed_activity.ActivityError, lab.LabError) as stopped:
                     result = {"ok": False, "stopped": stopped.code, "changed_anything": None, "action": payload["action"]}
                 except Exception as error:
                     result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__, "changed_anything": None,
@@ -752,6 +773,8 @@ class Executor:
 
     def _runner_do(self, payload):
         action = payload["action"]
+        if action == "lab_enroll":
+            return self.lab.enroll(payload["client"])
         if action == "setup":
             info = self.jobs.setup()
             test = self.jobs.selftest()
@@ -782,10 +805,12 @@ class Executor:
 
     def runner_call(self, call, args):
         """GREEN runner operations (owner-only socket, no approval): refused while an upgrade runs."""
-        if self.jobs is None:
-            raise ExecutionDenied("runner_not_available")
         if type(call) is not str or type(args) is not dict:
             raise ExecutionDenied("runner_call_invalid")
+        if call in lab.CALLS:
+            return self._lab_call(call, args)
+        if self.jobs is None:
+            raise ExecutionDenied("runner_not_available")
         self._settle_upgrades()
         if any(self.upgrader.is_job(r) for r in self.runs.running()):
             raise ExecutionDenied("an_upgrade_is_still_running")
@@ -793,6 +818,35 @@ class Executor:
             return self._runner_green(call, args)
         except (JobError, runner_policy.RunnerError) as stopped:
             raise ExecutionDenied(stopped.code) from None
+
+    def _lab_call(self, call, args):
+        if self.lab is None or self.passkeys is None:
+            raise ExecutionDenied("lab_unavailable")
+        methods = {
+            "lab_enrollment": (self.lab.enrollment, ("client", "repository")),
+            "lab_prepare": (self._lab_prepare, ("client", "repository", "commit", "version")),
+            "lab_start": (self.lab.start, ("client", "repository", "commit", "artifact_sha256", "scenario")),
+            "lab_jobs": (self.lab.jobs, ("client",)),
+            "lab_job_status": (self.lab.status, ("client", "job")),
+            "lab_job_output": (self.lab.output, ("client", "job", "offset", "limit")),
+            "lab_cancel": (self.lab.cancel, ("client", "job")),
+        }
+        method, keys = methods[call]
+        if set(args) != set(keys):
+            raise ExecutionDenied("lab_request_invalid")
+        try:
+            if call == "lab_start":
+                self._no_other_change()
+                if any(thread.is_alive() for thread in self._builds.values()):
+                    raise ExecutionDenied("another_build_is_running")
+            return method(*(args[key] for key in keys))
+        except (lab.LabError, dev_lab_policy.LabError, AuthorityError, managed_activity.ActivityError, vault.VaultError) as error:
+            raise ExecutionDenied(error.code) from None
+
+    def _lab_prepare(self, client, repository, commit, version):
+        if not self.lab.enrollment(client, repository)["enrolled"]:
+            raise ExecutionDenied("lab_enrollment_required")
+        return self._prepare_verification(commit, version, allow_current=True)
 
     def _runner_green(self, call, args):
         jobs, base = self.jobs, self.jobs.projects_dir
@@ -938,20 +992,33 @@ class Executor:
 
     def release_prepare(self, commit, version):
         """GREEN: start building and verifying a release from an exact commit (background). Nothing is signed or published."""
+        return self._prepare_verification(commit, version, allow_current=False)
+
+    def _prepare_verification(self, commit, version, *, allow_current):
+        self._no_lab_activity()
         authority = self._need_authority()
         if self._pending_release():                       # a pending release's inputs must not change under it
             raise ExecutionDenied("a_release_is_in_progress")
         try:
             installed = self.upgrader.installed_version()
-            if not self.upgrader.version_gt(version, installed):
+            acceptable = self.upgrader.version_ge(version, installed) if allow_current else self.upgrader.version_gt(version, installed)
+            if not acceptable:
                 raise ExecutionDenied("not_newer_than_installed")
-            state = authority.status(commit)
-            if state.get("state") == "building":
-                return state
-            authority.prepare_check(commit, version)          # refuse an unusable request before going to the background
-            thread = threading.Thread(target=self._build_in_background, args=(commit, version, installed), daemon=True)
-            self._builds[commit] = thread
-            thread.start()
+            with self._build_lock:
+                state = authority.status(commit)
+                active = self._builds.get(commit)
+                if state.get("state") == "building" and (not allow_current or (active and active.is_alive())):
+                    return state
+                if (allow_current and state.get("state") == "ready" and state.get("version") == version
+                        and state.get("lab_source_sha256")):
+                    return state
+                authority.prepare_check(commit, version)
+                self._builds = {sha: thread for sha, thread in self._builds.items() if thread.is_alive()}
+                if self._builds:
+                    raise ExecutionDenied("another_build_is_running")
+                thread = threading.Thread(target=self._build_in_background, args=(commit, version, installed), daemon=True)
+                self._builds[commit] = thread
+                thread.start()
         except UpgradeRefused as refused:
             raise ExecutionDenied(refused.code) from None
         except AuthorityError as refused:
@@ -1065,6 +1132,7 @@ class Executor:
 
     def _release_gate(self, rid):
         """No release step while the machine needs the owner or another change is running."""
+        self._no_lab_activity()
         if self.needs_attention():
             raise ExecutionDenied("owner_intervention_required")
         self._settle_upgrades()
@@ -1381,12 +1449,22 @@ class Executor:
                 self._rotation_finished(rid, {"ok": True, "rotation": "completed"})
 
     def _no_other_change(self):
+        self._no_lab_activity()
         if self.needs_attention():
             raise ExecutionDenied("owner_intervention_required")
         self._rotation_guard()
         self._settle_upgrades()
         if self.runs.running():
             raise ExecutionDenied("another_change_is_still_running")
+
+    def _no_lab_activity(self):
+        if self.lab is not None:
+            try:
+                claim = managed_activity.current(self.dir)
+            except managed_activity.ActivityError as error:
+                raise ExecutionDenied(error.code) from None
+            if claim and claim["kind"] == "dev_lab":
+                raise ExecutionDenied("development_lab_is_running")
 
     def _install_locked(self, payload, proof_token, challenge, *, now=None):
         self._no_other_change()

@@ -4,7 +4,7 @@ set -eu
 umask 077
 test "$#" -ge 1 && test "$#" -le 2
 if [ "$#" -eq 2 ]; then
-    case "$2" in --fault-cases|--power-case|--limits-case|--oom-case|--upgrade-case) ;; *) exit 2;; esac
+    case "$2" in --fault-cases|--power-case|--limits-case|--oom-case|--upgrade-case|--lab-mcp-case) ;; *) exit 2;; esac
 fi
 package=$(realpath "$1")
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -19,6 +19,14 @@ cp "$package" "$run/payload/repo/"
     cp ./*.deb "$run/payload/repo/"
 )
 cp "$repo/tools/dev/guest-limits.py" "$repo/tools/dev/guest-restore.py" "$repo/tests/legacy_pairing.py" "$repo/tests/softauth.py" "$run/payload/"
+if [ "${2-}" = --lab-mcp-case ]; then
+    cp "$repo/tools/dev/guest-lab-mcp.py" "$run/payload/"
+    (
+        cd "$dev_dir/cache/lab-guest-debs"
+        sha256sum --strict -c SHA256SUMS.local >&2
+        cp ./*.deb "$run/payload/repo/"
+    )
+fi
 (cd "$run/payload/repo" && dpkg-scanpackages --multiversion . /dev/null > Packages)
 cat > "$run/seed/meta-data" <<'EOF'
 instance-id: stynpilot-restore-synthetic
@@ -60,8 +68,12 @@ if [[ -e /mnt/stynpilot-fixture/power-case ]]; then fixture+=(--power-case); fi
 if [[ -e /mnt/stynpilot-fixture/limits-case || -e /mnt/stynpilot-fixture/oom-case || -e /mnt/stynpilot-fixture/upgrade-case ]]; then
     fixture=(/usr/bin/python3 -IB /mnt/stynpilot-fixture/guest-limits.py)
 fi
+if [[ -e /mnt/stynpilot-fixture/lab-mcp-case ]]; then
+    "${apt_local[@]}" -y --no-install-recommends install bubblewrap python3-pytest
+    fixture=(/usr/bin/python3 -IB /mnt/stynpilot-fixture/guest-lab-mcp.py)
+fi
 if ! "${fixture[@]}"; then
-    journalctl -b -u stynpilot-installer.service -u stynpilot-restore.service -u stynpilot-restore.path -u 'run-*.service' --no-pager -n 160
+    journalctl -b -u stynpilot-installer.service -u stynpilot-restore.service -u stynpilot-restore.path -u 'run-*.service' -u 'stynpilot-lab-*.service' --no-pager -n 160
     journalctl -b _SYSTEMD_USER_UNIT=stynpilot-owner.service --no-pager -n 40
     if [[ -r /var/lib/stynpilot-installer/runner-selftest.json ]]; then
         cat /var/lib/stynpilot-installer/runner-selftest.json

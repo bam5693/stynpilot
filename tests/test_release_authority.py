@@ -30,6 +30,7 @@ VERSION = "0.1.0~dev4"
 class FakeMachine:
     """Pretends to be git + the build + pytest inside the builder's work folder, and records every step that ran."""
     LOCK = "# vendored\nmcp==1.30.0 " + "a" * 64 + "\n"
+    LAB_SOURCE = b"before candidate code"
 
     def __init__(self, deb_bytes, *, tests="1 passed in 1.0s", tests_code=0, second_build=None, commit=None, version="0.1.0.dev4",
                  pip_code=0):
@@ -60,6 +61,8 @@ class FakeMachine:
                 self.fetched = args[-1]
             elif "rev-parse" in args:
                 return 0, "...\n" + (self.commit or self.fetched) + "\n"
+            elif "archive" in args:
+                (work / "lab-source.tar").write_bytes(self.LAB_SOURCE)
             return 0, ""
         if args[:3] == ["/usr/bin/python3", "-I", "-c"]:
             return 0, self.version + "\n"
@@ -78,6 +81,8 @@ class FakeMachine:
             out.mkdir()
             data = self.deb if m.group(1) == "0" or self.second is None else self.second
             (out / "stynpilot_x_all.deb").write_bytes(data)
+            if (work / "lab-source.tar").exists():
+                (work / "lab-source.tar").write_bytes(b"changed by executing candidate")
             return 0, ""
         if "pytest" in script:
             return self.tests_code, "....\n" + self.tests + "\n"
@@ -181,6 +186,15 @@ class AuthorityTests(unittest.TestCase):
 
     def prepared(self):
         return self.auth.prepare(COMMIT, VERSION, "0.1.0~dev3")
+
+    def test_lab_artifact_is_captured_before_execution_and_rehashed_on_use(self):
+        self.auth = self.make(self.tmp / "with-lab", self.machine, retain_lab_source=True, build_uid=os.geteuid())
+        record = self.prepared()
+        self.assertEqual(record["state"], "ready", record)
+        digest = record["lab_source_sha256"]
+        self.assertEqual(self.auth.lab_artifact(COMMIT, digest), self.machine.LAB_SOURCE)
+        with self.assertRaisesRegex(AuthorityError, "lab_source_not_verified"):
+            self.auth.lab_artifact(COMMIT, "1" * 64)
 
     def test_a_good_build_is_recorded_with_everything_the_owner_will_see(self):
         got = self.prepared()

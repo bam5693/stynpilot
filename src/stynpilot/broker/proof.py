@@ -137,6 +137,12 @@ def render_summary(payload):
     if payload.get("kind") == "runner":
         expires = "Expires %s UTC." % str(payload.get("expires_at")).replace("T", " ").rstrip("Z")
         name = str(payload.get("name"))
+        if payload.get("action") == "lab_enroll":
+            return ["Authorize AI client %s to run the fixed offline development test profile %s for repository %s."
+                    % (payload["client"], payload["profile"], payload["repository"]),
+                    "Routine tests use an exact commit and source fingerprint verified by the installer. Only this client can read its evidence.",
+                    "One job at a time, up to 2 GiB RAM, two CPUs, 64 tasks and eleven minutes. Source is read-only, with no external network.",
+                    "Revoking this AI client in StyNpilot removes its MCP access. This approval only enrolls the profile.", expires]
         if payload.get("action") == "settle_inference":
             return ["Stop the fixed local Ollama pilot service and settle inference reservation %s." % name,
                     "This can interrupt local AI and OpenCode. The service will remain stopped. No models, project files or backups are deleted.",

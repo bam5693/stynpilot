@@ -70,6 +70,11 @@ class SourceArtifactTests(unittest.TestCase):
         with self.assertRaises(OSError):
             dev_lab_source.stage(linked, self.scratch, COMMIT, "a" * 64)
 
+    def test_worker_rejects_an_unpinned_dependency(self):
+        self.archive.write_bytes(b"unapproved wheel fixture")
+        with self.assertRaisesRegex(LabError, "lab_worker_dependency_invalid"):
+            dev_lab_worker._stage_support(self.archive, self.scratch)
+
 
 class WorkerProcessTests(unittest.TestCase):
     def test_preserves_failure_and_output(self):
@@ -92,4 +97,4 @@ class WorkerProcessTests(unittest.TestCase):
 
     def test_unimplemented_scenario_stays_closed(self):
         with self.assertRaisesRegex(LabError, "lab_scenario_not_implemented"):
-            dev_lab_worker.run("unused", "unused", COMMIT, "b" * 64, "guest_restore")
+            dev_lab_worker.run("unused", "unused", COMMIT, "b" * 64, "guest_restore", wheel="unused")

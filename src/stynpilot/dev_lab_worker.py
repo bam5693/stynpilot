@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import selectors
 import signal
@@ -21,8 +22,11 @@ OUTPUT_LIMIT = 256 << 10
 MEMORY_LIMIT = 2 << 30
 TASK_LIMIT = 64
 CPU_LIMIT = 2
+WHEEL_DIGEST = "666edb5009503e1047c9d60346a756f94b261f05cc2625f23d41c728ffc484d0"
+WHEEL_MAX = 1 << 20
 _RECIPES = {
     "offline_normal": ["/usr/bin/python3", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                       "--tb=short", "--maxfail=5",
                        "tests", "--ignore=tests/test_g7.py", "--ignore=tests/test_compat_check.py"],
 }
 
@@ -48,9 +52,28 @@ def _require_containment():
         raise LabError("lab_worker_cgroup_not_bounded") from None
 
 
+def _stage_support(wheel, scratch):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    with os.fdopen(os.open(wheel, flags), "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise LabError("lab_worker_dependency_invalid")
+        content = source.read(WHEEL_MAX + 1)
+    if len(content) > WHEEL_MAX or hashlib.sha256(content).hexdigest() != WHEEL_DIGEST:
+        raise LabError("lab_worker_dependency_invalid")
+    (scratch / "mcp.whl").write_bytes(content)
+    (scratch / "passwd").write_text(
+        "root:x:0:0:root:/root:/usr/sbin/nologin\n"
+        "lab:x:1000:1000:lab:/tmp:/usr/sbin/nologin\n"
+        "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n",
+        encoding="ascii")
+    (scratch / "group").write_text("root:x:0:\nlab:x:1000:\nnogroup:x:65534:\n", encoding="ascii")
+
+
 def _command(source, scenario):
+    scratch = source.parent
     return [
-        "/usr/bin/bwrap", "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",
+        "/usr/bin/bwrap", "--unshare-all", "--unshare-user", "--uid", "1000", "--gid", "1000",
+        "--disable-userns", "--die-with-parent", "--new-session",
         "--clearenv", "--cap-drop", "ALL",
         "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin",
         "--symlink", "usr/sbin", "/sbin", "--symlink", "usr/lib", "/lib",
@@ -58,13 +81,19 @@ def _command(source, scenario):
         "--ro-bind", "/etc/alternatives", "/etc/alternatives",
         "--ro-bind", "/etc/ld.so.cache", "/etc/ld.so.cache",
         "--ro-bind", "/etc/os-release", "/etc/os-release",
+        "--ro-bind", "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/certs/ca-certificates.crt",
+        "--ro-bind", str(scratch / "passwd"), "/etc/passwd",
+        "--ro-bind", str(scratch / "group"), "/etc/group",
         "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/run",
         "--size", str(256 << 20), "--tmpfs", "/tmp",
         "--ro-bind", str(source), "/work/src",
+        "--ro-bind", str(scratch / "mcp.whl"), "/work/mcp.whl",
         "--setenv", "HOME", "/tmp", "--setenv", "PATH", "/usr/bin:/bin",
-        "--setenv", "LANG", "C.UTF-8", "--setenv", "PYTHONPATH", "/work/src/src",
+        "--setenv", "LANG", "C.UTF-8", "--setenv", "PYTHONPATH", "/work/src/src:/tmp/vendor",
         "--setenv", "PYTHONDONTWRITEBYTECODE", "1", "--setenv", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1",
-        "--chdir", "/work/src", "--", *_RECIPES[scenario],
+        "--chdir", "/work/src", "--", "/bin/sh", "-ec",
+        '/usr/bin/python3 -I -m zipfile -e /work/mcp.whl /tmp/vendor; exec "$@"',
+        "lab-worker", *_RECIPES[scenario],
     ]
 
 
@@ -103,7 +132,7 @@ def _execute(argv, stop):
                 child.kill()
 
 
-def run(archive, scratch_parent, commit, digest, scenario, *, stop=lambda: False):
+def run(archive, scratch_parent, commit, digest, scenario, *, wheel, stop=lambda: False):
     request = scenario_request(commit, scenario)
     if scenario not in _RECIPES:
         raise LabError("lab_scenario_not_implemented")
@@ -117,6 +146,7 @@ def run(archive, scratch_parent, commit, digest, scenario, *, stop=lambda: False
         if stop():
             return {**request, "state": "cancelled", "exit_code": None, "output": ""}
         source = stage(archive, scratch, commit, digest)
+        _stage_support(wheel, source.parent)
         state, code, raw = _execute(_command(source, scenario), stop)
     evidence, _ = redact(raw.decode("utf-8", "replace"))
     return {**request, "state": state, "exit_code": code, "output": evidence}
@@ -132,6 +162,7 @@ def main():
     parser.add_argument("commit")
     parser.add_argument("digest")
     parser.add_argument("scenario", choices=tuple(_RECIPES))
+    parser.add_argument("--wheel", type=Path, required=True)
     args = parser.parse_args()
     cancelled = False
 
@@ -142,7 +173,8 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        result = run(args.archive, args.scratch, args.commit, args.digest, args.scenario, stop=lambda: cancelled)
+        result = run(args.archive, args.scratch, args.commit, args.digest, args.scenario,
+                     wheel=args.wheel, stop=lambda: cancelled)
     except (LabError, OSError, ValueError, EOFError, tarfile.TarError) as error:
         parser.exit(2, getattr(error, "code", "lab_worker_input_invalid") + "\n")
     print(json.dumps(result))

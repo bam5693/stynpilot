@@ -32,6 +32,8 @@ The Dev28 review adds read-only MCP access to existing imported archives. An own
 
 The authenticated client can list its archives, page refs and commit links, inspect a commit tree, read small text files, and compare two commit trees when it has access to both archives. This mode covers inspection. The separate remote intake worker still requires provider authorization and an approved broker route. Test the package with `tools/dev/restore-media.sh PACKAGE --archive-mcp-case` and require `STYNPILOT_PACKAGED_ARCHIVE_MCP_OK` and `FIXTURE_EXIT=0` from the disposable guest.
 
+The private-history follow-up applies the existing secret-name policy to historical paths and redacts recognized credentials in the entire returned text. Contents of the original blob and bundle stay byte-identical. Protected paths are withheld from tree and comparison output. Redaction is heuristic, and private-archive grants remain an explicit owner decision. The read routes recheck retained storage and refuse inspection if recovery is unresolved or the store is unsafe or exceeds capacity.
+
 ## Milestones and versions
 
 | Milestone | Scope | Debian package |

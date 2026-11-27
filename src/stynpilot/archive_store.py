@@ -13,7 +13,7 @@ import stat
 import tempfile
 import threading
 
-from . import repo_archive as git, vault
+from . import repo_archive as git, redact, safefs, vault
 
 MAX_RETAINED = 4 << 30
 MAX_ARCHIVES = 32
@@ -26,6 +26,7 @@ ADOPTION_RESERVATION = 5 * git.MAX_BUNDLE + 4 * git.MAX_MANIFEST
 _ARCHIVE = re.compile(r"[a-f0-9]{32}\Z")
 _CLIENT = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 _PENDING = re.compile(r"\.pending-[a-z0-9_]{8}\Z")
+_PROTECTED_LOCATIONS = tuple(tuple(path.lower().split("/")) for path in safefs.HOME_DENY) + ((".git",),)
 
 
 def _private_dir(path):
@@ -54,8 +55,11 @@ def _receipt(path):
 
 
 def _size(root, remaining):
+    def refused(error):
+        raise git.ArchiveError("archive_store_untrusted") from error
+
     total, count = 0, 0
-    for folder, dirs, files in os.walk(root, followlinks=False):
+    for folder, dirs, files in os.walk(root, followlinks=False, onerror=refused):
         for name in dirs + files:
             info = (Path(folder) / name).lstat()
             count += 1
@@ -102,6 +106,9 @@ class Store:
                 fcntl.flock(fd, (fcntl.LOCK_EX if write else fcntl.LOCK_SH) | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise git.ArchiveError("archive_store_busy") from None
+            if not write:
+                self._inventory()
+                _size(self.path, MAX_RETAINED)
             yield True
         finally:
             os.close(fd)
@@ -125,8 +132,10 @@ class Store:
     def _inventory(self):
         rows = []
         for entry in self.path.iterdir():
-            if entry.name == "store.lock" or _PENDING.fullmatch(entry.name):
+            if entry.name == "store.lock":
                 continue
+            if _PENDING.fullmatch(entry.name):
+                raise git.ArchiveError("archive_recovery_required")
             if not _ARCHIVE.fullmatch(entry.name) or len(rows) >= MAX_ARCHIVES:
                 raise git.ArchiveError("archive_store_capacity")
             _private_dir(entry)
@@ -218,7 +227,11 @@ class Store:
             receipt = None
         if receipt is None:
             raise git.ArchiveError("archive_not_found")
-        return entry / "comparison.git", receipt
+        bare = entry / "comparison.git"
+        _private_dir(bare)
+        if os.path.lexists(bare / "objects/info/alternates") or os.path.lexists(bare / "shallow"):
+            raise git.ArchiveError("archive_store_untrusted")
+        return bare, receipt
 
     def refs(self, client, archive_id, offset=0, limit=50):
         with self._locked():
@@ -228,7 +241,8 @@ class Store:
     def tree(self, client, archive_id, commit, offset=0, limit=50):
         with self._locked():
             bare, _ = self._lookup(archive_id, client)
-            return _page([{"path": path, **item} for path, item in _tree(bare, commit).items()], offset, limit)
+            return _page([{"path": path, **item} for path, item in _tree(bare, commit).items() if _safe_path(path)],
+                         offset, limit)
 
     def history(self, client, archive_id, commit, offset=0, limit=50):
         _page([], offset, limit)
@@ -245,6 +259,8 @@ class Store:
         with self._locked():
             _path(path)
             bare, _ = self._lookup(archive_id, client)
+            if not _safe_path(path):
+                raise git.ArchiveError("archive_protected_path")
             _commit(bare, commit)
             spec = commit + ":" + path
             if git._git(bare, "cat-file", "-t", spec, timeout=8).strip() != b"blob":
@@ -258,7 +274,12 @@ class Store:
                 raise git.ArchiveError("archive_file_not_text") from None
             if "\0" in text:
                 raise git.ArchiveError("archive_file_not_text")
-            return {"path": path, "size": size, "text": text}
+            clean, found = redact.redact(text)
+            if redact.mostly_secret(len(text), clean, found):
+                raise git.ArchiveError("archive_file_is_mostly_secret")
+            if len(clean.encode("utf-8")) > MAX_FILE:
+                raise git.ArchiveError("archive_file_too_large")
+            return {"path": path, "size": size, "text": clean, "redacted": found}
 
     def compare(self, client, left_id, left_commit, right_id, right_commit, offset=0, limit=50):
         with self._locked():
@@ -266,7 +287,8 @@ class Store:
             right, _ = self._lookup(right_id, client)
             before, after = _tree(left, left_commit), _tree(right, right_commit)
             return _page([{"path": name, "before": before.get(name), "after": after.get(name)}
-                          for name in sorted(before.keys() | after.keys()) if before.get(name) != after.get(name)],
+                          for name in sorted(before.keys() | after.keys())
+                          if before.get(name) != after.get(name) and _safe_path(name)],
                          offset, limit)
 
 
@@ -297,6 +319,20 @@ def _path(path):
     if (type(path) is not str or not 0 < len(path) <= 1024 or any(ord(c) < 32 for c in path)
             or any(p in {"", ".", ".."} for p in path.split("/"))):
         raise git.ArchiveError("archive_path_invalid")
+
+
+def _safe_path(path):
+    try:
+        _path(path)
+        parts = tuple(path.lower().split("/"))
+        for part in parts:
+            safefs.Policy.name_ok(part)
+    except (git.ArchiveError, safefs.FileDenied):
+        return False
+    if any(parts[start:start + len(location)] == location
+           for start in range(len(parts)) for location in _PROTECTED_LOCATIONS):
+        return False
+    return not redact.redact(path)[1]
 
 
 def _tree(bare, commit):

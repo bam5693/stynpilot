@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from functools import partial
 import hmac
 import secrets
 import threading
@@ -112,7 +113,8 @@ class ApprovalFlow:
         required = {"restore_root": "root_restore_requires_passkey",
                     "settle_inference": "inference_settlement_requires_passkey",
                     "lab_enroll": "lab_enrollment_requires_passkey",
-                    "repo_push": "git_push_requires_passkey"}.get(payload.get("action"))
+                    "repo_push": "git_push_requires_passkey",
+                    "repo_credential": "repository_credential_requires_passkey"}.get(payload.get("action"))
         with self._lock:
             self._sweep()
             if len(self._views) >= MAX_VIEWS:
@@ -120,7 +122,8 @@ class ApprovalFlow:
             self._views[view] = {"request_id": request_id, "csrf": csrf, "passkey_required": required,
                                  "challenges": {"approve": approve, "deny": deny},
                                  "used": False, "attempts": 0, "expires": self.clock() + VIEW_LIFETIME}
-        return {"passkey_required": bool(required), "passkey": passkey, "status_url": "/approve/status/" + request_id, "view": view, "csrf": csrf, "request_id": request_id, "kind": payload.get("kind", "install"),
+        return {"passkey_required": bool(required), "repository_credential": payload.get("action") == "repo_credential",
+                "passkey": passkey, "status_url": "/approve/status/" + request_id, "view": view, "csrf": csrf, "request_id": request_id, "kind": payload.get("kind", "install"),
                 "summary": list(approve["summary"]), "summary_sha256": approve["summary_sha256"],
                 "fingerprint": request_id[:12], "choices": ["approve", "deny"],
                 "expires_in": VIEW_LIFETIME}
@@ -145,7 +148,7 @@ class ApprovalFlow:
     # -- 1b. one tap: a passkey signs the exact decision nonce ------------------------------------------------------------
     MAX_PASSKEY_TRIES = 5
 
-    def passkey_decide(self, view, csrf, decision, assertion):
+    def passkey_decide(self, view, csrf, decision, assertion, credential=None):
         """``assertion``: JSON text of the WebAuthn proof. The installer checks it WITHOUT using anything up first, so a
         wrong finger, a cancelled prompt or a bad signature leaves the request exactly as it was (up to a few tries)."""
         if decision not in ("approve", "deny"):
@@ -166,15 +169,25 @@ class ApprovalFlow:
         if payload is None:
             raise ApprovalError("unknown_request")
         challenge = item["challenges"][decision]["challenge"]
+        kwargs = {}
+        if payload.get("action") == "repo_credential" and decision == "approve":
+            from .broker.repo_push import credential_digest
+            from .repo_git import WorkspaceError
+            try:
+                kwargs["credential_sha256"] = credential_digest(credential)
+            except WorkspaceError as error:
+                raise ApprovalError(error.code) from None
+        elif credential is not None:
+            raise ApprovalError("repository_credential_not_expected")
         try:
-            self.broker.passkey_precheck(payload, assertion, challenge, decision)
+            self.broker.passkey_precheck(payload, assertion, challenge, decision, **kwargs)
         except Exception as error:
             raise ApprovalError("passkey_refused_%s" % getattr(error, "code", "unavailable")) from None
         with self._lock:
             if item["used"]:
                 raise ApprovalError("already_chosen")
             item["used"] = True
-        return self._conclude(item["request_id"], decision, payload, assertion, challenge, view=view)
+        return self._conclude(item["request_id"], decision, payload, assertion, challenge, view=view, credential=credential)
 
     # -- 2. the owner picks Approve or Deny: start a fresh Auth0 sign-in for exactly that choice --------
     def choose(self, view, csrf, decision):
@@ -220,7 +233,7 @@ class ApprovalFlow:
             raise ApprovalError("sign_in_failed") from None
         return self._conclude(rid, decision, payload, id_token, item["challenge"], view=item["view"])
 
-    def _conclude(self, rid, decision, payload, proof, challenge, view=None):
+    def _conclude(self, rid, decision, payload, proof, challenge, view=None, credential=None):
         """Record the owner's decision and act on it exactly once (Auth0 token or passkey assertion: same path)."""
         # One decision per request: the compare-and-set is what stops a double decision.
         target = "approved" if decision == "approve" else "denied"
@@ -243,9 +256,13 @@ class ApprovalFlow:
                 self._enroll_sessions[rid] = {"view": view, "expires": self.clock() + VIEW_LIFETIME}
         wanted = {"rollback": "rollback", "upgrade": "upgrade", "release": "release", "runner": "runner_admin",
                   "passkey": "passkey_admin", "backup": "backup_admin"}.get(payload.get("kind"), "install")
+        if payload.get("action") == "repo_credential":
+            wanted = "repository_credential_install"
         method = getattr(self.broker, wanted, None)
         if method is None:
             return self._uncertain(rid)
+        if credential is not None:
+            method = partial(method, credential=credential)
         try:
             self.store.transition(rid, "approved", "running")
             if self._pool is not None:

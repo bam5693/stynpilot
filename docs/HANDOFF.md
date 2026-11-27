@@ -16,6 +16,12 @@ The transport needs a separate owner-provisioned GitHub credential with write ac
 
 After independent review and activation, prepare an exact GitHub revision with the live release authority, obtain its `checkout_bundle_sha256`, and consume it through `workspace_fetch_stynpilot`. Confirm the exact new local ref and compare the workspace HEAD before and after. Preserve occupied workspaces. The NIC-free packaged fixture tests the combined MCP workflow against a disposable HTTPS smart-Git origin and synthetic credential.
 
+## Phone-based GitHub credential review
+
+The Dev27 candidate adds `commander_request_stynpilot_credential_setup`. Its MCP arguments contain only the enrolled device and repository. The private approval page accepts the fine-grained token in a masked field and binds the entered value to the existing WebAuthn challenge. The authenticated broker writes the credential atomically to its protected installer state only after verifying that exact value and consuming the independent approval. The token is absent from tool arguments, request records, status and backup payloads.
+
+Provision a GitHub fine-grained token for only the StyNpilot repository with Contents read and write. A saved credential means local provisioning succeeded. A separately approved work-branch push verifies real repository access after activation. The transport now sets `LimitCORE=0` and requests a stop on timeout. Treat a lost push response as uncertain and inspect the remote ref before repeating the operation.
+
 ## Milestones and versions
 
 | Milestone | Scope | Debian package |
@@ -24,7 +30,8 @@ After independent review and activation, prepare an exact GitHub revision with t
 | Dev23 Stage 1 | Retention policy and periodic verification | `0.1.0~dev23` |
 | Dev23 Stage 2 | Secure key rotation | `0.1.0~dev24` released |
 | Dev23 Stage 3 | Installer-side restoration and development lab | `0.1.0~dev25` released |
-| Repository management | StyNpilot checkout, fetch and guarded native push | `0.1.0~dev26` candidate |
+| Repository management | StyNpilot checkout, fetch and guarded native push | `0.1.0~dev26` released |
+| GitHub credential setup | Phone entry and transport hardening | `0.1.0~dev27` candidate |
 | Dev23 Stage 4 | Owner-side restoration | Following unused increment |
 
 Dev24 off-machine backup and Dev25 repository management are milestone labels. Every separately published package consumes a version increment.

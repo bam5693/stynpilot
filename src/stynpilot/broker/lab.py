@@ -19,7 +19,7 @@ POLICY = "offline-normal-v1"
 JOB_SECONDS = 660
 RETAIN = 16
 CLIENT = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
-CALLS = frozenset(("lab_enrollment", "lab_prepare", "lab_start", "lab_jobs", "lab_job_status", "lab_job_output", "lab_cancel", "lab_checkout", "lab_fetch", "lab_push_ready"))
+CALLS = frozenset(("lab_enrollment", "lab_prepare", "lab_start", "lab_jobs", "lab_job_status", "lab_job_output", "lab_cancel", "lab_checkout", "lab_fetch", "lab_push_ready", "lab_credential_ready"))
 _ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
 _WORKER = ("import sys;sys.pycache_prefix='/usr/lib/stynpilot/.source-only';"
            "sys.path.insert(0,'/usr/lib/stynpilot/lib');"

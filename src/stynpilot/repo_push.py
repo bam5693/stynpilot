@@ -43,8 +43,8 @@ def push_bundle(bundle, branch, commit, expected, token, *, remote=repo_git.ORIG
             "-c", "protocol.file.allow=always",
         ]
 
-        def git(*args, env=None):
-            return subprocess.run(commands + list(args), cwd=folder, env=env or repo_git._ENV,
+        def git(*args):
+            return subprocess.run(commands + list(args), cwd=folder, env=repo_git._ENV,
                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL, timeout=30, check=True).stdout
 
@@ -58,15 +58,17 @@ def push_bundle(bundle, branch, commit, expected, token, *, remote=repo_git.ORIG
         # repository. It has no workspace hooks, config, files or credentials.
         if git("rev-parse", "--verify", ref + "^{commit}").strip() != commit.encode("ascii"):
             raise repo_git.WorkspaceError("git_push_commit_mismatch")
-        env = dict(repo_git._ENV)
         if remote == repo_git.ORIGIN:
             auth = base64.b64encode(("x-access-token:" + token).encode("ascii")).decode("ascii")
-            env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http." + remote + ".extraHeader",
-                       GIT_CONFIG_VALUE_0="Authorization: Basic " + auth)
+            auth_config = folder / "auth.conf"
+            fd = os.open(auth_config, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w", encoding="ascii") as config:
+                config.write('[http "' + remote + '"]\n\textraHeader = Authorization: Basic ' + auth + '\n')
             commands.extend(["-c", "protocol.https.allow=always", "-c", "protocol.file.allow=never",
-                             "-c", "http.followRedirects=false", "-c", "credential.helper="])
+                             "-c", "http.followRedirects=false", "-c", "credential.helper=",
+                             "-c", "include.path=" + str(auth_config)])
         def remote_head():
-            entries = git("ls-remote", "--refs", "--", remote, ref, env=env).splitlines()
+            entries = git("ls-remote", "--refs", "--", remote, ref).splitlines()
             if not entries:
                 return ZERO
             if len(entries) != 1:
@@ -84,7 +86,7 @@ def push_bundle(bundle, branch, commit, expected, token, *, remote=repo_git.ORIG
         # The pre-push hook checks the actual push advertisement. Native push
         # then enforces fast-forward and receive-pack performs old-OID CAS.
         git("-c", "core.hooksPath=" + str(hooks), "push", "--porcelain",
-            "--no-follow-tags", "--recurse-submodules=no", "--", remote, ref + ":" + ref, env=env)
+            "--no-follow-tags", "--recurse-submodules=no", "--", remote, ref + ":" + ref)
         if remote_head() != commit:
             raise repo_git.WorkspaceError("git_push_outcome_unverified")
 

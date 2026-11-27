@@ -64,7 +64,7 @@ from .selftest import clean_diagnostics
 from .passkeys import PasskeyError
 from .release_authority import AuthorityError, _write_private
 from .. import webauthn
-from .proof import ProofDenied, decision_nonce, render_summary, summary_hash
+from .proof import ProofDenied, decision_nonce, render_summary, repository_credential_nonce, summary_hash
 from .upgrade import UpgradeRefused, Upgrader
 
 ReleaseErrorTypes = (release.ReleaseError,)
@@ -417,13 +417,17 @@ class Executor:
             return self._check_rollback_payload(payload)
         return self._check_install_payload(payload)
 
-    def _prove(self, rid, proof_token, challenge, decision):
+    def _prove(self, rid, proof_token, challenge, decision, *, credential_sha256=None):
         """Check the owner's proof (Auth0 token or passkey assertion) for exactly this decision; uses nothing up.
         Returns (fingerprint, passkey-or-None). The ONLY place an owner proof is accepted."""
         if type(challenge) is not str or len(challenge) != 64:
             raise ExecutionDenied("challenge_unknown")
         try:
             nonce = decision_nonce(decision, rid, rid, challenge)
+            if credential_sha256 is not None:
+                nonce = repository_credential_nonce(nonce, credential_sha256)
+                if type(proof_token) is not str or not proof_token.startswith("{"):
+                    raise ExecutionDenied("repository_credential_requires_passkey")
             if type(proof_token) is str and proof_token.startswith("{"):
                 return self._verify_passkey(proof_token, nonce, rid, decision)
             return self.verifier.verify(proof_token, owner=self.owner, expected_nonce=nonce), None
@@ -439,9 +443,16 @@ class Executor:
             except Exception:
                 raise ExecutionDenied("passkey_record_failed_nothing_was_approved") from None
 
-    def _decide(self, payload, proof_token, challenge, decision, kind):
+    def _decide(self, payload, proof_token, challenge, decision, kind, *, credential_sha256=None):
         rid, _ = payload_hash(payload)
-        fingerprint, passkey = self._prove(rid, proof_token, challenge, decision)
+        if (payload.get("action") == "repo_credential" and decision == "approve") != (credential_sha256 is not None):
+            raise ExecutionDenied("repository_credential_invalid")
+        if credential_sha256 is None:
+            fingerprint, passkey = self._prove(rid, proof_token, challenge, decision)
+        else:
+            self.runs.peek(challenge=challenge, request_id=rid, decision=decision)
+            fingerprint, passkey = self._prove(rid, proof_token, challenge, decision,
+                                              credential_sha256=credential_sha256)
         if decision == "approve" and payload.get("kind") == "runner" and passkey is None:
             if payload.get("action") == "settle_inference":
                 raise ExecutionDenied("inference_settlement_requires_passkey")
@@ -489,7 +500,7 @@ class Executor:
         fingerprint = hashlib.sha256(("passkey|%s|%s" % (row["credential_id"], data["signature"])).encode()).hexdigest()
         return fingerprint, (row, auth)
 
-    def passkey_precheck(self, payload, proof_token, challenge, decision):
+    def passkey_precheck(self, payload, proof_token, challenge, decision, *, credential_sha256=None):
         """Would this passkey proof be accepted right now? Changes nothing and uses nothing up, so a wrong fingerprint or a
         cancelled prompt leaves the request exactly as it was and the owner can simply try again."""
         if decision not in ("approve", "deny"):
@@ -502,6 +513,10 @@ class Executor:
         self.runs.peek(challenge=challenge, request_id=rid, decision=decision)
         try:
             nonce = decision_nonce(decision, rid, rid, challenge)
+            if payload.get("action") == "repo_credential" and decision == "approve":
+                nonce = repository_credential_nonce(nonce, credential_sha256)
+            elif credential_sha256 is not None:
+                raise ExecutionDenied("repository_credential_not_expected")
         except ProofDenied as denied:
             raise ExecutionDenied(denied.code) from None
         if type(proof_token) is not str or not proof_token.startswith("{"):
@@ -696,20 +711,23 @@ class Executor:
     _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}\Z")
     _RUNNER_KEYS = {"kind", "action", "name", "owner", "device", "expires_at"}
 
-    def _git_push_ready(self, client, repository, branch, commit, expected):
-        from .. import repo_git
-        from .repo_push import Transport
-        try:
-            repo_git.validate_push(branch, commit, expected)
-        except repo_git.WorkspaceError as error:
-            raise ExecutionDenied(error.code) from None
+    def _git_credential_ready(self, client, repository):
         if self.jobs is None or self.lab is None or self.passkeys is None:
             raise ExecutionDenied("git_push_unavailable")
         if not self.lab.enrollment(client, repository)["enrolled"]:
             raise ExecutionDenied("lab_enrollment_required")
-        if not any(row["path"] == self._workspace_path(repo_git.WORKSPACE) for row in self.jobs.workspaces()):
+        if not any(row["path"] == self._workspace_path("stynpilot") for row in self.jobs.workspaces()):
             raise ExecutionDenied("workspace_not_enrolled")
-        if not Transport(self.dir).ready():
+        from .repo_push import Transport
+        return {"ready": True, "configured": Transport(self.dir).ready()}
+
+    def _git_push_ready(self, client, repository, branch, commit, expected):
+        from .. import repo_git
+        try:
+            repo_git.validate_push(branch, commit, expected)
+        except repo_git.WorkspaceError as error:
+            raise ExecutionDenied(error.code) from None
+        if not self._git_credential_ready(client, repository)["configured"]:
             raise ExecutionDenied("git_push_credential_unavailable")
         return {"ready": True}
 
@@ -723,8 +741,10 @@ class Executor:
             fields |= {"client", "repository", "profile"}
         if action == "repo_push":
             fields |= {"client", "repository", "branch", "commit", "expected_remote"}
+        if action == "repo_credential":
+            fields |= {"client", "repository"}
         if (set(payload) != fields or payload.get("kind") != "runner"
-                or action not in ("setup", "enroll", "unenroll", "settle_inference", "lab_enroll", "repo_push")
+                or action not in ("setup", "enroll", "unenroll", "settle_inference", "lab_enroll", "repo_push", "repo_credential")
                 or payload.get("owner") != self.owner or payload.get("device") != self.device):
             raise ExecutionDenied("runner_request_invalid")
         name = payload.get("name")
@@ -743,6 +763,10 @@ class Executor:
                 raise ExecutionDenied("lab_executor_unavailable")
             if state["enrolled"]:
                 raise ExecutionDenied("lab_already_enrolled")
+        if action == "repo_credential":
+            if name != "stynpilot":
+                raise ExecutionDenied("git_workspace_not_bound")
+            self._git_credential_ready(payload["client"], payload["repository"])
         if action == "repo_push":
             if name != "stynpilot":
                 raise ExecutionDenied("git_workspace_not_bound")
@@ -772,6 +796,8 @@ class Executor:
 
     def runner_admin(self, payload, proof_token, challenge):
         """Execute owner-approved runner changes through the single proof gate."""
+        if type(payload) is dict and payload.get("action") == "repo_credential":
+            raise ExecutionDenied("repository_credential_requires_phone")
         fence = nullcontext()
         if type(payload) is dict and payload.get("action") == "settle_inference":
             if self.inference_settlement_fence is None:
@@ -793,6 +819,28 @@ class Executor:
                 return result
         except managed_activity.ActivityError as error:
             raise ExecutionDenied(error.code) from None
+
+    def repository_credential_install(self, payload, proof_token, challenge, credential):
+        from ..repo_git import WorkspaceError
+        from .repo_push import Transport, credential_digest
+        if type(payload) is not dict or payload.get("kind") != "runner" or payload.get("action") != "repo_credential":
+            raise ExecutionDenied("repository_credential_not_expected")
+        self._check_payload(payload)
+        self._no_other_change()
+        try:
+            digest = credential_digest(credential)
+        except WorkspaceError as error:
+            raise ExecutionDenied(error.code) from None
+        rid = self._decide(payload, proof_token, challenge, "approve", "runner", credential_sha256=digest)
+        target = Transport(self.dir).credential
+        try:
+            vault._write_atomic(target.parent, target.name, credential.encode("ascii"), mode=0o600)
+        except (OSError, vault.VaultError):
+            result = {"ok": False, "stopped": "repository_credential_write_unverified"}
+        else:
+            result = {"ok": True, "action": "repo_credential", "repository": payload["repository"], "configured": True}
+        self._record_result(rid, "done" if result["ok"] else "failed", result)
+        return result
 
     def _workspace_path(self, name):
         if type(name) is not str or not self._NAME.fullmatch(name) or self.jobs.projects_dir is None:
@@ -868,6 +916,7 @@ class Executor:
             "lab_checkout": (self._lab_checkout, ("client", "repository", "commit", "bundle_sha256")),
             "lab_fetch": (self._lab_fetch, ("client", "repository", "commit", "bundle_sha256")),
             "lab_push_ready": (self._git_push_ready, ("client", "repository", "branch", "commit", "expected")),
+            "lab_credential_ready": (self._git_credential_ready, ("client", "repository")),
             "lab_start": (self.lab.start, ("client", "repository", "commit", "artifact_sha256", "scenario")),
             "lab_jobs": (self.lab.jobs, ("client",)),
             "lab_job_status": (self.lab.status, ("client", "job")),

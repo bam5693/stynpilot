@@ -71,14 +71,31 @@ async function go(d){
   if(!window.PublicKeyCredential){note('This browser cannot use passkeys. Use the Auth0 sign-in below.');return}
   buttons.forEach(b=>b.disabled=true);note('Waiting for your phone to confirm it is you...');
   let sent=false;
+  let credential;
   try{
-    const c=await navigator.credentials.get({publicKey:{challenge:u2b(o.challenge[d]),rpId:o.rp_id,timeout:120000,userVerification:'required',
+    let challenge=u2b(o.challenge[d]);
+    if(o.repository_credential&&d==='approve'){
+      const field=document.getElementById('repository-credential');
+      credential=field.value.trim();
+      if(!/^github_pat_[A-Za-z0-9_]{20,244}$/.test(credential)){
+        note('Enter a fine-grained GitHub token.');buttons.forEach(b=>b.disabled=false);return;
+      }
+      field.value='';
+      const enc=new TextEncoder();
+      const domain=enc.encode('stynpilot-repository-credential-v1\0');
+      const digest=new Uint8Array(await crypto.subtle.digest('SHA-256',enc.encode(credential)));
+      const bound=new Uint8Array(domain.length+challenge.length+digest.length);
+      bound.set(domain);bound.set(challenge,domain.length);bound.set(digest,domain.length+challenge.length);
+      challenge=new Uint8Array(await crypto.subtle.digest('SHA-256',bound));
+    }
+    const c=await navigator.credentials.get({publicKey:{challenge:challenge,rpId:o.rp_id,timeout:120000,userVerification:'required',
       allowCredentials:o.credentials.map(id=>({type:'public-key',id:u2b(id)}))}});
     const r=c.response;
     const a={credential_id:b2u(c.rawId),client_data_json:b2u(r.clientDataJSON),authenticator_data:b2u(r.authenticatorData),signature:b2u(r.signature)};
     note('Checking...');sent=true;
     const reply=await fetch('/approve/passkey',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({view:o.view,csrf:o.csrf,decision:d,assertion:JSON.stringify(a)})});
+      body:JSON.stringify({view:o.view,csrf:o.csrf,decision:d,assertion:JSON.stringify(a),credential})});
+    credential=undefined;
     const j=await reply.json();
     if(j.ok){if(o.return_url){note('Done. Returning to your chat...');setTimeout(()=>{location.replace(o.return_url)},900)}
       else{location.href=j.next}return}
@@ -217,11 +234,17 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
             nonce = secrets.token_urlsafe(18)
             options = dict(passkey, view=view["view"], csrf=view["csrf"], status_url=view["status_url"],
                            return_url=safe_return(request.query_params.get("redirectUrl")),
-                           autostart=request.query_params.get("go") == "1")
+                           repository_credential=bool(view.get("repository_credential")),
+                           autostart=request.query_params.get("go") == "1" and not view.get("repository_credential"))
             warning = ("<p><b>Note:</b> at least one enrolled passkey is synced through your Google account, so anyone who can "
                        "sign in to that account could use it. Add a device-only passkey when you can.</p>"
                        if passkey["synced"] else "")
-            body = (intro + "<div id=pk data-o='%s'></div>"
+            credential_field = (
+                "<label for=repository-credential>Fine-grained GitHub token</label>"
+                "<input id=repository-credential type=password maxlength=255 autocomplete=off "
+                "autocapitalize=none spellcheck=false>"
+                if view.get("repository_credential") else "")
+            body = (intro + credential_field + "<div id=pk data-o='%s'></div>"
                     "<button class=primary data-d=approve>Approve with fingerprint or PIN</button>"
                     "<button class=deny data-d=deny>Deny</button><p id=msg role=status></p>"
                     "<p><small>Your phone decides how it confirms it is you (fingerprint, face or screen lock) and may accept a "
@@ -283,8 +306,9 @@ def build_app(*, flow: ApprovalFlow, public_host, secure_cookie=True):
         if data is None or request.cookies.get(COOKIE) != view or not view:
             return JSONResponse({"ok": False, "message": _MESSAGES["page_expired"]}, status_code=403)
         try:
+            kwargs = {"credential": data.pop("credential")} if "credential" in data else {}
             outcome = await run_in_threadpool(flow.passkey_decide, view, data.get("csrf"), data.get("decision"),
-                                              data.get("assertion"))
+                                              data.get("assertion"), **kwargs)
         except ApprovalError as error:
             return refused(error)
         except Exception:

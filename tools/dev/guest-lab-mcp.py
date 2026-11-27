@@ -24,6 +24,7 @@ import jwt
 from softauth import SoftAuthenticator
 from stynpilot.broker import lab
 from stynpilot.broker.passkeys import PasskeyStore
+from stynpilot.broker.proof import repository_credential_nonce
 from stynpilot.approval_web import COOKIE
 
 HOST = "owner.example.test"
@@ -110,6 +111,12 @@ def fixture_push_origin(root, workspace, base, token):
                    "CONTENT_TYPE": self.headers.get("Content-Type", "")}
             result = subprocess.run(["/usr/lib/git-core/git-http-backend"], input=self.rfile.read(size), env=env,
                                     capture_output=True, timeout=20, check=True)
+            if target.path.endswith("/git-receive-pack"):
+                self.server.receive_posts += 1
+                if self.server.drop_receive:
+                    self.server.drop_receive = False
+                    self.close_connection = True
+                    return
             header, body = result.stdout.split(b"\r\n\r\n", 1)
             fields = [line.decode().split(": ", 1) for line in header.split(b"\r\n")]
             status = next((int(value.split()[0]) for name, value in fields if name.lower() == "status"), 200)
@@ -122,6 +129,8 @@ def fixture_push_origin(root, workspace, base, token):
             self.wfile.write(body)
 
     listener = ThreadingHTTPServer(("127.0.0.2", 443), Handler)
+    listener.receive_posts = 0
+    listener.drop_receive = False
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.load_cert_chain(cert, key)
     listener.socket = tls.wrap_socket(listener.socket, server_side=True)
@@ -188,7 +197,7 @@ def main():
         keys.open_window(enrollment, "Lab guest approver", "fixture")
         key = keys.complete(enrollment, auth.register(bytes.fromhex(keys.begin(enrollment)["challenge"])))
         keys.activate(key["kid"], key["label"], key["pub"], enrollment, "fixture")
-        def approve(request_id, *, required=False):
+        def approve(request_id, *, required=False, credential=None, substitution=None):
             with httpx.Client(base_url="http://127.0.0.1:18444", headers={"Host": HOST}, timeout=20, trust_env=False) as phone:
                 page = phone.get("/approve/" + request_id)
                 page.raise_for_status()
@@ -196,12 +205,22 @@ def main():
                     assert "Approval requires an enrolled passkey" in page.text
                 options = json.loads(html.unescape(re.search("data-o='([^']+)'", page.text).group(1)))
                 nonce = base64.urlsafe_b64decode(options["challenge"]["approve"] + "==")
+                if credential is not None:
+                    assert 'type=password' in page.text
+                    assert options.get("repository_credential") and not options.get("autostart")
+                    nonce = bytes.fromhex(repository_credential_nonce(nonce.hex(), hashlib.sha256(credential.encode()).hexdigest()))
                 proof = json.dumps(auth.assert_(nonce))
                 cookie = {COOKIE: options["view"]}
-                response = phone.post("/approve/passkey", cookies=cookie, headers={"Origin": "https://" + HOST},
-                                      json={"view": options["view"], "csrf": options["csrf"],
-                                            "decision": "approve", "assertion": proof})
-                assert response.json()["ok"], response.text
+                body = {"view": options["view"], "csrf": options["csrf"], "decision": "approve", "assertion": proof}
+                if credential is not None:
+                    body["credential"] = substitution if substitution is not None else credential
+                response = phone.post("/approve/passkey", cookies=cookie, headers={"Origin": "https://" + HOST}, json=body)
+                if credential:
+                    assert credential not in page.text and credential not in response.text
+                if substitution is not None:
+                    assert not response.json()["ok"], response.text
+                else:
+                    assert response.json()["ok"], response.text
         approve(filed["request_id"], required=True)
         fixture.until(lambda: fixture.broker("status", filed["request_id"])["state"] == "done", 20)
         assert ok("commander_request_dev_lab_enrollment", repository=lab.REPOSITORY)["already_enrolled"]
@@ -290,23 +309,39 @@ def main():
         assert git("rev-parse", "test/fixture") == changed and not git("status", "--porcelain")
         push = {"repository": lab.REPOSITORY, "branch": "work/fixture", "commit": changed, "expected_remote": "0" * 40}
         assert call("commander_request_stynpilot_push", **push)["error"] == "git_push_credential_unavailable"
-        token = "ghp_fixture_only_01234567890123456789"
+        token = "github_pat_fixture_only_01234567890123456789"
         credential = fixture.STATE / "repository-github-token"
-        credential.write_text(token)
-        credential.chmod(0o600)
+        setup_tool = "commander_request_stynpilot_credential_setup"
+        assert call(setup_tool, client="fixture-other", repository=lab.REPOSITORY)["error"] == "lab_enrollment_required"
+        setup_request = ok(setup_tool, repository=lab.REPOSITORY)
+        approve(setup_request["request_id"], required=True, credential=token, substitution=token + "X")
+        assert not credential.exists()
+        approve(setup_request["request_id"], required=True, credential=token)
+        configured = fixture.until(lambda: fixture.broker("status", setup_request["request_id"])["state"] == "done", 20)
+        assert configured and credential.read_text() == token and credential.stat().st_mode & 0o777 == 0o600
+        assert token not in json.dumps(fixture.broker("status", setup_request["request_id"]))
+        print("STYNPILOT_PACKAGED_PHONE_CREDENTIAL_OK", flush=True)
         with tempfile.TemporaryDirectory(prefix="fixture-push-") as scratch:
             origin, remote = fixture_push_origin(Path(scratch), folder, base, token)
             try:
                 assert call("commander_request_stynpilot_push", **dict(push, branch="main"))["error"] == "git_push_binding_invalid"
                 assert call("commander_request_stynpilot_push", client="fixture-other", **push)["error"] == "lab_enrollment_required"
+                origin.drop_receive = True
                 filed_push = ok("commander_request_stynpilot_push", **push)
                 approve(filed_push["request_id"], required=True)
                 def pushed():
                     result = fixture.broker("status", filed_push["request_id"])
                     return result if result["state"] in ("done", "failed") else None
                 result = fixture.until(pushed, 100)
-                assert result["state"] == "done", result
+                assert result["state"] == "failed", result
                 assert fixture.command("git", "-C", str(remote), "rev-parse", "refs/heads/work/fixture") == changed
+                receives = origin.receive_posts
+                filed_push = ok("commander_request_stynpilot_push", **dict(push, expected_remote=changed))
+                approve(filed_push["request_id"], required=True)
+                result = fixture.until(pushed, 100)
+                assert result["state"] == "done", result
+                assert origin.receive_posts == receives
+                print("STYNPILOT_PACKAGED_PUSH_INTERRUPTION_OK", flush=True)
                 ok("workspace_write", workspace_name=workspace, path="second.txt", content="second\n")
                 descendant = git_job("git-work-commit", ["work/fixture", changed, "fixture push update", "second.txt"])
                 for expected, state in (("0" * 40, "failed"), (changed, "done")):

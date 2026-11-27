@@ -154,6 +154,23 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
             return receipt(result)
         return run("commander_request_stynpilot_push", device_id, work, write=True)
 
+    @server.tool(name="commander_request_stynpilot_credential_setup", title="Request secure phone setup for StyNpilot GitHub",
+                 annotations=FILES_A_REQUEST,
+                 description="Ask the owner to enter a fine-grained token for only the StyNpilot GitHub repo on the private phone approval page. The token stays outside MCP. Requires an enrolled owner passkey.")
+    def request_repo_credential(device_id: str, repository: str) -> dict:
+        def work(owner):
+            proposer = ctx.proposer
+            broker.runner("lab_credential_ready", {"client": proposer.client, "repository": repository})
+            expires = now() + timedelta(hours=1)
+            payload = {"kind": "runner", "action": "repo_credential", "name": "stynpilot", "owner": owner,
+                       "device": device_id, "client": proposer.client, "repository": repository,
+                       "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            result, _ = store.submit(kind="runner", software="stynpilot-repository-credential", device=device_id,
+                                     owner=owner, proposer=proposer, payload=payload,
+                                     summary=render_summary(payload), expires=expires.timestamp())
+            return receipt(result)
+        return run("commander_request_stynpilot_credential_setup", device_id, work, write=True)
+
     @server.tool(name="dev_lab_start", title="Start an authorized offline test job", annotations=WORKS,
                  description="Start a fixed test for an exact commit and the installer-verified lab_source_sha256 from its release build record.")
     def dev_lab_start(device_id: str, repository: str, commit: str, artifact_sha256: str, scenario: str = "offline_normal") -> dict:

@@ -118,7 +118,8 @@ class BrokerService:
         payload = msg.get("payload")
         approving = isinstance(payload, dict) and (
             (msg.get("op") == "backup_admin" and payload.get("action") == "restore_root")
-            or (msg.get("op") == "runner_admin" and payload.get("action") in ("settle_inference", "lab_enroll", "repo_push")))
+            or (msg.get("op") == "runner_admin" and payload.get("action") in ("settle_inference", "lab_enroll", "repo_push"))
+            or (msg.get("op") == "repository_credential_install" and payload.get("action") == "repo_credential"))
         exclusive = approving or (msg.get("op") == "runner" and msg.get("call") in
                                   ("inference_claim", "inference_finish", "lab_start", "lab_cancel", "lab_checkout", "lab_fetch"))
         try:
@@ -171,8 +172,10 @@ class BrokerService:
             if op == "passkey_complete":
                 return {"ok": True, "result": self.executor.passkey_complete(message.get("request_id"), message.get("response"))}
             if op == "passkey_precheck":
+                kwargs = {"credential_sha256": message["credential_sha256"]} if "credential_sha256" in message else {}
                 return {"ok": True, "result": self.executor.passkey_precheck(message.get("payload"), message.get("proof"),
-                                                                              message.get("challenge"), message.get("decision"))}
+                                                                              message.get("challenge"), message.get("decision"),
+                                                                              **kwargs)}
             if op == "release_prepare":
                 return {"ok": True, "result": self.executor.release_prepare(message.get("commit"), message.get("version"))}
             if op == "release_status":
@@ -206,6 +209,17 @@ class BrokerService:
             if op == "vault_settings":
                 vault = getattr(self, "vault", None)
                 return {"ok": True, "result": vault.effective_retention() if vault is not None else None}
+            if op == "repository_credential_install":
+                if set(message) != {"op", "payload", "proof", "challenge", "credential"}:
+                    return {"ok": False, "error": "repository_credential_invalid"}
+                if not self._busy.acquire(blocking=False):
+                    return {"ok": False, "error": "busy"}
+                try:
+                    result = self.executor.repository_credential_install(message["payload"], message["proof"],
+                                                                        message["challenge"], message["credential"])
+                finally:
+                    self._busy.release()
+                return {"ok": True, "result": result}
             if op in ("install", "rollback", "upgrade", "release", "deny", "runner_admin", "passkey_admin", "backup_admin"):
                 if not self._busy.acquire(blocking=False):
                     return {"ok": False, "error": "busy"}          # one change at a time
@@ -484,9 +498,16 @@ class BrokerClient:
     def passkey_complete(self, request_id, response):
         return self._ask({"op": "passkey_complete", "request_id": request_id, "response": response}, 30)["result"]
 
-    def passkey_precheck(self, payload, proof, challenge, decision):
-        return self._ask({"op": "passkey_precheck", "payload": payload, "proof": proof, "challenge": challenge,
-                          "decision": decision}, 30)["result"]
+    def passkey_precheck(self, payload, proof, challenge, decision, *, credential_sha256=None):
+        request = {"op": "passkey_precheck", "payload": payload, "proof": proof, "challenge": challenge, "decision": decision}
+        if credential_sha256 is not None:
+            request["credential_sha256"] = credential_sha256
+        return self._ask(request, 30)["result"]
+
+    def repository_credential_install(self, payload, proof, challenge, *, credential):
+        request = {"op": "repository_credential_install", "payload": payload, "proof": proof,
+                   "challenge": challenge, "credential": credential}
+        return self._ask(request, 90)["result"]
 
     def deny(self, payload, proof, challenge):
         return self._ask({"op": "deny", "payload": payload, "proof": proof, "challenge": challenge}, 60)["result"]

@@ -110,6 +110,39 @@ class PushTests(unittest.TestCase):
         self.assertEqual("work/hydrated", self.git(incoming, "branch", "--show-current"))
         self.assertTrue(repo_git.run(repo_git.EXPORT, ["work/hydrated", tip], incoming).startswith(b"# v"))
 
+    def test_lost_push_response_reconciles_existing_exact_commit(self):
+        bundle = repo_git.run(repo_git.EXPORT, ["work/demo", self.base], self.local)
+        native = subprocess.run
+
+        def lose_response(argv, *args, **kwargs):
+            result = native(argv, *args, **kwargs)
+            if "push" in argv:
+                self.assertEqual(result.returncode, 0)
+                raise subprocess.TimeoutExpired(argv, 30)
+            return result
+
+        with patch.object(repo_push.subprocess, "run", side_effect=lose_response):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                repo_push.push_bundle(bundle, "work/demo", self.base, repo_push.ZERO, "",
+                                      remote=str(self.remote))
+        self.assertEqual(self.base, self.git(self.remote, "rev-parse", "refs/heads/work/demo"))
+        with patch.object(repo_push.subprocess, "run", wraps=native) as calls:
+            repo_push.push_bundle(bundle, "work/demo", self.base, repo_push.ZERO, "",
+                                  remote=str(self.remote))
+            self.assertTrue(all("push" not in call.args[0] for call in calls.call_args_list))
+
+    def test_transport_timeout_requests_stop_and_reports_unknown_outcome(self):
+        credential = self.root / "repository-github-token"
+        credential.write_bytes(b"ghp_fixture123456789012345")
+        credential.chmod(0o600)
+        with patch("stynpilot.broker.repo_push.subprocess.run") as run:
+            run.side_effect = [subprocess.TimeoutExpired("systemd-run", 140), None]
+            with self.assertRaisesRegex(repo_git.WorkspaceError, "git_push_outcome_unverified"):
+                Transport(self.root, run).publish(b"fixture bundle", "work/demo", self.base, repo_push.ZERO)
+            cmd = run.call_args_list[0].args[0]
+            unit = next(arg.removeprefix("--unit=") for arg in cmd if arg.startswith("--unit="))
+            self.assertEqual(run.call_args_list[1].args[0], ["/usr/bin/systemctl", "stop", unit + ".service"])
+
     def test_protected_credential_goes_to_separate_unit_only(self):
         credential = self.root / "repository-github-token"
         token = b"ghp_fixture123456789012345"
@@ -123,5 +156,6 @@ class PushTests(unittest.TestCase):
             params = run.call_args.kwargs
             self.assertIn("--property=LoadCredential=github:" + str(credential), argv)
             self.assertIn("--property=DynamicUser=yes", argv)
+            self.assertIn("--property=LimitCORE=0", argv)
             self.assertEqual(b"fixture bundle", params["input"])
             self.assertNotIn(token.decode(), repr(run.call_args))

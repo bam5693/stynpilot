@@ -14,6 +14,15 @@ _ENTRY = ("import sys;sys.pycache_prefix='/usr/lib/stynpilot/.source-only';"
 _ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
 
 
+def credential_digest(token):
+    # Only the dedicated phone flow may add credentials, and it accepts
+    # fine-grained GitHub PATs rather than broad classic tokens.
+    if type(token) is not str or not re.fullmatch(r"github_pat_[A-Za-z0-9_]{20,244}", token):
+        raise repo_git.WorkspaceError("repository_credential_invalid")
+    import hashlib
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
 class Transport:
     def __init__(self, state, run=subprocess.run):
         self.credential = Path(state) / "repository-github-token"
@@ -36,7 +45,7 @@ class Transport:
             "NoNewPrivileges=yes", "ProtectControlGroups=yes", "ProtectKernelTunables=yes",
             "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", "UMask=0077", "KillMode=control-group",
             "TimeoutStartSec=10s", "TimeoutStopSec=5s", "RuntimeMaxSec=130s", "MemoryMax=1G", "MemorySwapMax=0", "TasksMax=32",
-            "CPUQuota=200%", "LimitFSIZE=64M", "TemporaryFileSystem=/tmp:rw,nosuid,nodev,size=128M",
+            "CPUQuota=200%", "LimitCORE=0", "LimitFSIZE=64M", "TemporaryFileSystem=/tmp:rw,nosuid,nodev,size=128M",
             "InaccessiblePaths=-/var/lib/stynpilot-installer -/run/stynpilot",
             "LoadCredential=github:" + str(self.credential),
         )
@@ -47,6 +56,11 @@ class Transport:
             result = self.run(command, input=bundle, env=_ENV, timeout=140,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         except (OSError, subprocess.SubprocessError):
+            try:
+                self.run(["/usr/bin/systemctl", "stop", unit + ".service"], env=_ENV, timeout=8,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            except (OSError, subprocess.SubprocessError):
+                pass
             raise repo_git.WorkspaceError("git_push_outcome_unverified") from None
         if result.returncode:
             raise repo_git.WorkspaceError("git_push_refused_or_unverified")

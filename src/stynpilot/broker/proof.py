@@ -64,6 +64,13 @@ def proof_fingerprint(id_token):
     return hashlib.sha256(id_token.encode("ascii", "replace")).hexdigest()
 
 
+def repository_credential_nonce(nonce, digest):
+    if type(digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ProofDenied("repository_credential_invalid")
+    return hashlib.sha256(b"stynpilot-repository-credential-v1\0" + bytes.fromhex(nonce)
+                          + bytes.fromhex(digest)).hexdigest()
+
+
 def render_summary(payload):
     """Plain-English text of an install or rollback payload, produced by the root installer itself."""
     if payload.get("kind") == "release":
@@ -147,6 +154,11 @@ def render_summary(payload):
             return ["Stop the fixed local Ollama pilot service and settle inference reservation %s." % name,
                     "This can interrupt local AI and OpenCode. The service will remain stopped. No models, project files or backups are deleted.",
                     "Only this exact reservation can be cleared, and only after StyNpilot verifies the service is inactive, its cgroup is empty and the inference port is no longer listening.", expires]
+        if payload.get("action") == "repo_credential":
+            return ["Configure or replace the GitHub development credential for " + payload["repository"] + ".",
+                    "Enter a fine-grained GitHub personal access token for only this repository with Contents read and write.",
+                    "The phone binds the entered token to your passkey approval. Only the installer stores it.",
+                    "This approval does not push code or change the release signing credential.", expires]
         if payload.get("action") == "repo_push":
             base = payload["expected_remote"]
             return ["Publish " + payload["repository"] + " branch " + payload["branch"] + ".",

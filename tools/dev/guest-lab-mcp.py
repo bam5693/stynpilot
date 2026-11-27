@@ -140,6 +140,20 @@ def fixture_push_origin(root, workspace, base, token):
 
 def main():
     signing_key = fixture.setup(check_restore_path=False, lab=True)
+    properties = ("show", "-p", "MainPID", "-p", "LimitCORE", "-p", "LimitCORESoft")
+    services = (
+        fixture.command("systemctl", *properties, "stynpilot-installer.service"),
+        fixture.as_owner("systemctl", "--user", *properties, "stynpilot-owner.service").stdout,
+    )
+    for service in services:
+        fields = dict(line.split("=", 1) for line in service.splitlines() if "=" in line)
+        assert fields["LimitCORE"] == fields["LimitCORESoft"] == "0", fields
+        pid = int(fields["MainPID"])
+        assert pid > 1, fields
+        limits = Path("/proc", str(pid), "limits").read_text().splitlines()
+        core = next(line.split() for line in limits if line.startswith("Max core file size"))
+        assert core[4:6] == ["0", "0"], core
+    print("STYNPILOT_PACKAGED_CREDENTIAL_SERVICE_LIMITS_OK", flush=True)
     fast, slow = artifact("pass"), artifact("slow")
     with httpx.Client(base_url="http://127.0.0.1:18443", headers={"Host": HOST}, timeout=45, trust_env=False) as http:
         def call(tool, *, client="fixture", **kw):

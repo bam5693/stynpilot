@@ -5,6 +5,7 @@
 Description=StyNpilot owner service (approval page and request store)
 
 [Service]
+LimitCORE=0
 Type=simple
 ExecStart=/usr/bin/stynpilot service owner --config %h/.config/stynpilot/owner.json
 Restart=on-failure

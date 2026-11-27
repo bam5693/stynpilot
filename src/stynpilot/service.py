@@ -708,6 +708,22 @@ def release_console_main(config_path, action, *, out=print):
     return release_console.status(authority, release.ADDENDUM_FILE, out=out)
 
 
+def _protect_credential_process():
+    """Keep credential-bearing services out of kernel core files and pipe handlers."""
+    import ctypes
+    import resource
+
+    # A hard zero survives a unit override or a manual service launch. Linux
+    # pipe handlers can ignore RLIMIT_CORE, so also disable kernel dumping for
+    # this process before it reads credentials or opens any listening socket.
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    prctl.argtypes = (ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong)
+    prctl.restype = ctypes.c_int
+    if prctl(4, 0, 0, 0, 0) != 0 or prctl(3, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE, PR_GET_DUMPABLE
+        raise ConfigError("credential_process_protection_failed")
+
+
 def main(argv=None):                                       # pragma: no cover - thin process wrapper
     import argparse
     import signal
@@ -718,6 +734,8 @@ def main(argv=None):                                       # pragma: no cover - 
     parser.add_argument("--action", choices=("list", "activate", "confirm-restored", "init", "set-token", "status"), default="list")
     parser.add_argument("--kid", default="")
     args = parser.parse_args(argv)
+    if args.role in ("owner", "installer"):
+        _protect_credential_process()
     if args.role == "restore-worker":
         from . import restore_service
         return restore_service.run(args.config, InstallerConfig.from_file(args.config))

@@ -59,7 +59,7 @@ from .. import backup, release, vault
 from . import apt
 from .. import runner as runner_policy
 from .jobs import JobError
-from . import lab, repository_auth
+from . import archive_jobs, lab, repository_auth
 from .selftest import clean_diagnostics
 from .passkeys import PasskeyError
 from .release_authority import AuthorityError, _write_private
@@ -232,6 +232,7 @@ class Executor:
         self.authority = authority                # release_authority.Authority or None (release publishing not configured)
         self.lab = lab_jobs
         self.repositories = None
+        self.archive_jobs = None
         self._sleep = sleep
         self._builds = {}
         self._build_lock = threading.Lock()
@@ -863,7 +864,7 @@ class Executor:
         try:
             with fence:
                 self._check_payload(payload)
-                self._no_other_change()
+                self._no_other_change(repository_action=payload["action"] in repository_auth.ACTIONS)
                 rid = self._decide(payload, proof_token, challenge, "approve", "runner")
                 try:
                     result = self._runner_do(payload)
@@ -978,7 +979,9 @@ class Executor:
             raise ExecutionDenied("runner_call_invalid")
         if call in lab.CALLS:
             return self._lab_call(call, args)
-        if call in {"repository_target", "repository_grants", "repository_connect", "repository_probe"}:
+        if call in archive_jobs.CALLS:
+            return self._archive_call(call, args)
+        if call in {"repository_target", "repository_grants", "repository_connect", "repository_probe", "repository_archive_read"}:
             return self._repository_call(call, args)
         if self.jobs is None:
             raise ExecutionDenied("runner_not_available")
@@ -990,12 +993,34 @@ class Executor:
         except (JobError, runner_policy.RunnerError) as stopped:
             raise ExecutionDenied(stopped.code) from None
 
+    def _archive_call(self, call, args):
+        from ..repo_archive import ArchiveError
+        if self.archive_jobs is None or self.passkeys is None:
+            raise ExecutionDenied("private_archive_intake_unavailable")
+        methods = {
+            "archive_capture_start": (self.archive_jobs.start, ("client", "repository", "refs", "head")),
+            "archive_capture_status": (self.archive_jobs.status, ("client", "job")),
+            "archive_capture_cancel": (self.archive_jobs.cancel, ("client", "job")),
+        }
+        method, keys = methods[call]
+        if set(args) != set(keys):
+            raise ExecutionDenied("archive_intake_request_invalid")
+        try:
+            if call == "archive_capture_start":
+                self._no_other_change()
+                if any(thread.is_alive() for thread in self._builds.values()):
+                    raise ExecutionDenied("another_build_is_running")
+            return method(*(args[key] for key in keys))
+        except (ArchiveError, repository_auth.AuthorizationError, managed_activity.ActivityError, OSError, vault.VaultError) as error:
+            raise ExecutionDenied(getattr(error, "code", "archive_intake_unavailable")) from None
+
     def _repository_call(self, call, args):
         if self.repositories is None or self.passkeys is None:
             raise ExecutionDenied("repository_authorization_unavailable")
         methods = {"repository_target": (self.repositories.describe, ("repository",)),
                    "repository_grants": (self.repositories.status, ("client",)),
                    "repository_probe": (self.repositories.probe, ("client", "repository")),
+                   "repository_archive_read": (self.repositories.archive_read, ("client", "repository", "profile", "source")),
                    "repository_connect": (self.repositories.connect, ("request_id", "poll"))}
         method, keys = methods[call]
         if set(args) != set(keys):
@@ -1678,8 +1703,8 @@ class Executor:
             if vault_.rotation_outcome(rid) == "completed" and vault_.journal_request() is None:
                 self._rotation_finished(rid, {"ok": True, "rotation": "completed"})
 
-    def _no_other_change(self):
-        self._no_lab_activity()
+    def _no_other_change(self, *, repository_action=False):
+        self._no_lab_activity(repository_action=repository_action)
         if self.needs_attention():
             raise ExecutionDenied("owner_intervention_required")
         self._rotation_guard()
@@ -1687,14 +1712,16 @@ class Executor:
         if self.runs.running():
             raise ExecutionDenied("another_change_is_still_running")
 
-    def _no_lab_activity(self):
-        if self.lab is not None:
+    def _no_lab_activity(self, *, repository_action=False):
+        if self.lab is not None or self.archive_jobs is not None:
             try:
                 claim = managed_activity.current(self.dir)
             except managed_activity.ActivityError as error:
                 raise ExecutionDenied(error.code) from None
             if claim and claim["kind"] == "dev_lab":
                 raise ExecutionDenied("development_lab_is_running")
+            if claim and claim["kind"] == archive_jobs.KIND and not repository_action:
+                raise ExecutionDenied("private_archive_intake_running")
 
     def _install_locked(self, payload, proof_token, challenge, *, now=None):
         self._no_other_change()

@@ -1,6 +1,9 @@
 """Real Git archives preserve all pinned refs without checking out source."""
+import base64
+import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -116,8 +119,9 @@ class RepositoryArchiveTests(unittest.TestCase):
 
         def offline_https(repository, config, deadline, action, *args):
             calls.append(action)
-            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
-            self.assertIn(f'[http "{self.origin}"]', config.read_text())
+            self.assertEqual(os.fstat(config).st_mode & 0o777, 0o600)
+            self.assertFalse((repository.parent / "auth.conf").exists())
+            self.assertIn(f'[http "{self.origin}"]'.encode(), os.pread(config, 4096, 0))
             self.assertNotIn(fixture, repr(args))
             remote = args.index("--") + 1
             self.assertEqual(args[remote], self.origin)
@@ -139,6 +143,28 @@ class RepositoryArchiveTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("stynpilot-intake-*")))
         self.assertNotIn(fixture, (target / "manifest.json").read_text())
         self.assertEqual(set(self.refs), set(self.git(self.bare, "for-each-ref", "--format=%(refname)").splitlines()))
+
+    def test_credential_is_an_inherited_sealed_fd_closed_on_interruption(self):
+        origin = "https://gitlab.com/group/example.git"
+        fixture = "synthetic_read_only_credential"
+        with self.assertRaises(KeyboardInterrupt):
+            with repo_intake._credential_config("gitlab", origin, ("oauth2", fixture)) as fd:
+                seals = fcntl.fcntl(fd, fcntl.F_GET_SEALS)
+                self.assertTrue(seals & fcntl.F_SEAL_WRITE)
+                self.assertFalse(os.get_inheritable(fd))
+                with self.assertRaises(PermissionError):
+                    os.write(fd, b"changed")
+                command = ["/usr/bin/git", "-c", f"include.path=/proc/self/fd/{fd}",
+                           "config", "--get-urlmatch", "http.extraHeader", origin + "/info/refs"]
+                output = subprocess.check_output(command, pass_fds=(fd,), cwd=self.root, env=repo_git._ENV)
+                self.assertEqual(output.strip(), b"Authorization: Basic " + base64.b64encode(("oauth2:" + fixture).encode()))
+                refused = subprocess.run([*command[:-1], "https://gitlab.com/group/other.git"], pass_fds=(fd,),
+                                         cwd=self.root, env=repo_git._ENV, capture_output=True, check=False)
+                self.assertEqual(refused.returncode, 1)
+                self.assertEqual(refused.stdout, b"")
+                raise KeyboardInterrupt
+        with self.assertRaises(OSError):
+            os.fstat(fd)
 
     def test_readonly_intake_rejects_wrong_source_and_ref_drift(self):
         scope = ("github", self.origin)

@@ -474,7 +474,14 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
                     diagnostics=Diagnostics(), system=SystemStatus(backup_dir=config.state_dir / "backups", vault=service.vault),
                     vault=service.vault, broker=broker)
         from . import archive_store, repo_archive
-        archives = archive_store.Store(state / "repository-archives")
+        def private_archive_read(client, access, source):
+            try:
+                return broker.runner("repository_archive_read", {"client": client, "repository": access["repository"],
+                                     "profile": access["authorization_profile"], "source": source}).get("allowed") is True
+            except Exception:
+                return False
+
+        archives = archive_store.Store(state / "repository-archives", private_read=private_archive_read)
         try:
             archives.reconcile()
         except (OSError, repo_archive.ArchiveError) as error:
@@ -672,6 +679,10 @@ def build_installer(config, *, jwks, jwks_loader=None, run_command=apt.real_run,
                 executor.repositories = repository_auth.Store(config.state_dir, targets)
             except (OSError, ValueError, repo_archive.ArchiveError, repository_auth.AuthorizationError, vault.VaultError) as error:
                 logging.getLogger("stynpilot.repository").warning("repository authorization unavailable: %s", type(error).__name__)
+        if executor.jobs is not None:
+            from .broker.archive_jobs import Jobs as ArchiveJobs
+            executor.archive_jobs = ArchiveJobs(config.state_dir, executor.repositories,
+                                                executor.jobs.helper, executor.jobs.home)
         from . import inference_fence, managed_activity
         if executor.authority is not None and executor.lab is None:
             from .broker.lab import LabJobs

@@ -92,7 +92,7 @@ if [[ -e /mnt/stynpilot-fixture/deckplay-checkout-case ]]; then
     fixture=(/usr/bin/python3 -IB /mnt/stynpilot-fixture/guest-deckplay-checkout.py)
 fi
 if ! "${fixture[@]}"; then
-    journalctl -b -u stynpilot-installer.service -u stynpilot-restore.service -u stynpilot-restore.path -u 'run-*.service' -u 'stynpilot-lab-*.service' --no-pager -n 160
+    journalctl -b -u stynpilot-installer.service -u stynpilot-restore.service -u stynpilot-restore.path -u 'run-*.service' -u 'stynpilot-lab-*.service' -u 'stynpilot-archive-*.service' --no-pager -n 160
     journalctl -b _SYSTEMD_USER_UNIT=stynpilot-owner.service --no-pager -n 40
     if [[ -r /var/lib/stynpilot-installer/runner-selftest.json ]]; then
         cat /var/lib/stynpilot-installer/runner-selftest.json

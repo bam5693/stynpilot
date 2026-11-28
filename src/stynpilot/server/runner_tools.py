@@ -760,6 +760,16 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
         return run("runner_selftest", device_id, lambda owner: broker.runner("selftest"), write=True)
 
 
+    def capture_private_archive(device_id, repository, refs, head):
+        return lab_call("repository.archive-capture", device_id, "archive_capture_start",
+                        repository=repository, refs=refs, head=head)
+
+    def archive_capture_status(device_id, job_id):
+        return lab_call("repository.archive-status", device_id, "archive_capture_status", job=job_id)
+
+    def archive_capture_cancel(device_id, job_id):
+        return lab_call("repository.archive-cancel", device_id, "archive_capture_cancel", job=job_id)
+
     # Treat these as public API contracts. New operations extend discovery
     # without changing either tool signature or exposing the registered MCP tool table.
     operations = (
@@ -769,6 +779,12 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
                                capabilities.LabEvidenceInput, dev_lab_job_output),
         capabilities.Operation("dev-lab.request-enrollment", 1, "YELLOW", "workspace.propose",
                                capabilities.LabEnrollmentInput, request_dev_lab_enrollment),
+        capabilities.Operation("repository.archive-capture", 1, "GREEN", "workspace.propose",
+                               capabilities.ArchiveCaptureInput, capture_private_archive),
+        capabilities.Operation("repository.archive-status", 1, "GREEN", "workspace.propose",
+                               capabilities.ArchiveJobInput, archive_capture_status),
+        capabilities.Operation("repository.archive-cancel", 1, "GREEN", "workspace.propose",
+                               capabilities.ArchiveJobInput, archive_capture_cancel),
     )
 
     capabilities.register(server, operations=operations, run=run, bearer=bearer, router=router)

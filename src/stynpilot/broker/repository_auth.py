@@ -7,6 +7,7 @@ an OAuth endpoint or repository URL supplied by an assistant.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 import base64
 import fcntl
 import hashlib
@@ -14,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import time
 from urllib import error, parse, request
@@ -35,6 +37,18 @@ class AuthorizationError(Exception):
     def __init__(self, code):
         super().__init__(code)
         self.code = code
+
+
+@dataclass(frozen=True)
+class FetchLease:
+    """Broker-only authorization for a bounded asynchronous native fetch."""
+    request_id: str
+    client: str
+    repository: str
+    source: tuple[str, str]
+    expires: int
+    epoch: int
+    credential: tuple[str, str] = field(repr=False)
 
 
 class _NoRedirect(request.HTTPRedirectHandler):
@@ -190,12 +204,16 @@ class Store:
             except FileNotFoundError:
                 if os.fstat(lock).st_size:
                     raise AuthorizationError("repository_state_untrusted") from None
-                state = {"suspended": False, "grants": {}}
+                state = {"suspended": False, "grants": {}, "epoch": 0}
                 self._save(state)
                 os.write(lock, b"provisioned\n")
                 os.fsync(lock)
-            if (type(state) is not dict or set(state) != {"suspended", "grants"} or type(state["suspended"]) is not bool
+            if (type(state) is not dict or set(state) not in ({"suspended", "grants"}, {"suspended", "grants", "epoch"})
+                    or type(state["suspended"]) is not bool
                     or type(state["grants"]) is not dict or len(state["grants"]) > MAX_GRANTS):
+                raise AuthorizationError("repository_state_untrusted")
+            epoch = state.setdefault("epoch", 0)
+            if type(epoch) is not int or not 0 <= epoch < 2**63 - 1:
                 raise AuthorizationError("repository_state_untrusted")
             # Every consumer sheds expired credentials before reading the store.
             self._purge_expired(state, int(self.clock()))
@@ -264,6 +282,7 @@ class Store:
             now = int(self.clock())
             if action == "repository_suspend":
                 state["suspended"] = True
+                state["epoch"] += 1
                 # A suspended OAuth handoff can never become active afterwards.
                 for key in [key for key, row in grants.items() if row["state"] != "active"]:
                     del grants[key]
@@ -348,27 +367,65 @@ class Store:
             row.pop(key, None)
         row["state"] = status
 
-    def use(self, client, repository, operation, consumer):
-        """Invoke a broker-owned typed consumer; no RPC ever returns a credential."""
+    def _grant(self, state, client, repository, operation, *, request_id=None):
+        self._enabled(state)
         if operation not in OPERATIONS:
             raise AuthorizationError("repository_operation_not_supported")
-        target = self.target(repository)
-        with self._state() as state:
-            self._enabled(state)
-            now = int(self.clock())
-            row = next((row for row in state["grants"].values() if row["client"] == client
-                        and row["repository"] == repository and row["state"] == "active"
-                        and row["source"] == target and row["expires"] > now and operation in row["operations"]), None)
-            if row is None:
-                raise AuthorizationError("repository_grant_unavailable")
-            if row["token_until"] <= now + 60:
-                refresh = row.pop("credential")["refresh"]
-                row["state"] = "renewal_uncertain"
-                self._save(state)
-                credential = self.provider.renew(target, refresh)
-                row.update(state="active", credential=credential, token_until=int(self.clock()) + credential["expires_in"])
-                self._save(state)
-            return consumer((target["provider"], target["origin"]), ("oauth2", row["credential"]["access"]))
+        target, now = self.target(repository), int(self.clock())
+        for rid, row in state["grants"].items():
+            if ((request_id is None or rid == request_id) and row["client"] == client
+                    and row["repository"] == repository and row["state"] == "active"
+                    and row["source"] == target and row["expires"] > now and operation in row["operations"]):
+                return rid, row, target
+        raise AuthorizationError("repository_grant_unavailable")
 
+    def _credential(self, state, row, target, *, seconds=60):
+        if row["token_until"] <= int(self.clock()) + seconds:
+            refresh = row.pop("credential")["refresh"]
+            row["state"] = "renewal_uncertain"
+            self._save(state)
+            credential = self.provider.renew(target, refresh)
+            row.update(state="active", credential=credential, token_until=int(self.clock()) + credential["expires_in"])
+            self._save(state)
+        return ("oauth2", row["credential"]["access"])
+
+    def use(self, client, repository, operation, consumer):
+        """Invoke a broker-owned typed consumer; no RPC ever returns a credential."""
+        with self._state() as state:
+            _, row, target = self._grant(state, client, repository, operation)
+            return consumer((target["provider"], target["origin"]), self._credential(state, row, target))
+
+    def archive_read(self, client, repository, profile, source):
+        try:
+            with self._state() as state:
+                _, _, target = self._grant(state, client, repository, "read")
+                return {"allowed": (profile == self.describe(repository)["authorization_profile"]
+                                    and source == {"provider": target["provider"], "url": target["origin"]})}
+        except AuthorizationError:
+            return {"allowed": False}
+
+    def begin_fetch(self, client, repository, *, seconds):
+        """Release the grant store lock before starting network IO."""
+        if type(seconds) is not int or not 1 <= seconds <= 600:
+            raise AuthorizationError("repository_fetch_deadline_invalid")
+        with self._state() as state:
+            rid, row, target = self._grant(state, client, repository, "fetch")
+            minimum = int(self.clock()) + seconds
+            if minimum >= row["expires"]:
+                raise AuthorizationError("repository_fetch_grant_expires_too_soon")
+            credential = self._credential(state, row, target, seconds=max(60, seconds))
+            if row["token_until"] <= minimum:
+                raise AuthorizationError("repository_fetch_grant_expires_too_soon")
+            return FetchLease(rid, client, repository, (target["provider"], target["origin"]),
+                              minimum, state["epoch"], credential)
+
+    def check_fetch(self, lease):
+        """Refuse publication if the original exact grant, credential or deadline changed."""
+        with self._state() as state:
+            _, row, target = self._grant(state, lease.client, lease.repository, "fetch", request_id=lease.request_id)
+            if ((target["provider"], target["origin"]) != lease.source or lease.expires <= int(self.clock())
+                    or state["epoch"] != lease.epoch
+                    or not secrets.compare_digest(row["credential"]["access"], lease.credential[1])):
+                raise AuthorizationError("repository_fetch_grant_changed")
     def probe(self, client, repository):
         return self.use(client, repository, "read", self.provider.probe)

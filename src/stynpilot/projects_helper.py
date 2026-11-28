@@ -28,6 +28,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from stynpilot import archive_store, deckplay_snapshot, repo_archive, repo_git, safefs, vault  # noqa: E402
@@ -626,10 +627,43 @@ def _deckplay_checkout(request, path):
     return {"workspace": repo_git.DECKPLAY_WORKSPACE, "receipt": receipt}
 
 
+def op_archive_receive(request):
+    fields = {"op", "job", "client", "manifest_sha256", "bundle_sha256", "repository_access"}
+    if set(request) != fields or type(request["job"]) is not str or not re.fullmatch(r"[a-f0-9]{32}", request["job"]):
+        raise Refuse("archive_transfer_invalid")
+    runtime = Path("/run") / ("stynpilot-archive-receive-" + request["job"])
+
+    def require_dispatch():
+        # Bind the directory so an unlink or atomic replacement by the broker
+        # is visible. A read-only mount of just the file would pin its old inode.
+        try:
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+            with os.fdopen(os.open(runtime / "dispatch" / "permit.json", flags), "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+                        or info.st_mode & 0o022 or not 0 < info.st_size <= 1024):
+                    raise ValueError
+                data = json.loads(stream.read(1025))
+        except (OSError, ValueError):
+            raise Refuse("archive_transfer_authority_missing") from None
+        if type(data) is not dict or type(data.get("expires")) is not int or time.time() >= data["expires"]:
+            raise Refuse("archive_transfer_authority_expired")
+        if {key: value for key, value in data.items() if key != "expires"} != request:
+            raise Refuse("archive_transfer_authority_changed")
+
+    require_dispatch()
+    try:
+        return archive_store.Store(runtime / "archives").adopt_stream(
+            sys.stdin.buffer, manifest_sha256=request["manifest_sha256"], bundle_sha256=request["bundle_sha256"],
+            client=request["client"], before_publish=require_dispatch, repository_access=request["repository_access"])
+    except repo_archive.ArchiveError as error:
+        raise Refuse(error.code) from None
+
+
 OPS = {"prepare": op_prepare, "check": op_check, "home_names": op_home_names, "disk": op_disk, "enroll": op_enroll,
        "grant": op_grant, "unenroll": op_unenroll, "protected": op_protected, "import_checkout": op_import_checkout,
        "deckplay_snapshot_preview": op_deckplay_snapshot_preview, "deckplay_snapshot_checkout": op_deckplay_snapshot_checkout,
-       "deckplay_checkout_cleanup": op_deckplay_checkout_cleanup}
+       "deckplay_checkout_cleanup": op_deckplay_checkout_cleanup, "archive_receive": op_archive_receive}
 
 
 def main(argv):

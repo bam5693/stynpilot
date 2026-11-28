@@ -15,7 +15,7 @@ from pathlib import Path
 
 NAME = "managed-activity"
 ID = re.compile(r"[a-f0-9]{32}\Z")
-KINDS = ("inference", "dev_lab", "deckplay_checkout")
+KINDS = ("inference", "dev_lab", "deckplay_checkout", "private_archive")
 
 
 class ActivityError(Exception):

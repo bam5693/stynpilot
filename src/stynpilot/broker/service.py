@@ -124,7 +124,8 @@ class BrokerService:
                 ("settle_inference", "lab_enroll", "repo_push", "deckplay_checkout", "workspace_access", *REPOSITORY_ACTIONS))
             or (msg.get("op") == "repository_credential_install" and payload.get("action") == "repo_credential"))
         exclusive = approving or (msg.get("op") == "runner" and msg.get("call") in
-                                  ("inference_claim", "inference_finish", "lab_start", "lab_cancel", "lab_checkout", "lab_fetch"))
+                                  ("inference_claim", "inference_finish", "lab_start", "lab_cancel", "lab_checkout", "lab_fetch",
+                                   "archive_capture_start", "archive_capture_cancel"))
         try:
             with root_restore.admission(state, exclusive=exclusive):
                 if (root_restore.control(state) / "safe.json").exists():
@@ -201,7 +202,7 @@ class BrokerService:
                         "vault_drill": lambda: vault.drill(manual=True)}[op]
                 return {"ok": True, "result": call()}
             if op == "runner":
-                if self._lab_boot_pending and message.get("call") in ("lab_start", "lab_prepare"):
+                if self._lab_boot_pending and message.get("call") in ("lab_start", "lab_prepare", "archive_capture_start"):
                     return {"ok": False, "error": "lab_restart_reconciling"}
                 return {"ok": True, "result": self.executor.runner_call(message.get("call"), message.get("args"))}
             if op == "restore_preview":
@@ -383,6 +384,9 @@ class BrokerService:
                             self.executor.jobs.reconcile_deckplay_checkout()
                         if lab is not None:
                             lab.reconcile(startup=startup)
+                        archive_jobs = getattr(self.executor, "archive_jobs", None)
+                        if archive_jobs is not None:
+                            archive_jobs.reconcile()
                         startup = False
                         self._lab_boot_pending = False
                         previous_error = None

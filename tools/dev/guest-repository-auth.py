@@ -4,6 +4,7 @@ import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import subprocess
 import re
 import ssl
 import sys
@@ -17,6 +18,7 @@ fixture = __import__("guest-restore")
 import httpx
 import jwt
 from softauth import SoftAuthenticator
+from stynpilot import managed_activity, repo_archive
 from stynpilot.approval_web import COOKIE
 from stynpilot.broker.passkeys import PasskeyStore
 from stynpilot.upgrade_worker import endpoint_answers
@@ -25,7 +27,29 @@ from test_repository_auth import DEVICE, FakeGitLab, REFRESH, SECRET, TARGET
 HOST = "owner.example.test"
 
 
-def mock_provider():
+def prepare_git_origin():
+    root = Path("/tmp/stynpilot-gitlab-fixture")
+    source = root / "source"
+    source.mkdir(parents=True)
+    bare = root / "team" / "fixture.git"
+    bare.parent.mkdir()
+    git = ("/usr/bin/git", "-c", "user.name=Synthetic source", "-c", "user.email=fixture@invalid.test")
+    fixture.command(*git, "-C", str(source), "init", "-q", "-b", "main")
+    (source / "README").write_text("first revision\n")
+    fixture.command(*git, "-C", str(source), "add", "README")
+    fixture.command(*git, "-C", str(source), "commit", "-qm", "first")
+    fixture.command(*git, "-C", str(source), "branch", "review/historical")
+    fixture.command(*git, "-C", str(source), "tag", "-a", "v1", "-m", "annotated fixture")
+    (source / "README").write_text("second revision\n")
+    fixture.command(*git, "-C", str(source), "commit", "-qam", "second")
+    fixture.command(*git, "clone", "-q", "--bare", str(source), str(bare))
+    rows = fixture.command(*git, "-C", str(bare), "for-each-ref", "--format=%(objectname) %(refname)",
+                           "refs/heads", "refs/tags")
+    expected = {name: oid for oid, name in (line.split() for line in rows.splitlines())}
+    return root, expected
+
+
+def mock_provider(git_root):
     cert, key = Path("/tmp/repository-provider.crt"), Path("/tmp/repository-provider.key")
     fixture.command("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
                     "-subj", "/CN=gitlab.com", "-addext", "subjectAltName=DNS:gitlab.com",
@@ -35,6 +59,9 @@ def mock_provider():
     with Path("/etc/hosts").open("a") as hosts:
         hosts.write("\n127.0.0.2 gitlab.com\n")
     app = FakeGitLab()
+    app.hold_fetch = False
+    app.fetch_started = threading.Event()
+    app.fetch_release = threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -47,17 +74,29 @@ def mock_provider():
             self.end_headers()
             self.wfile.write(data)
 
+        def git_read(self, path, query, body=b""):
+            expected = "Basic " + base64.b64encode(("oauth2:" + SECRET + str(app.refresh_count)).encode()).decode()
+            if self.headers.get("Authorization") != expected:
+                self.reply(401, b"{}")
+                return
+            env = dict(repo_archive._ENV, GIT_PROJECT_ROOT=str(git_root), GIT_HTTP_EXPORT_ALL="1",
+                       PATH_INFO=path, REQUEST_METHOD=self.command, QUERY_STRING=query,
+                       CONTENT_TYPE=self.headers.get("Content-Type", ""), CONTENT_LENGTH=str(len(body)),
+                       REMOTE_USER="fixture-readonly")
+            response = subprocess.run(["/usr/bin/git", "http-backend"], input=body, env=env,
+                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, check=True)
+            raw_headers, _, result = response.stdout.partition(b"\r\n\r\n")
+            headers = dict(line.decode("ascii").split(": ", 1) for line in raw_headers.splitlines())
+            status = int(headers.get("Status", "200").split()[0])
+            self.reply(status, result, headers["Content-Type"])
+
         def do_GET(self):
             target = urlsplit(self.path)
             if target.path == "/oauth/device" and target.query == "user_code=EXAMPLE-123":
                 app.ready = True
                 self.reply(200, b"Synthetic provider approval", "text/plain")
             elif self.path == "/team/fixture.git/info/refs?service=git-upload-pack":
-                expected = "Basic " + base64.b64encode(("oauth2:" + SECRET + str(app.refresh_count)).encode()).decode()
-                if self.headers.get("Authorization") != expected:
-                    self.reply(401, b"{}")
-                    return
-                self.reply(200, b"001e# service=git-upload-pack\n0000", "application/x-git-upload-pack-advertisement")
+                self.git_read(target.path, target.query)
             elif self.path == "/oauth/token/info":
                 status, data = app(self.path, bearer=self.headers.get("Authorization", "").removeprefix("Bearer "))
                 self.reply(status, json.dumps(data).encode())
@@ -65,7 +104,18 @@ def mock_provider():
                 self.reply(404, b"{}")
 
         def do_POST(self):
-            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 <= length <= (2 << 20):
+                self.reply(413, b"{}")
+                return
+            raw = self.rfile.read(length)
+            if self.path == "/team/fixture.git/git-upload-pack":
+                if app.hold_fetch:
+                    app.fetch_started.set()
+                    app.fetch_release.wait(30)
+                    return
+                self.git_read(self.path, "", raw)
+                return
             data = {key: value[0] for key, value in parse_qs(raw.decode()).items()}
             status, answer = app(self.path, data=data)
             if self.path == "/oauth/token" and status == 200:
@@ -81,7 +131,8 @@ def mock_provider():
 
 
 def main():
-    app, cert = mock_provider()
+    git_root, expected_refs = prepare_git_origin()
+    app, cert = mock_provider(git_root)
     fixture.ETC.mkdir(mode=0o700, exist_ok=True)
     fixture.write(fixture.ETC / "repository-authorization.json", {"fixture-private": TARGET})
     signing_key = fixture.setup(check_restore_path=False, lab=True)
@@ -131,7 +182,7 @@ def main():
         repository = {"repository": "fixture-private"}
         assert call("repository_private_readiness", **repository)["error"] == "repository_grant_unavailable"
         assert not call("commander_request_repository_access", action="authorize", operations=["push"], days=1, **repository)["result"]["ok"]
-        rid, csrf, view = approve("authorize", operations=["read"], days=1, **repository)
+        rid, csrf, view = approve("authorize", operations=["read", "fetch"], days=1, **repository)
         connection = "/approve/repository/" + rid
         origin = {"Origin": "https://" + HOST, "Cookie": COOKIE + "=" + view}
         assert phone.post(connection, data={"csrf": "different", "step": "start"}, headers=origin).status_code == 400
@@ -151,6 +202,58 @@ def main():
         fixture.until(lambda: fixture.broker("runner", "repository_grants", {"client": "fixture"}), 20)
         assert call("repository_private_readiness", **repository)["result"] == {"readable": True}
         assert app.refresh_count == 1
+        def invoke(name, client="fixture", **arguments):
+            return call("stynpilot_invoke", client=client, operation="repository.archive-" + name,
+                        version=1, arguments=arguments)
+        capture_args = {**repository, "refs": expected_refs, "head": "refs/heads/main"}
+        names = {item["name"] for item in call("stynpilot_capabilities")["result"]["operations"]}
+        assert {"repository.archive-capture", "repository.archive-status", "repository.archive-cancel"} <= names
+        assert invoke("capture", client="fixture-other", **capture_args)["error"] == "repository_grant_unavailable"
+        started = invoke("capture", **capture_args)
+        assert started["ok"], started
+        job = started["result"]["job_id"]
+        assert invoke("status", client="fixture-other", job_id=job)["error"] == "archive_job_not_found"
+        assert invoke("cancel", client="fixture-other", job_id=job)["error"] == "archive_job_not_found"
+
+        def finished(job_id):
+            answer = invoke("status", job_id=job_id)
+            if not answer["ok"]:
+                return None
+            row = answer["result"]
+            return row if row["state"] not in ("running", "cancel_requested") else None
+
+        completed = fixture.until(lambda: finished(job), 100)
+        assert completed["state"] == "done", completed
+        archive_id = completed["archive_id"]
+        assert not managed_activity.held(fixture.STATE)
+        refs = call("repository_archive_refs", archive_id=archive_id)["result"]["items"]
+        assert {row["ref"]: row["object"] for row in refs} == expected_refs
+        history = call("repository_archive_history", archive_id=archive_id, commit=expected_refs["refs/heads/main"])
+        assert len(history["result"]["items"]) == 2
+        assert call("repository_archive_list", client="fixture-other")["result"]["archives"] == []
+
+        for action, state in (("cancel", "cancelled"), ("restart", "interrupted")):
+            app.hold_fetch = True
+            app.fetch_started.clear()
+            app.fetch_release.clear()
+            try:
+                started = invoke("capture", **capture_args)
+                assert started["ok"], started
+                interrupted = started["result"]["job_id"]
+                assert app.fetch_started.wait(20)
+                assert managed_activity.held(fixture.STATE)
+                if action == "cancel":
+                    asked = invoke("cancel", job_id=interrupted)
+                    assert asked["ok"], asked
+                else:
+                    fixture.command("systemctl", "restart", "stynpilot-installer.service")
+                settled = fixture.until(lambda: finished(interrupted), 30)
+                assert settled["state"] == state, settled
+                assert not managed_activity.held(fixture.STATE)
+            finally:
+                app.fetch_release.set()
+                app.hold_fetch = False
+        print("STYNPILOT_PACKAGED_PRIVATE_INTAKE_MCP_OK", flush=True)
         approve("suspend")
         assert call("repository_private_readiness", **repository)["error"] == "repository_access_suspended"
         approve("resume")
@@ -161,6 +264,7 @@ def main():
         assert call("repository_private_readiness", **repository)["error"] == "repository_grant_unavailable"
         approve("revoke", **repository)
         assert call("repository_private_readiness", **repository)["error"] == "repository_grant_unavailable"
+        assert call("repository_archive_list")["result"]["archives"] == []
         app.principal = 99
         refused_id, csrf, view = approve("authorize", operations=["read"], days=1, **repository)
         connection = "/approve/repository/" + refused_id

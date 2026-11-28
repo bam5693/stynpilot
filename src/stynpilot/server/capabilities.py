@@ -25,6 +25,17 @@ class LabEnrollmentInput(EmptyInput):
     repository: str = Field(pattern=r"^bam5693/stynpilot$", min_length=17, max_length=17)
 
 
+class ArchiveCaptureInput(EmptyInput):
+    repository: str = Field(pattern=r"^[a-z][a-z0-9-]{0,47}$", min_length=1, max_length=48)
+    refs: dict[Annotated[str, Field(max_length=1024)], Annotated[str, Field(pattern=r"^[a-f0-9]{40}$")]] = Field(
+        min_length=1, max_length=512)
+    head: str = Field(pattern=r"^refs/heads/", max_length=1024)
+
+
+class ArchiveJobInput(EmptyInput):
+    job_id: str = Field(pattern=r"^[a-f0-9]{32}$", min_length=32, max_length=32)
+
+
 @dataclass(frozen=True)
 class Operation:
     name: str

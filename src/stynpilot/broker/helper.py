@@ -29,6 +29,12 @@ def checkout_unit(job):
     return "stynpilot-deckplay-checkout-" + job + ".service"
 
 
+def archive_receive_unit(job):
+    if type(job) is not str or not managed_activity.ID.fullmatch(job):
+        raise HelperError("archive_transfer_invalid")
+    return "stynpilot-archive-receive-" + job + ".service"
+
+
 class HelperError(Exception):
     def __init__(self, code):
         super().__init__(code)
@@ -48,6 +54,40 @@ def _parse(done):
 class SystemdHelper:
     def __init__(self, owner_user, python="/usr/bin/python3"):
         self.owner_user, self.python = owner_user, python
+
+    def adopt_archive(self, *, home, job, client, manifest_sha256, bundle_sha256, repository_access, dispatch_dir, stream):
+        """Pass a verified frame to the owner in a separate, offline service."""
+        unit = archive_receive_unit(job)
+        runtime = unit.removesuffix(".service")
+        state = Path(home) / ".local" / "state" / "stynpilot"
+        request = {"op": "archive_receive", "job": job, "client": client,
+                   "manifest_sha256": manifest_sha256, "bundle_sha256": bundle_sha256,
+                   "repository_access": repository_access}
+        timeout = 120
+        props = (
+            "Slice=system.slice", "User=" + self.owner_user, "ProtectSystem=strict", "ProtectHome=tmpfs",
+            "PrivateNetwork=yes", "PrivateDevices=yes", "NoNewPrivileges=yes", "CapabilityBoundingSet=",
+            "RestrictAddressFamilies=AF_UNIX", "UMask=0077", "KillMode=control-group", "ExitType=cgroup",
+            "BindsTo=stynpilot-installer.service", "After=stynpilot-installer.service", "TimeoutStopSec=5",
+            f"RuntimeMaxSec={timeout}", "MemoryMax=2G", "MemorySwapMax=0", "TasksMax=32", "CPUQuota=200%",
+            "LimitFSIZE=512M", "LimitCORE=0", "RuntimeDirectoryMode=0700", "RuntimeDirectory=" + runtime,
+            "TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size=128M,mode=1777",
+            f"ReadWritePaths=/run/{runtime}/archives",
+            f"BindPaths={state / 'repository-archives'}:/run/{runtime}/archives",
+            f"BindReadOnlyPaths={dispatch_dir}:/run/{runtime}/dispatch",
+        )
+        command = ["/usr/bin/systemd-run", "--pipe", "--wait", "--collect", "--quiet",
+                   "--service-type=exec", "--unit=" + unit]
+        command.extend("--property=" + prop for prop in props)
+        command += ["--", self.python, "-IB", "-X", "pycache_prefix=/usr/lib/stynpilot/.source-only",
+                    HELPER, json.dumps(request)]
+        try:
+            done = subprocess.run(command, stdin=stream, capture_output=True, timeout=timeout + 8, env=_ENV, check=False)
+        except (OSError, subprocess.SubprocessError):
+            # The broker that dispatched the job must reconcile the named
+            # cgroup before reusing the store or considering it published.
+            raise HelperError("archive_transfer_outcome_unverified") from None
+        return _parse(done)
 
     def call(self, request, timeout=DEFAULT_TIMEOUT, *, data=None):
         """One owner-side operation with a HARD deadline: systemd itself ends the unit at ``timeout`` (RuntimeMaxSec), and if the

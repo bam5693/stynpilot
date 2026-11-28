@@ -24,10 +24,18 @@ MAX_FILE = 64 << 10
 # limit. Commit refs and receipts are bounded separately.
 ADOPTION_RESERVATION = 5 * git.MAX_BUNDLE + 4 * git.MAX_MANIFEST
 _ARCHIVE = re.compile(r"[a-f0-9]{32}\Z")
+_REPOSITORY = re.compile(r"[a-z][a-z0-9-]{0,47}\Z")
 _CLIENT = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 _PENDING = re.compile(r"\.pending-[a-z0-9_]{8}\Z")
 _PROTECTED_LOCATIONS = tuple(tuple(path.lower().split("/")) for path in safefs.HOME_DENY) + ((".git",),)
 _DECKPLAY_SOURCE = {"provider": "github", "url": "https://github.com/bam5693/Deckplay-hq.git"}
+
+
+def _check_repository_access(value):
+    if (type(value) is not dict or set(value) != {"repository", "authorization_profile"}
+            or type(value["repository"]) is not str or not _REPOSITORY.fullmatch(value["repository"])
+            or type(value["authorization_profile"]) is not str or not git.DIGEST.fullmatch(value["authorization_profile"])):
+        raise git.ArchiveError("archive_binding_invalid")
 
 
 def _private_dir(path):
@@ -38,7 +46,14 @@ def _private_dir(path):
 
 def _receipt(path):
     try:
-        row = json.loads(vault._read_private(path, git.MAX_MANIFEST))
+        return _receipt_data(vault._read_private(path, git.MAX_MANIFEST))
+    except (OSError, vault.VaultError):
+        raise git.ArchiveError("archive_receipt_invalid") from None
+
+
+def _receipt_data(raw):
+    try:
+        row = json.loads(raw)
         if type(row) is not dict or set(row) != {"format", "source", "refs", "bundle_sha256", "bundle_size", "default_head"}:
             raise ValueError
         src = row["source"]
@@ -83,9 +98,11 @@ def _page(items, offset, limit):
 class Store:
     """The only writer is the owner adoption command. MCP can inspect grants only."""
 
-    def __init__(self, path):
+    def __init__(self, path, *, private_read=None):
+        self.private_read = private_read
         self.path = Path(path).absolute()
         self._slots = threading.BoundedSemaphore(2)
+        self._private_checks = threading.local()
 
     @contextmanager
     def _locked(self, write=False):
@@ -124,11 +141,11 @@ class Store:
                 vault._fsync_dir(self.path)
 
     def reconcile(self):
-        if self.path.exists():
-            with self._locked(write=True):
-                self._recover()
-                self._inventory()
-                _size(self.path, MAX_RETAINED)
+        # Provision the empty owner-private mount before a first broker capture.
+        with self._locked(write=True):
+            self._recover()
+            self._inventory()
+            _size(self.path, MAX_RETAINED)
 
     def _inventory(self):
         rows = []
@@ -144,16 +161,35 @@ class Store:
         return sorted(rows)
 
     def adopt(self, source, *, manifest_sha256, bundle_sha256, clients):
+        source = Path(source)
+        _private_dir(source)
+        raw = vault._read_private(source / "manifest.json", git.MAX_MANIFEST)
+        return self._adopt(raw, manifest_sha256, bundle_sha256, clients,
+                           lambda output, size: git._bundle_digest(source / "source.bundle", copy_to=output))
+
+    def adopt_stream(self, stream, *, manifest_sha256, bundle_sha256, client, before_publish=None, repository_access=None):
+        """Adopt a verified capture from the broker without passing paths or credentials."""
+        header = stream.read(4)
+        length = int.from_bytes(header, "big")
+        if len(header) != 4 or not 0 < length <= git.MAX_MANIFEST:
+            raise git.ArchiveError("archive_manifest_limit")
+        raw = stream.read(length)
+        if len(raw) != length:
+            raise git.ArchiveError("archive_manifest_invalid")
+        return self._adopt(raw, manifest_sha256, bundle_sha256, [client],
+                           lambda output, size: git._hash_bundle_stream(stream, copy_to=output, limit=size),
+                           before_publish=before_publish, repository_access=repository_access)
+
+    def _adopt(self, raw, manifest_sha256, bundle_sha256, clients, receive_bundle, *, before_publish=None, repository_access=None):
         if (type(clients) is not list or not 1 <= len(clients) <= 8
                 or any(type(c) is not str or not _CLIENT.fullmatch(c) for c in clients)
                 or len(set(clients)) != len(clients)):
             raise git.ArchiveError("archive_client_grant_invalid")
+        if repository_access is not None:
+            _check_repository_access(repository_access)
         for digest in (manifest_sha256, bundle_sha256):
             if type(digest) is not str or not git.DIGEST.fullmatch(digest):
                 raise git.ArchiveError("archive_binding_invalid")
-        source = Path(source)
-        _private_dir(source)
-        raw = vault._read_private(source / "manifest.json", git.MAX_MANIFEST)
         if hashlib.sha256(raw).hexdigest() != manifest_sha256:
             raise git.ArchiveError("archive_binding_invalid")
         archive_id = manifest_sha256[:32]
@@ -175,16 +211,24 @@ class Store:
                 bundle = archive / "source.bundle"
                 fd = os.open(bundle, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
                 with os.fdopen(fd, "wb") as stream:
-                    digest, size = git._bundle_digest(source / "source.bundle", copy_to=stream)
+                    digest, size = receive_bundle(stream, receipt["bundle_size"])
                     stream.flush()
                     os.fsync(stream.fileno())
                 if digest != bundle_sha256 or (digest, size) != (receipt["bundle_sha256"], receipt["bundle_size"]):
                     raise git.ArchiveError("archive_bundle_digest_mismatch")
                 _restore(pending, receipt)
-                vault._write_atomic(pending, "grant.json", json.dumps({"clients": sorted(clients),
-                                    "manifest_sha256": manifest_sha256}).encode())
+                grant = {"manifest_sha256": manifest_sha256}
+                if repository_access is not None:
+                    # Older builds ignore unknown fields and rely on clients.
+                    # Omit that key so private archives stay hidden on rollback.
+                    grant.update(private_client=clients[0], repository_access=repository_access)
+                else:
+                    grant["clients"] = sorted(clients)
+                vault._write_atomic(pending, "grant.json", json.dumps(grant).encode())
                 _size(self.path, MAX_RETAINED)
                 _sync_tree(pending)
+                if before_publish is not None:
+                    before_publish()
                 git._publish_directory(pending, dest)
             finally:
                 if pending.exists():
@@ -195,20 +239,38 @@ class Store:
         if not self._slots.acquire(blocking=False):
             raise git.ArchiveError("archive_store_busy")
         try:
-            return method(client, *args)
+            self._private_checks.scopes = []
+            result = method(client, *args)
+            if any(not self.private_read(client, access, source) for access, source in self._private_checks.scopes):
+                raise git.ArchiveError("archive_read_authorization_changed")
+            return result
         finally:
+            del self._private_checks.scopes
             self._slots.release()
 
     def _visible(self, entry, client):
         row = json.loads(vault._read_private(entry / "grant.json", 4096))
-        if type(row) is not dict or type(row.get("clients")) is not list or client not in row["clients"]:
+        if type(row) is not dict:
+            return None
+        if "repository_access" in row:
+            if set(row) != {"repository_access", "private_client", "manifest_sha256"} or row["private_client"] != client:
+                return None
+        elif type(row.get("clients")) is not list or client not in row["clients"]:
             return None
         manifest = entry / "archive" / "manifest.json"
         raw = vault._read_private(manifest, git.MAX_MANIFEST)
         digest = hashlib.sha256(raw).hexdigest()
         if digest != row.get("manifest_sha256") or digest[:32] != entry.name:
             raise git.ArchiveError("archive_binding_invalid")
-        return _receipt(manifest)
+        receipt = _receipt_data(raw)
+        if "repository_access" in row:
+            access = row["repository_access"]
+            _check_repository_access(access)
+            if self.private_read is None or not self.private_read(client, access, receipt["source"]):
+                return None
+            if hasattr(self._private_checks, "scopes"):
+                self._private_checks.scopes.append((access, receipt["source"]))
+        return receipt
 
     def list(self, client):
         with self._locked() as ready:

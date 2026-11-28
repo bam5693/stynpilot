@@ -1,4 +1,6 @@
 import hashlib
+import json
+from io import BytesIO
 from pathlib import Path
 import subprocess
 import tempfile
@@ -42,6 +44,12 @@ class StoreTests(unittest.TestCase):
         self.binding = {"manifest_sha256": hashlib.sha256((self.archive / "manifest.json").read_bytes()).hexdigest(),
                         "bundle_sha256": result["bundle_sha256"], "clients": ["scope.chatgpt"]}
 
+    def test_reconcile_provisions_a_private_empty_capture_mount(self):
+        self.assertFalse(self.store.path.exists())
+        self.store.reconcile()
+        self.assertEqual(self.store.path.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.store.list("scope.chatgpt"), {"archives": []})
+
     def test_bounded_inspection_and_cross_client_refusal(self):
         self.assertEqual(self.store.list("scope.chatgpt"), {"archives": []})
         archive_id = self.store.adopt(self.archive, **self.binding)["archive_id"]
@@ -56,6 +64,95 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.compare("scope.chatgpt", archive_id, self.old, archive_id, self.new)["total"], 2)
         with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_path_invalid"):
             self.store.file("scope.chatgpt", archive_id, self.old, "../grant.json")
+
+    def test_broker_stream_under_exact_client_and_digest(self):
+        raw = (self.archive / "manifest.json").read_bytes()
+        header = len(raw).to_bytes(4, "big") + raw
+        bundle = (self.archive / "source.bundle").read_bytes()
+        binding = {key: value for key, value in self.binding.items() if key != "clients"}
+        for data, code in ((header + bundle[:-1], "archive_bundle_digest_mismatch"),
+                           (header + bundle + b"x", "archive_bundle_limit"),
+                           (header[:7], "archive_manifest_invalid"),
+                           ((repo_archive.MAX_MANIFEST + 1).to_bytes(4, "big"), "archive_manifest_limit")):
+            with self.subTest(code=code), self.assertRaisesRegex(repo_archive.ArchiveError, code):
+                self.store.adopt_stream(BytesIO(data), client="scope.chatgpt", **binding)
+            self.assertEqual(self.store.list("scope.chatgpt")["archives"], [])
+        with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_binding_invalid"):
+            self.store.adopt_stream(BytesIO(header + bundle), client="scope.chatgpt",
+                                    **{**binding, "manifest_sha256": "0" * 64})
+        def revoke():
+            raise repo_archive.ArchiveError("synthetic_revocation")
+
+        with self.assertRaisesRegex(repo_archive.ArchiveError, "synthetic_revocation"):
+            self.store.adopt_stream(BytesIO(header + bundle), client="scope.chatgpt", before_publish=revoke, **binding)
+        self.assertEqual(self.store.list("scope.chatgpt"), {"archives": []})
+        adopted = self.store.adopt_stream(BytesIO(header + bundle), client="scope.chatgpt", **binding)
+        self.assertEqual(self.store.list("scope.chatgpt")["archives"], [adopted])
+        self.assertEqual(self.store.list("scope.other")["archives"], [])
+        assert self.store.history("scope.chatgpt", adopted["archive_id"], self.new)["items"][0]["parents"] == [self.old]
+
+    def test_private_archive_adoption_has_separate_revocable_read_scope(self):
+        raw = (self.archive / "manifest.json").read_bytes()
+        encoded = len(raw).to_bytes(4, "big") + raw + (self.archive / "source.bundle").read_bytes()
+        binding = {key: value for key, value in self.binding.items() if key != "clients"}
+        access = {"repository": "project", "authorization_profile": "e" * 64}
+        source = {"provider": "github", "url": "https://github.com/fixture/archive.git"}
+        allowed = True
+        def authorizer(client, registered, origin):
+            return allowed and client == "scope.chatgpt" and registered == access and origin == source
+
+        store = archive_store.Store(self.store.path, private_read=authorizer)
+        adopted = store.adopt_stream(BytesIO(encoded), client="scope.chatgpt", repository_access=access, **binding)
+        self.assertEqual(store.list("scope.chatgpt")["archives"], [adopted])
+        self.assertEqual(store.list("scope.other")["archives"], [])
+        self.assertEqual(self.store.list("scope.chatgpt")["archives"], [])
+        old_schema = json.loads((store.path / adopted["archive_id"] / "grant.json").read_bytes())
+        self.assertNotIn("clients", old_schema)
+        with patch.object(store, "private_read", side_effect=[True, False]):
+            with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_read_authorization_changed"):
+                store.inspect(store.history, "scope.chatgpt", adopted["archive_id"], self.new)
+        allowed = False
+        with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_not_found"):
+            store.history("scope.chatgpt", adopted["archive_id"], self.new)
+        self.assertTrue((store.path / adopted["archive_id"] / "archive" / "source.bundle").is_file())
+
+    def test_private_transport_cross_checks_worker_frame_and_fences_before_return(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from stynpilot.broker.archive_transport import Transport, capture_unit
+        from stynpilot.broker.lab import LabError
+
+        raw = (self.archive / "manifest.json").read_bytes()
+        frame = len(raw).to_bytes(4, "big") + raw + (self.archive / "source.bundle").read_bytes()
+        source = ("github", "https://github.com/fixture/archive.git")
+        refs = {"refs/heads/main": self.new}
+        with BytesIO(frame) as stream:
+            binding = Transport._verify_frame(stream, source, refs, "refs/heads/main")
+            self.assertEqual(stream.tell(), 0)
+            self.assertEqual(binding["manifest_sha256"], self.binding["manifest_sha256"])
+            with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_binding_invalid"):
+                Transport._verify_frame(stream, ("gitlab", "https://gitlab.com/team/fixture.git"),
+                                        refs, "refs/heads/main")
+
+        source = ("gitlab", "https://gitlab.com/team/fixture.git")
+        job = "a" * 32
+        fixture = "synthetic_read_only_credential"
+        fence = Mock()
+        runner = Mock(return_value=SimpleNamespace(returncode=1))
+        with tempfile.TemporaryFile(dir=self.root) as file:
+            args = dict(job=job, source=source, refs=refs, head="refs/heads/main",
+                        credential=("oauth2", fixture), stream=file)
+            driver = Transport(run=runner, fence=fence)
+            with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_intake_refused"):
+                driver.capture(**args)
+            fence.stop.assert_called_once_with(job)
+            command, = runner.call_args.args
+            self.assertIn("--unit=" + capture_unit(job), command)
+            self.assertNotIn(fixture, repr(command))
+            self.assertNotIn(fixture, repr(runner.call_args.kwargs["env"]))
+            fence.stop.side_effect = LabError("lab_quiescence_unverified")
+            with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_intake_quiescence_unverified"):
+                driver.capture(**args)
 
     def test_deckplay_checkout_preview_is_bound_and_nonmutating(self):
         adopted = self.store.adopt(self.archive, **self.binding)

@@ -121,22 +121,27 @@ def _expected_map(value):
     return dict(sorted(value.items()))
 
 
+def _hash_bundle_stream(source, *, copy_to=None, limit=MAX_BUNDLE):
+    digest, total = hashlib.sha256(), 0
+    while chunk := source.read(min(1 << 20, limit + 1 - total)):
+        total += len(chunk)
+        if total > limit:
+            raise ArchiveError("archive_bundle_limit")
+        digest.update(chunk)
+        if copy_to is not None:
+            copy_to.write(chunk)
+    return digest.hexdigest(), total
+
+
 def _bundle_digest(path, *, copy_to=None):
     with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC), "rb") as source:
         info = os.fstat(source.fileno())
         if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_BUNDLE:
             raise ArchiveError("archive_bundle_limit")
-        digest, total = hashlib.sha256(), 0
-        while chunk := source.read(1 << 20):
-            total += len(chunk)
-            if total > MAX_BUNDLE:
-                raise ArchiveError("archive_bundle_limit")
-            digest.update(chunk)
-            if copy_to is not None:
-                copy_to.write(chunk)
-        if total != info.st_size:
+        digest, size = _hash_bundle_stream(source, copy_to=copy_to)
+        if size != info.st_size:
             raise ArchiveError("archive_bundle_changed")
-        return digest.hexdigest(), total
+        return digest, size
 
 
 def _restore_bundle(bundle, bare, refs, default_head=None):

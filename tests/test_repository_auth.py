@@ -186,6 +186,50 @@ class RepositoryAuthTests(unittest.TestCase):
         self.assertEqual(self.store.status("chatgpt")["grants"][0]["state"], "renewal_uncertain")
         self.assertNotIn(REFRESH, (self.store.root / "grants.json").read_text())
 
+    def test_retained_private_archive_reads_require_a_live_read_grant_and_exact_origin(self):
+        self.connect()
+        source = {"provider": "gitlab", "url": TARGET["origin"]}
+        profile = self.store.describe("fixture")["authorization_profile"]
+        check = self.store.archive_read
+        self.assertEqual(check("chatgpt", "fixture", profile, source), {"allowed": True})
+        self.assertEqual(check("other", "fixture", profile, source), {"allowed": False})
+        self.assertEqual(check("chatgpt", "fixture", "0" * 64, source), {"allowed": False})
+        self.assertEqual(check("chatgpt", "fixture", profile, {**source, "url": "https://gitlab.com/team/other.git"}),
+                         {"allowed": False})
+        self.now += 86400
+        self.assertEqual(check("chatgpt", "fixture", profile, source), {"allowed": False})
+
+    def test_fetch_lease_never_keeps_the_grant_store_locked(self):
+        self.store.apply("repository_authorize", "chatgpt", "fixture", ["fetch"], 1, REQUEST)
+        self.store.connect(REQUEST, False)
+        self.now += 5
+        self.provider.ready = True
+        self.store.connect(REQUEST, True)
+        with self.assertRaisesRegex(auth.AuthorizationError, "repository_grant_unavailable"):
+            self.store.begin_fetch("other", "fixture", seconds=15)
+        lease = self.store.begin_fetch("chatgpt", "fixture", seconds=15)
+        source = {"provider": "gitlab", "url": TARGET["origin"]}
+        profile = self.store.describe("fixture")["authorization_profile"]
+        self.assertEqual(self.store.archive_read("chatgpt", "fixture", profile, source), {"allowed": False})
+        self.assertNotIn(SECRET, repr(lease))
+        self.assertEqual(lease.source, ("gitlab", TARGET["origin"]))
+        self.store.check_fetch(lease)
+        self.store.apply("repository_suspend", "chatgpt", "", [], 0, REQUEST)
+        with self.assertRaisesRegex(auth.AuthorizationError, "repository_access_suspended"):
+            self.store.check_fetch(lease)
+        self.store.apply("repository_resume", "chatgpt", "", [], 0, REQUEST)
+        self.store = self.reopen()
+        with self.assertRaisesRegex(auth.AuthorizationError, "repository_fetch_grant_changed"):
+            self.store.check_fetch(lease)
+        lease = self.store.begin_fetch("chatgpt", "fixture", seconds=15)
+        self.now += 16
+        with self.assertRaisesRegex(auth.AuthorizationError, "repository_fetch_grant_changed"):
+            self.store.check_fetch(lease)
+        lease = self.store.begin_fetch("chatgpt", "fixture", seconds=15)
+        self.store.apply("repository_revoke", "chatgpt", "fixture", [], 0, REQUEST)
+        with self.assertRaisesRegex(auth.AuthorizationError, "repository_grant_unavailable"):
+            self.store.check_fetch(lease)
+
     def test_failed_reconnection_keeps_the_previous_valid_grant(self):
         self.connect()
         rerun = "b" * 64

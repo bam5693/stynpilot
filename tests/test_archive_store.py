@@ -8,8 +8,9 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from stynpilot import archive_publication, archive_store, managed_activity, repo_archive, repo_git, root_restore
+from stynpilot import archive_publication, archive_store, managed_activity, projects_helper, repo_archive, repo_git, root_restore
 from stynpilot.broker import archive_jobs, repository_auth
+from stynpilot.server.clients import ARCHIVE_AUTHORITY, ClientDenied, RevocationFile
 from test_repository_auth import FakeGitLab, REQUEST, TARGET
 
 
@@ -131,7 +132,9 @@ class StoreTests(unittest.TestCase):
         now[0] += 5
         auth.connect(REQUEST, True)
         lease = auth.begin_fetch("chatgpt", "fixture", seconds=60)
-        jobs = archive_jobs.Jobs(directory, auth, Mock(), "/home/fixture", transport=Mock(),
+        helper = Mock()
+        helper.call.return_value = {"active": True}
+        jobs = archive_jobs.Jobs(directory, auth, helper, "/home/fixture", transport=Mock(),
                                  receive_fence=Mock(), clock=lambda: now[0])
         job = "d" * 32
         jobs._folder(job).mkdir(mode=0o700)
@@ -198,6 +201,45 @@ class StoreTests(unittest.TestCase):
         revoke()
         self.assertFalse((dispatch / "permit.json").exists())
         self.assertTrue((self.store.path / adopted["archive_id"] / "archive" / "source.bundle").is_file())
+
+    def test_global_revocation_is_ordered_with_the_final_publish(self):
+        raw = (self.archive / "manifest.json").read_bytes()
+        frame = len(raw).to_bytes(4, "big") + raw + (self.archive / "source.bundle").read_bytes()
+        digests = {key: value for key, value in self.binding.items() if key != "clients"}
+        revocations = RevocationFile(self.root / "owner" / "revoked-clients.json")
+        revocations.provision()
+        revocations.enable_archive_fence()
+        authority = revocations.path.parent / ARCHIVE_AUTHORITY
+        client = "scope.chatgpt"
+
+        def adopt():
+            return self.store.adopt_stream(BytesIO(frame), client=client, **digests,
+                                           publication_guard=lambda: projects_helper._archive_client_publication(authority, client))
+
+        sync = archive_store._sync_tree
+
+        def revoke_after_stage(path):
+            sync(path)
+            revocations.set_revoked(client, True)
+
+        with (patch.object(archive_store, "_sync_tree", side_effect=revoke_after_stage),
+              self.assertRaisesRegex(repo_archive.ArchiveError, "archive_client_authorization_withdrawn")):
+            adopt()
+        self.assertEqual(self.store.list(client)["archives"], [])
+        revocations.set_revoked(client, False)
+        publish = repo_archive._publish_directory
+
+        def revoke_during_publish(source, target):
+            with self.assertRaisesRegex(ClientDenied, "archive_publication_busy"):
+                RevocationFile(revocations.path).set_revoked(client, True)
+            return publish(source, target)
+
+        with patch.object(repo_archive, "_publish_directory", side_effect=revoke_during_publish):
+            archive_id = adopt()["archive_id"]
+        revocations.set_revoked(client, True)
+        self.assertTrue((self.store.path / archive_id).is_dir())
+        revocations._write([])
+        self.assertIn(client, RevocationFile(revocations.path).revoked())
 
     def test_private_transport_cross_checks_worker_frame_and_fences_before_return(self):
         from types import SimpleNamespace

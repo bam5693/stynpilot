@@ -225,6 +225,9 @@ class Executor:
         self.upgrader = Upgrader(self, keys=release_keys, fetch=fetch_release, launch=launch_worker,
                                  options=upgrade_options)
         self.jobs = jobs
+        from . import private_floor
+        self._install_private_floor = private_floor.install
+        self._private_floor_ready = private_floor.ready
         # Activating a passkey through the owner-side service is OFF unless explicitly allowed: by default the owner confirms a new
         # passkey at the computer's console (passkey_console.py), which does not depend on that service.
         self.allow_remote_activation = allow_remote_activation
@@ -920,6 +923,13 @@ class Executor:
 
     def _runner_do(self, payload):
         action = payload["action"]
+        if action in ("repository_authorize", "deckplay_checkout") or (
+                action == "workspace_access" and payload["workspace_clients"]):
+            from .private_floor import FloorError
+            try:
+                self._install_private_floor()
+            except FloorError as error:
+                raise JobError(error.code) from None
         if action in repository_auth.ACTIONS:
             return self.repositories.apply(action, payload["client"], payload["repository"], payload["operations"],
                                            payload["days"], payload_hash(payload)[0])
@@ -1015,6 +1025,8 @@ class Executor:
             raise ExecutionDenied("archive_intake_request_invalid")
         try:
             if call == "archive_capture_start":
+                if not self._private_floor_ready():
+                    raise ExecutionDenied("private_access_version_floor_unverified")
                 self._no_other_change()
                 if any(thread.is_alive() for thread in self._builds.values()):
                     raise ExecutionDenied("another_build_is_running")
@@ -1033,6 +1045,10 @@ class Executor:
         method, keys = methods[call]
         if set(args) != set(keys):
             raise ExecutionDenied("repository_grant_invalid")
+        if call == "repository_connect" and not self._private_floor_ready():
+            raise ExecutionDenied("private_access_version_floor_unverified")
+        if call == "repository_archive_read" and not self._private_floor_ready():
+            return {"allowed": False}
         try:
             return method(*(args[key] for key in keys))
         except (OSError, repository_auth.AuthorizationError, vault.VaultError) as error:
@@ -1093,7 +1109,9 @@ class Executor:
         jobs, base = self.jobs, self.jobs.projects_dir
         name_of = lambda path: os.path.basename(path)
         client = args.get("client")
-        visible = lambda path: jobs.workspace_allowed(path, client) if name_of(path) == "deckplay-hq" else True
+        def visible(path):
+            return (name_of(path) != "deckplay-hq"
+                    or (jobs.workspace_allowed(path, client) and self._private_floor_ready()))
         if call == "workspace_access_revision":
             if set(args) != {"workspace"} or args["workspace"] != "deckplay-hq" or self.passkeys is None:
                 raise ExecutionDenied("workspace_access_invalid")

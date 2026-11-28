@@ -778,6 +778,10 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
     operations = (
         capabilities.Operation("runner.status", 1, "GREEN", "health.read", capabilities.EmptyInput, runner_status),
         capabilities.Operation("workspace.list", 1, "GREEN", "health.read", capabilities.EmptyInput, workspace_list),
+        capabilities.Operation("workspace.deckplay-checkout-preview", 1, "GREEN", "workspace.propose",
+                               capabilities.DeckPlayPreviewInput, deckplay_checkout_preview),
+        capabilities.Operation("workspace.request-deckplay-access", 1, "YELLOW", "workspace.propose",
+                               capabilities.DeckPlayWorkspaceAccessInput, request_workspace_authorization),
         capabilities.Operation("dev-lab.evidence", 1, "GREEN", "workspace.propose",
                                capabilities.LabEvidenceInput, dev_lab_job_output),
         capabilities.Operation("dev-lab.request-enrollment", 1, "YELLOW", "workspace.propose",

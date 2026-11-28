@@ -27,6 +27,10 @@ if [ "${2-}" = --repository-auth-case ]; then
 fi
 if [ "${2-}" = --deckplay-checkout-case ]; then
     cp "$repo/tools/dev/guest-deckplay-checkout.py" "$run/payload/"
+    if [ -n "${STYNPILOT_DEV30_BASELINE-}" ]; then
+        printf '%s  %s\n' 70d605764b288386a4dc5956db880e1169e645086fb77ff81b8b72c1ec3d8609 "$STYNPILOT_DEV30_BASELINE" | sha256sum --strict -c >&2
+        cp "$STYNPILOT_DEV30_BASELINE" "$run/payload/dev30.deb"
+    fi
 fi
 if [ "${2-}" = --lab-mcp-case ] || [ "${2-}" = --deckplay-checkout-case ]; then
     cp "$repo/tools/dev/guest-lab-mcp.py" "$run/payload/"

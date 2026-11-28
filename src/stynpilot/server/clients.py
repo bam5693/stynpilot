@@ -17,8 +17,11 @@ import json
 import os
 import re
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+
+from .. import archive_publication, repo_archive, vault
 
 PROPOSE_SCOPE = "workspace.propose"
 REVIEW_SCOPE = "workspace.review"
@@ -26,6 +29,8 @@ UNIDENTIFIED_CLIENT = "unidentified-client"
 KINDS = ("chatgpt", "claude", "local")
 _CLIENT = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+ARCHIVE_AUTHORITY = "archive-client-authority"
+_AUTHORITY_MARKER = ".archive-client-authority-enabled"
 
 
 class ClientDenied(Exception):
@@ -65,24 +70,48 @@ class RevocationFile:
 
     def revoked(self):
         with self._lock:
+            return self._read_both()
+
+    def _read_current(self):
+        try:
+            self._check_folder()
+            data = json.loads(vault._read_private(self.path, 65536))
+        except (OSError, ValueError, vault.VaultError):
+            raise ClientDenied("client_state_unreadable") from None
+        if (type(data) is not dict or set(data) != {"revoked"} or type(data["revoked"]) is not list
+                or any(type(x) is not str or not _CLIENT.fullmatch(x) for x in data["revoked"])):
+            raise ClientDenied("client_state_unreadable")
+        return frozenset(data["revoked"])
+
+    def _authority(self):
+        return RevocationFile(self.path.parent / ARCHIVE_AUTHORITY / self.path.name)
+
+    def _read_both(self):
+        current = self._read_current()
+        authority = self._authority()
+        if os.path.lexists(authority.path.parent) or os.path.lexists(self.path.parent / _AUTHORITY_MARKER):
+            current |= authority._read_current()
+        return current
+
+    def enable_archive_fence(self):
+        """Initialize the separately mounted authority from the existing revocations."""
+        authority = self._authority()
+        marker = self.path.parent / _AUTHORITY_MARKER
+        with self._lock, archive_publication.lock(self.path.parent):
+            current = self._read_current()
             try:
-                self._check_folder()
-                fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
-            except (OSError, ClientDenied):
-                raise ClientDenied("client_state_unreadable") from None
-            try:
-                info = os.fstat(fd)
-                if info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_size > 65536:
+                authority.path.parent.mkdir(mode=0o700)
+            except FileExistsError:
+                with archive_publication.lock(authority.path.parent):
+                    retained = authority._read_current()
+                    if not current <= retained:
+                        authority._write(current | retained)
+            else:
+                if os.path.lexists(marker):
                     raise ClientDenied("client_state_unreadable")
-                data = json.loads(os.read(fd, 65537).decode("utf-8"))
-            except (OSError, ValueError, UnicodeError):
-                raise ClientDenied("client_state_unreadable") from None
-            finally:
-                os.close(fd)
-            if (type(data) is not dict or set(data) != {"revoked"} or type(data["revoked"]) is not list
-                    or any(type(x) is not str or not _CLIENT.fullmatch(x) for x in data["revoked"])):
-                raise ClientDenied("client_state_unreadable")
-            return frozenset(data["revoked"])
+                authority._write(current)
+            if not os.path.lexists(marker):
+                vault._write_atomic(self.path.parent, marker.name, b"enabled\n")
 
     def provision(self):
         """Create the empty list once. Returns True if created, False if it already exists (left untouched)."""
@@ -103,21 +132,29 @@ class RevocationFile:
     def _write(self, revoked):
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._check_folder()
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-        try:
-            os.write(fd, json.dumps({"revoked": sorted(revoked)}).encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, self.path)
+        data = json.dumps({"revoked": sorted(revoked)}).encode("utf-8")
+        if len(data) > 65536:
+            raise ClientDenied("client_state_unreadable")
+        vault._write_atomic(self.path.parent, self.path.name, data)
 
     def set_revoked(self, client_id, revoked):
         """Owner-side only (owner tool / phone, G5). Never exposed to an AI."""
-        current = set(self.revoked())
-        (current.add if revoked else current.discard)(client_id)
-        with self._lock:
-            self._write(current)
+        if type(client_id) is not str or not _CLIENT.fullmatch(client_id):
+            raise ClientDenied("client_state_unreadable")
+        authority = self._authority()
+        try:
+            with self._lock, archive_publication.lock(self.path.parent):
+                fenced = os.path.lexists(authority.path.parent) or os.path.lexists(self.path.parent / _AUTHORITY_MARKER)
+                with (archive_publication.lock(authority.path.parent) if fenced else nullcontext()):
+                    current = set(self._read_both())
+                    (current.add if revoked else current.discard)(client_id)
+                    if fenced and revoked:
+                        authority._write(current)
+                    self._write(current)
+                    if fenced and not revoked:
+                        authority._write(current)
+        except (OSError, repo_archive.ArchiveError, vault.VaultError) as error:
+            raise ClientDenied(getattr(error, "code", "client_state_unreadable")) from None
 
 
 class EnrolledClients:

@@ -9,9 +9,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from stynpilot import managed_activity, repo_archive, root_restore
+from stynpilot import managed_activity, projects_helper, repo_archive, root_restore
 from stynpilot.broker.archive_jobs import Jobs, KIND
 from stynpilot.broker.lab import LabError
+from stynpilot.server.clients import RevocationFile
 
 REFS = {"refs/heads/main": "a" * 40}
 HEAD = "refs/heads/main"
@@ -37,7 +38,11 @@ class PrivateArchiveJobsTests(unittest.TestCase):
         self.transport.capture.side_effect = self._capture
         self.helper = Mock()
         self.helper.adopt_archive.side_effect = self._adopt
-        self.jobs = Jobs(self.state, auth, self.helper, "/home/fixture",
+        self.home = self.state / "owner"
+        self.revocations = RevocationFile(self.home / ".local/state/stynpilot/revoked-clients.json")
+        self.revocations.provision()
+        self.helper.call.side_effect = lambda request, timeout: projects_helper.op_archive_client_active(request)
+        self.jobs = Jobs(self.state, auth, self.helper, str(self.home),
                          transport=self.transport, receive_fence=self.receiver)
 
     def _capture(self, **kwargs):
@@ -106,6 +111,32 @@ class PrivateArchiveJobsTests(unittest.TestCase):
         self.assertEqual(self.jobs.status("chatgpt", job)["state"], "cancelled")
         self.assertFalse(managed_activity.held(self.state))
         self.helper.adopt_archive.assert_not_called()
+
+    def test_global_client_revocation_stops_active_private_capture_and_blocks_late_dispatch(self):
+        job = self.start()
+        self.revocations.set_revoked("claude", True)
+        with root_restore.admission(self.state, exclusive=True):
+            self.jobs.reconcile()
+        self.assertEqual(self.jobs.status("chatgpt", job)["state"], "running")
+        self.revocations.set_revoked("chatgpt", True)
+        with root_restore.admission(self.state, exclusive=True):
+            self.jobs.reconcile()
+            self.assertTrue(managed_activity.held(self.state))
+        self.transport.fence.stop.assert_called_once_with(job)
+        self.receiver.stop.assert_called_once_with(job)
+        self.release.set()
+        self.jobs._active[2].join(2)
+        with root_restore.admission(self.state, exclusive=True):
+            self.jobs.reconcile()
+        self.assertEqual(self.jobs.status("chatgpt", job)["state"], "authorization_withdrawn")
+        self.assertFalse(managed_activity.held(self.state))
+        self.helper.adopt_archive.assert_not_called()
+
+    def test_archive_client_probe_accepts_enrolled_identity_syntax(self):
+        request = {"op": "archive_client_active", "home": str(self.home), "client": "provider:assistant"}
+        self.assertTrue(projects_helper.op_archive_client_active(request)["active"])
+        self.revocations.set_revoked(request["client"], True)
+        self.assertFalse(projects_helper.op_archive_client_active(request)["active"])
 
     def test_restart_refuses_to_replay_interrupted_intent(self):
         job = "d" * 32

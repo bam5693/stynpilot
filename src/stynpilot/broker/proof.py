@@ -147,7 +147,8 @@ def render_summary(payload):
         if payload.get("action") == "repository_authorize":
             return ["Authorize %s for %s." % (payload["client"], payload["origin"]),
                     "Approved operations %s for %d days." % (", ".join(payload["operations"]), payload["days"]),
-                    "Continue in the provider browser with the dedicated project-only account. This approval never authorizes a push.", expires]
+                    "Continue in the provider browser with the dedicated project-only account. This approval never authorizes a push.",
+                    "Private access persists a systemd startup guard that requires StyNpilot Dev34 or newer.", expires]
         if payload.get("action") == "repository_revoke":
             return ["Revoke %s's private repository grant for %s." % (payload["client"], payload["origin"]),
                     "This clears the local grant and credential. Existing archives and repository files stay in place.", expires]
@@ -180,11 +181,13 @@ def render_summary(payload):
                     "Review plan SHA-256 " + payload["plan_sha256"] + "; " + str(plan["entry_count"]) + " files.",
                     "The current tree becomes a new root commit. Original history remains in the private archive. "
                     "The scanner is heuristic; verify the source is suitable for AI access. No download, push or deployment. "
-                    "An occupied workspace is refused.", expires]
+                    "An occupied workspace is refused.",
+                    "Private access persists a systemd startup guard that requires StyNpilot Dev34 or newer.", expires]
         if payload.get("action") == "workspace_access":
             return ["Replace the DeckPlay HQ workspace client grants.",
                     "New access list: " + (", ".join(payload["workspace_clients"]) or "No AI clients") + ".",
-                    "An intervening change invalidates this request.",
+                    "An intervening change invalidates this request. Granting access persists a systemd startup guard "
+                    "that requires StyNpilot Dev34 or newer.",
                     "Listed clients may read, edit and start approved sandbox recipes in this workspace. Other AI clients are denied.", expires]
         if payload.get("action") == "repo_push":
             base = payload["expected_remote"]

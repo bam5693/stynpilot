@@ -1,7 +1,7 @@
 """Fixed, versioned operation contracts for MCP clients that cache tool lists."""
 
 from dataclasses import dataclass
-from typing import Annotated, Callable
+from typing import Annotated, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
 
@@ -34,6 +34,17 @@ class ArchiveCaptureInput(EmptyInput):
 
 class ArchiveJobInput(EmptyInput):
     job_id: str = Field(pattern=r"^[a-f0-9]{32}$", min_length=32, max_length=32)
+
+
+class DeckPlayPreviewInput(EmptyInput):
+    archive_id: str = Field(pattern=r"^[a-f0-9]{32}$", min_length=32, max_length=32)
+    ref: str = Field(pattern=r"^refs/heads/", max_length=1024)
+    commit: str = Field(pattern=r"^[a-f0-9]{40}$", min_length=40, max_length=40)
+
+
+class DeckPlayWorkspaceAccessInput(EmptyInput):
+    name: Literal["deckplay-hq"]
+    client_ids: list[Annotated[str, Field(pattern=r"^[A-Za-z0-9._:-]{1,128}$")]] = Field(max_length=8)
 
 
 @dataclass(frozen=True)

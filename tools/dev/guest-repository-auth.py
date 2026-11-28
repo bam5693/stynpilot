@@ -238,7 +238,16 @@ def main():
         assert len(history["result"]["items"]) == 2
         assert call("repository_archive_list", client="fixture-other")["result"]["archives"] == []
 
-        for action, state in (("cancel", "cancelled"), ("restart", "interrupted")):
+        def revoke_client(revoked):
+            probe = ("import sys; from pathlib import Path;"
+                     "sys.path.insert(0,'/usr/lib/stynpilot/lib');"
+                     "from stynpilot.server.clients import RevocationFile;"
+                     "RevocationFile(Path.home()/'.local/state/stynpilot/revoked-clients.json')"
+                     ".set_revoked('fixture',sys.argv[1]=='revoke')")
+            fixture.as_owner(fixture.PYTHON, "-IB", "-c", probe, "revoke" if revoked else "reinstate")
+
+        for action, state in (("cancel", "cancelled"), ("restart", "interrupted"),
+                              ("revoke-client", "authorization_withdrawn")):
             app.hold_fetch = True
             app.fetch_started.clear()
             app.fetch_release.clear()
@@ -251,14 +260,26 @@ def main():
                 if action == "cancel":
                     asked = invoke("cancel", job_id=interrupted)
                     assert asked["ok"], asked
-                else:
+                elif action == "restart":
                     fixture.command("systemctl", "restart", "stynpilot-installer.service")
-                settled = fixture.until(lambda: finished(interrupted), 30)
+                else:
+                    revoke_client(True)
+                    assert not invoke("status", job_id=interrupted)["ok"]
+
+                def settled_job():
+                    # The revoked client deliberately cannot see its own result.
+                    # The disposable owner harness checks the installer record.
+                    row = fixture.broker("runner", "archive_capture_status", {"client": "fixture", "job": interrupted})
+                    return row if row["state"] not in ("running", "cancel_requested") else None
+
+                settled = fixture.until(settled_job if action == "revoke-client" else lambda: finished(interrupted), 30)
                 assert settled["state"] == state, settled
                 assert not managed_activity.held(fixture.STATE)
             finally:
                 app.fetch_release.set()
                 app.hold_fetch = False
+                if action == "revoke-client":
+                    revoke_client(False)
         print("STYNPILOT_PACKAGED_PRIVATE_INTAKE_MCP_OK", flush=True)
         approve("suspend")
         assert call("repository_private_readiness", **repository)["error"] == "repository_access_suspended"

@@ -20,7 +20,7 @@ MAX_ENTRIES = 2048
 MAX_TOTAL = 64 << 20
 MAX_BLOB = 4 << 20
 MAX_SECONDS = 60
-POLICY = "deckplay-clean-snapshot-v4"
+POLICY = "deckplay-clean-snapshot-v5"
 REF = "refs/heads/stynpilot-import"
 
 # Filename entropy false positives from the reviewed DeckPlay source tree.
@@ -28,9 +28,41 @@ REF = "refs/heads/stynpilot-import"
 _REVIEWED_TREE = "aaec79d0f851d6c4d3d6f7612b19b51216fa2c11"
 _MIGRATION_PATH = re.compile(r"supabase/migrations/[0-9]{14}_[a-z0-9_]+\.sql")
 _REPORT_PATH = re.compile(r"tests/reports/[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+\.md")
-_LOCAL_TEST_WORKFLOW = ".github/workflows/t2-unread-local.yml"
-_LOCAL_TEST_WORKFLOW_BLOB = "c34011831863c49c391f8e59f66316e70c1546030dc10d6c5cf4e18b0d9174cd"
+_WORKFLOW_FILENAMES = {
+    ".github/workflows/t2-unread-local.yml": "c34011831863c49c391f8e59f66316e70c1546030dc10d6c5cf4e18b0d9174cd",
+    ".github/workflows/t1-metadata-acceptance-launch.yml": "0b6b44a16017b6a9ecf5302a37de0dfcd55e3c758b69411590a8ddbe09e039c2",
+    ".github/workflows/t1-ui-publish-acceptance-launch.yml": "e8beaef23ced35268dee3ae08b9d01b53c661c90e5c4bc8a9c1435359c260f85",
+}
 _WORKFLOW_PATH = re.compile(r"\.github/workflows/[a-z0-9-]+\.yml")
+# Reviewed descriptive filenames. These pins do not exempt any content finding.
+_FILENAME_ONLY = {
+    ".github/workflows/v1-comprehensive-audit.yml":
+        "74490ab875b42d40857f7fffe1b44032d49bef88be63248a7207bd293d0f0976",
+    "docs/trunk-9/2026-11-01-competitor-evidence-log.md":
+        "1f556949e895ae825a8f1520d7af455387ae4cf11c3bac5bd8a26b86697957c0",
+    "tests/reports/2026-10-27-next-roadmap-handoff.md":
+        "92e9d11b3efc96e58483c8bf321ddf4eb9b3bc4259aefd369cd5c613ecac17d7",
+    "tests/reports/2026-10-28-admin-foundation.md":
+        "58d2c504e17db20f70a1949962f63ef270e9426e28b79a6304a1c21b4cddd354",
+    "tests/reports/2026-10-28-category-coverage-development.md":
+        "083e3cba221f620bb9b03c6420af948cebb8665f90e275c332015b097232a9dc",
+    "tests/reports/2026-10-28-mfa-onboarding.md":
+        "ff8d5f9cb2c6e9ee64174cdf2ac3c3d21cf194cab5b6a1a9e2184c4501591af9",
+    "tests/reports/2026-10-29-alert-account-isolation-and-parity.md":
+        "7161b627ec3da4c742c98e5a567467e007b3b0ff7953f1c24bdb9e7d35b6e80c",
+    "tests/reports/2026-10-29-clock-in-development.md":
+        "771226d518d6c59263fa5ec7283f312693f43060b341a375af6b2770d475f25f",
+    "tests/reports/2026-10-29-marketplace-live-recovery.md":
+        "5d859fdaaed0ad0c191a81e3bc9f50d6085b591cbf9c536ee2c4185109373577",
+    "tests/reports/2026-10-29-price-offer-and-inbox-response-recovery.md":
+        "5390edcbc875d3fe40ad6772ff3d10f11ec7f2a8152946f79b4f368672a30396",
+    "tests/reports/2026-10-29-production-preview-schema-diff.md":
+        "56ba1fa718234aca710fac5d500d968bf8c28a4f13fb7322ba02f47fab5dfd6d",
+    "tests/reports/2026-10-31-collector-review-starting-audit.md":
+        "5fad110aa925a7f81e8814fa149348fcad6420f93a626b38bf12f53a7be28dfb",
+    "tests/reports/2026-10-31-t3-5-accepted-deal-inbox-blocker.md":
+        "4e798c562cffcbb7b18e93f196abcc5667e51e543a16db120d489cc7115b8d7c",
+}
 # The flagged strings in these specific blobs are existing tracked source paths
 # in the workflows' push path lists. Values pin the raw file and finding count.
 _WORKFLOW_REFERENCES = {
@@ -56,12 +88,28 @@ _WORKFLOW_REFERENCES = {
         ("a8a482516e82732c105c5c9c0dfa9b76a372b70fc181895c8fb0965bac29adaa", 1),
     "1f4a24f5a1f1547d0f6ae980ba59832c59481af6de6143e2677a1153125a3c55":
         ("0cf0d0663564437959ca63acef0baad71396a7ae84aca81c0a26af7d4a7241b5", 1),
+    "9ce894af1f77f70ea6386a9932000f8ce7c7cf090fade80230a68239175ab041":
+        ("3a4f41a423c88b312bcd7f365b1067946bec22d026bd6cd92057d15d2c01f7e0", 1),
+    "5c9063c003b40be71465c969fb558d27077baac19ae3f912265dee46f1b2ca52":
+        ("f3b9a5b9090ab4886be367947d9b56f81a5d355361732b4b9ca21a74d848b449", 1),
+    "ce70f4247238e16fdae6bd006c0e6a382aabb0d3f040caa4f1b3e3b5b8d273f3":
+        ("97e3fc695eba8f82868484e36e0ea44eef538c2a157a1ca2903dbdd9b399d9d8", 1),
+    "465c69f1dd9cc3d411b1baf4417df0e6d9fde83229c57dea1e2b37ac0deccc57":
+        ("70fcc0d47d4bc2266cf09bb761c748dfbab5e1965fea41439f1804d84241f0f6", 1),
+    "9283c45b2878c52b55779a998a59c82414b557944787cbd6f27d7c6990b8daab":
+        ("2334193ab9789bab689662a8a80138cd4413b3f647b064c646b2aadba30fd231", 1),
+    "ffb5ba7906004bcf1b3141799ed1317b7758eb9a57a71616495e7473199a5162":
+        ("68efd952903bb65c7f0bb8ff0fb6b3a3138388827e617e3c2c635b9b57838d05", 1),
 }
 # The handoff report references another tracked Markdown file by name.
 _REPORT_REFERENCES = {
     "9357c2eb7127884f672e6660836e38100a1661073884126613eecb06bbe4f2f2":
         ("a4ad65fa90ba7212627215563bf35a72fd7dab3aae19243d2a2e36c9212deb94", 1),
 }
+# The scanner's single assignment finding is a computed process.env lookup,
+# with no literal credential in the assignment. Bind the whole reviewed blob.
+_ENV_REFERENCE_PATH = "tests/e2e/accounts.spec.js"
+_ENV_REFERENCE_BLOB = "08b82d174a465a103d82db6c13ad81484d5795883e83bec6d542c69acab11f68"
 _MIGRATION_BLOBS = {
     "f92c89f31e4a8bf48adf8c9956d0794dfe0ffac1f5ea61d166748b8a6b83e93b":
         "dd9820c891621132252561cb8c87a62574861c60b72eb41d0c57ed46f18cc3f3",
@@ -110,8 +158,9 @@ def path_admitted(tree, path, data):
         return True
     if tree != _REVIEWED_TREE or set(flags) != {"random-string"}:
         return False
-    if path == _LOCAL_TEST_WORKFLOW:
-        return hashlib.sha256(data).hexdigest() == _LOCAL_TEST_WORKFLOW_BLOB
+    filename_pin = _WORKFLOW_FILENAMES.get(path) or _FILENAME_ONLY.get(path)
+    if filename_pin is not None:
+        return hashlib.sha256(data).hexdigest() == filename_pin
     if _reviewed_reference(tree, path, data) is not None:
         return True
     if _MIGRATION_PATH.fullmatch(path):
@@ -146,6 +195,9 @@ def content_refusal(data, *, tree="", path=""):
     if "\0" in decoded:
         return "binary"
     findings = redact.redact(decoded)[1]
+    if (findings == {"secret-assignment": 1} and tree == _REVIEWED_TREE
+            and path == _ENV_REFERENCE_PATH and hashlib.sha256(data).hexdigest() == _ENV_REFERENCE_BLOB):
+        return None
     if findings and findings != {"random-string": _reviewed_reference(tree, path, data)}:
         return "sensitive"
     return None

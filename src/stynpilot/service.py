@@ -420,6 +420,7 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
         raise ConfigError("not_provisioned_or_state_missing_owner_must_run_provision_or_restore")
     revocations = RevocationFile(state / "revoked-clients.json")
     revocations.revoked()                                  # must be readable and trusted, or we don't start
+    revocations.enable_archive_fence()
     store = RequestStore(state / "requests.sqlite3", clock=clock)
     broker = broker or BrokerClient(config.broker_socket)
     service_vault = [None]                                  # the owner vault, once it exists (the approval flow needs it later)

@@ -82,6 +82,8 @@ class FakeBroker:
             return {"workspaces": [{"name": w, "enrolled_at": 1} for w in self.workspaces]}
         if call == "lab_enrollment":
             return {"enrolled": False, "ready": True, "repository": args["repository"]}
+        if call == "workspace_access_revision":
+            return {"workspace_revision": "b" * 64}
         if call == "inference_claim_status":
             return {"claim": getattr(self, "inference_claim", None)}
         if call == "inference_claim":
@@ -172,6 +174,7 @@ class RunnerToolTests(unittest.TestCase):
         self.assertEqual(manifest["api_version"], 1)
         operations = {op["name"]: op for op in manifest["operations"]}
         self.assertEqual(operations["dev-lab.request-enrollment"]["permission"], "YELLOW")
+        self.assertEqual(operations["workspace.request-deckplay-access"]["permission"], "YELLOW")
         self.assertFalse(operations["dev-lab.evidence"]["input_schema"]["additionalProperties"])
         self.assertEqual(invoke("workspace.list", {}, "readonly"), self.call("workspace_list", self.d(), "readonly"))
         self.broker.calls.clear()
@@ -184,6 +187,9 @@ class RunnerToolTests(unittest.TestCase):
         self.assertFalse(invoke("workspace.list", {}, version=2)["ok"])
         self.assertFalse(invoke("dev-lab.evidence", {"job_id": "a" * 32}, "readonly")["ok"])
         self.assertFalse(invoke("dev-lab.request-enrollment", {"repository": "bam5693/stynpilot"}, "readonly")["ok"])
+        access = {"name": "deckplay-hq", "client_ids": ["claude-connector"]}
+        self.assertFalse(invoke("workspace.request-deckplay-access", access, "readonly")["ok"])
+        self.assertFalse(invoke("workspace.request-deckplay-access", {**access, "name": "stynpilot"})["ok"])
         self.assertEqual(self.broker.calls, [])
         self.assertTrue(invoke("dev-lab.evidence", {"job_id": "a" * 32}, "claude")["ok"])
         self.assertEqual(self.broker.calls[-1], ("lab_job_output", {"client": "claude-connector", "job": "a" * 32,
@@ -191,6 +197,10 @@ class RunnerToolTests(unittest.TestCase):
         pending = invoke("dev-lab.request-enrollment", {"repository": "bam5693/stynpilot"})["result"]
         self.assertEqual(pending["state"], "pending")
         self.assertFalse(pending["approved_by_ai"])
+        share = invoke("workspace.request-deckplay-access", access)["result"]
+        self.assertEqual(share["state"], "pending")
+        self.assertFalse(share["approved_by_ai"])
+        self.assertEqual(self.store.payload(share["request_id"])["workspace_revision"], "b" * 64)
 
     def test_existing_http_client_discovers_an_added_operation_with_same_tool_catalog(self):
         from contextlib import AsyncExitStack
@@ -200,7 +210,7 @@ class RunnerToolTests(unittest.TestCase):
 
         register = capabilities.register
         def earlier(server, *, operations, **kwargs):
-            register(server, operations=tuple(op for op in operations if op.name != "dev-lab.evidence"), **kwargs)
+            register(server, operations=tuple(op for op in operations if op.name != "workspace.deckplay-checkout-preview"), **kwargs)
 
         with patch.object(capabilities, "register", side_effect=earlier):
             old = self.make_server().streamable_http_app()
@@ -225,11 +235,12 @@ class RunnerToolTests(unittest.TestCase):
                         result = await rpc("tools/call", {"name": name, "arguments": self.d(**args)})
                         return result.get("structuredContent") or json.loads(result["content"][0]["text"])
                     names = await rpc("tools/list", {})
-                    args = dict(operation="dev-lab.evidence", version=1, arguments={"job_id": "a" * 32})
+                    args = dict(operation="workspace.deckplay-checkout-preview", version=1,
+                                arguments={"archive_id": "a" * 32, "ref": "refs/heads/main", "commit": "b" * 40})
                     self.assertFalse((await tool("stynpilot_invoke", **args))["ok"])
                     current = new
                     discovered = await tool("stynpilot_capabilities")
-                    self.assertIn("dev-lab.evidence", [entry["name"] for entry in discovered["result"]["operations"]])
+                    self.assertIn(args["operation"], [entry["name"] for entry in discovered["result"]["operations"]])
                     self.assertTrue((await tool("stynpilot_invoke", **args))["ok"])
                     self.assertEqual(await rpc("tools/list", {}), names)
         asyncio.run(exercise())

@@ -190,6 +190,27 @@ def main():
         else:
             raise AssertionError("Original history reached the working repository")
     print("STYNPILOT_PACKAGED_DECKPLAY_CHECKOUT_OK", flush=True)
+    old_deb = Path(__file__).with_name("dev30.deb")
+    if old_deb.is_file():
+        payload = Path(__file__).parent / "repo"
+        current_deb, = payload.glob("stynpilot_*.deb")
+        assert fixture.command("systemctl", "show", "--property=DropInPaths", "--value",
+                               "stynpilot-installer.service").endswith("60-stynpilot-private-floor.conf")
+        fixture.command("systemctl", "stop", "stynpilot-installer.service")
+        fixture.command("dpkg", "-i", "--force-downgrade", str(old_deb))
+        assert fixture.command("dpkg-query", "-W", "-f=${Version}", "stynpilot") == "0.1.0~dev30"
+        fixture.command("systemctl", "daemon-reload")
+        denied = subprocess.run(["systemctl", "start", "stynpilot-installer.service"], capture_output=True, timeout=30)
+        assert denied.returncode != 0
+        assert subprocess.run(["systemctl", "is-active", "--quiet", "stynpilot-installer.service"]).returncode != 0
+        assert not Path(fixture.SOCKET).exists()
+        assert (workspace / "README").is_file()
+        fixture.command("systemctl", "stop", "stynpilot-installer.service")
+        fixture.command("dpkg", "-i", str(current_deb))
+        fixture.command("systemctl", "daemon-reload")
+        fixture.command("systemctl", "start", "stynpilot-installer.service")
+        fixture.until(lambda: Path(fixture.SOCKET).exists(), 30)
+        print("STYNPILOT_PACKAGED_PRIVATE_DOWNGRADE_FENCE_OK", flush=True)
 
 
 if __name__ == "__main__":

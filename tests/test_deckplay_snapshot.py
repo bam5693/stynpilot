@@ -119,6 +119,47 @@ class DeckPlaySnapshotTests(unittest.TestCase):
         self.assertFalse(bundle.exists())
         self.assertEqual(self.store.history("scope.chatgpt", archive_id, commit)["items"][0]["parents"], [self.old])
 
+    def test_materialization_rechecks_exact_reference_pins_with_tree_and_path(self):
+        path = ".github/workflows/t4-synthetic-long-tracked-migration.yml"
+        blob = b"      - 'tests/reports/2026-10-28-competitive-advantage-roadmap.md'\n"
+        target = self.working / path
+        target.parent.mkdir(parents=True)
+        target.write_bytes(blob)
+        self.git("add", ".")
+        self.git("commit", "-qm", "test reference")
+        archive_id, commit = self.adopt()
+        tree = self.git("rev-parse", "HEAD^{tree}")
+        pins = {hashlib.sha256(path.encode()).hexdigest(): (hashlib.sha256(blob).hexdigest(), 1)}
+        projects = self.root / "StyNpilot-Projects"
+        workspace = projects / "deckplay-hq"
+        workspace.mkdir(parents=True)
+        request = {"home": str(self.root), "projects": str(projects), "name": "deckplay-hq",
+                   "client": "scope.chatgpt", "archive_id": archive_id, "ref": "refs/heads/main", "commit": commit}
+        with (patch.object(deckplay_snapshot, "_REVIEWED_TREE", tree),
+              patch.object(deckplay_snapshot, "_WORKFLOW_REFERENCES", pins),
+              patch.object(projects_helper, "_deckplay_archive", return_value=self.store)):
+            preview = projects_helper.op_deckplay_snapshot_preview(request)
+            self.assertTrue(preview["plan"]["eligible"])
+            bound = {**request, "plan_sha256": preview["plan_sha256"]}
+            with patch.object(deckplay_snapshot, "_WORKFLOW_REFERENCES", {}):
+                with self.assertRaisesRegex(projects_helper.Refuse, "snapshot_plan_changed"):
+                    projects_helper._deckplay_checkout(bound, str(workspace))
+            self.assertFalse(list(workspace.iterdir()))
+            projects_helper._deckplay_checkout(bound, str(workspace))
+            self.assertEqual((workspace / path).read_bytes(), blob)
+
+    def test_environment_lookup_pin_accepts_only_the_one_reviewed_assignment(self):
+        path = deckplay_snapshot._ENV_REFERENCE_PATH
+        tree = "a" * 40
+        blob = b"const password=process.env[passwordKey];\n"
+        with (patch.object(deckplay_snapshot, "_REVIEWED_TREE", tree),
+              patch.object(deckplay_snapshot, "_ENV_REFERENCE_BLOB", hashlib.sha256(blob).hexdigest())):
+            self.assertEqual(redact.redact(blob.decode())[1], {"secret-assignment": 1})
+            self.assertIsNone(deckplay_snapshot.content_refusal(blob, tree=tree, path=path))
+            self.assertEqual(deckplay_snapshot.content_refusal(blob, tree=tree, path="other.js"), "sensitive")
+            self.assertEqual(deckplay_snapshot.content_refusal(blob + b"password=fixture\n", tree=tree, path=path),
+                             "sensitive")
+
     def test_stage_publication_keeps_original_ancestry_out_of_the_working_copy(self):
         archive_id, commit = self.adopt()
         args = (self.store, "scope.chatgpt", archive_id, "refs/heads/main", commit)

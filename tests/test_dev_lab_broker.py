@@ -13,6 +13,7 @@ from stynpilot import backup, managed_activity, root_restore, vault
 from stynpilot.broker import lab
 from stynpilot.broker.executor import Executor, Runs
 from stynpilot.broker.jobs import JobError, JobRunner, LocalBackend
+from stynpilot.broker.private_floor import FloorError
 from stynpilot.broker.release_authority import Authority, AuthorityError
 from stynpilot.broker.service import BrokerService
 from stynpilot.ledger import InstallLedger
@@ -44,6 +45,8 @@ class LabBrokerTests(unittest.TestCase):
                                 memory=lambda: 10 << 30)
         self.executor = Executor(state_dir=self.root, owner="owner", device=DEVICE, verifier=Mock(),
                                  require_root=False, lab_jobs=self.jobs, passkeys=Mock())
+        self.executor._install_private_floor = Mock()
+        self.executor._private_floor_ready = lambda: True
         self.addCleanup(lambda: os.close(self.executor._alive))
         self.service = BrokerService(socket_path=self.root / "socket", executor=self.executor, allowed_uid=1)
 
@@ -154,6 +157,18 @@ class LabBrokerTests(unittest.TestCase):
         self.addCleanup(reopened._db.close)
         self.assertFalse(reopened.workspace_allowed(workspace, "assistant"))
         self.assertFalse(reopened._db.execute("SELECT * FROM workspace_clients").fetchall())
+
+    def test_private_approval_cannot_change_state_before_the_floor_is_verified(self):
+        self.executor.jobs = Mock()
+        self.executor.repositories = Mock()
+        self.executor._install_private_floor.side_effect = FloorError
+        for payload in ({"action": "deckplay_checkout"}, {"action": "repository_authorize"},
+                        {"action": "workspace_access", "workspace_clients": ["assistant"]}):
+            with self.subTest(action=payload["action"]), self.assertRaisesRegex(
+                    JobError, "private_access_version_floor_unverified"):
+                self.executor._runner_do(payload)
+        self.assertFalse(self.executor.jobs.mock_calls)
+        self.assertFalse(self.executor.repositories.mock_calls)
 
     def test_only_verified_commit_and_digest_from_the_enrolled_repository_can_start(self):
         self.assertEqual(self.start()["error"], "lab_enrollment_required")

@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from .. import managed_activity
+from ..server.clients import ARCHIVE_AUTHORITY
 
 HELPER = str(Path(__file__).resolve().parent.parent / "projects_helper.py")
 DEFAULT_TIMEOUT = 120          # walks over big workspaces; the measurement the disk watchdog uses asks for much less
@@ -75,6 +76,7 @@ class SystemdHelper:
             f"ReadWritePaths=/run/{runtime}/archives",
             f"BindPaths={state / 'repository-archives'}:/run/{runtime}/archives",
             f"BindReadOnlyPaths={dispatch_dir}:/run/{runtime}/dispatch",
+            f"BindReadOnlyPaths={state / ARCHIVE_AUTHORITY}:/run/{runtime}/client-authority",
         )
         command = ["/usr/bin/systemd-run", "--pipe", "--wait", "--collect", "--quiet",
                    "--service-type=exec", "--unit=" + unit]
@@ -111,6 +113,8 @@ class SystemdHelper:
                     "-p", "CPUQuota=200%", "-p", "LimitFSIZE=64M", "-p", "KillMode=control-group", "-p", "UMask=0077"]
         if operation in ("deckplay_snapshot_preview", "deckplay_snapshot_checkout"):
             cmd += ["-p", "LimitCORE=0", "-p", "TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size=256M,mode=1777"]
+        if operation == "archive_client_active":
+            cmd += ["-p", "LimitCORE=0", "-p", "MemoryMax=64M", "-p", "TasksMax=8", "-p", "PrivateDevices=yes"]
         cmd += ["--", self.python, "-IB", "-X", "pycache_prefix=/usr/lib/stynpilot/.source-only", HELPER, json.dumps(request)]
         try:
             done = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout + SLACK, env=_ENV, check=False)

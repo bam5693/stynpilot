@@ -93,6 +93,7 @@ class Jobs:
         free = os.statvfs(self.path)
         if free.f_bavail * free.f_frsize < _MIN_FREE or free.f_favail < 1024:
             raise repo_archive.ArchiveError("archive_intake_insufficient_headroom")
+        self._require_active_client(client)
         binding = self.authorization.begin_fetch(client, repository, seconds=DEADLINE)
         access = {"repository": repository,
                   "authorization_profile": self.authorization.describe(repository)["authorization_profile"]}
@@ -118,6 +119,15 @@ class Jobs:
     def _permit(self, job):
         return self._folder(job) / "dispatch" / "permit.json"
 
+    def _require_active_client(self, client):
+        request = {"op": "archive_client_active", "home": self.home, "client": client}
+        try:
+            status = self.helper.call(request, timeout=3)
+        except (OSError, HelperError):
+            raise repo_archive.ArchiveError("archive_client_authority_unavailable") from None
+        if status.get("active") is not True:
+            raise repo_archive.ArchiveError("archive_client_authorization_withdrawn")
+
     def _dispatch(self, job, binding, captured, access):
         # A concurrent revoke or cancellation cannot publish an older grant.
         for _ in range(20):
@@ -127,6 +137,7 @@ class Jobs:
                     if (self._read(job)["state"] != "running"
                             or managed_activity.current(self.state) != {"job_id": job, "kind": KIND}):
                         raise repo_archive.ArchiveError("archive_job_cancelled")
+                    self._require_active_client(binding.client)
                     permit = self._permit(job)
                     permit.parent.mkdir(mode=0o755)
                     receipt = {"op": "archive_receive", "job": job, "client": binding.client,
@@ -214,6 +225,11 @@ class Jobs:
                 except AuthorizationError as error:
                     if error.code == "repository_authorization_busy":
                         return
+                    reason = "authorization_withdrawn"
+            if reason is None:
+                try:
+                    self._require_active_client(row["client"])
+                except repo_archive.ArchiveError:
                     reason = "authorization_withdrawn"
             if reason is None:
                 return

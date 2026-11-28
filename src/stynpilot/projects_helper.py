@@ -481,7 +481,7 @@ def _materialize_checkout(request, path, commit, data, origin, expected_tree=Non
                     with os.fdopen(os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), "rb") as stream:
                         value = stream.read(int(size) + 1)
                     if (not deckplay_snapshot.path_admitted(expected_tree, name, value)
-                            or deckplay_snapshot.content_refusal(value)):
+                            or deckplay_snapshot.content_refusal(value, tree=expected_tree, path=name)):
                         raise Refuse("snapshot_content_refused")
                     digest = hashlib.sha1(b"blob " + size + b"\0" + value).hexdigest().encode("ascii")
                     if digest != oid or bool(info.st_mode & stat.S_IXUSR) != (mode == b"100755"):
@@ -627,6 +627,18 @@ def _deckplay_checkout(request, path):
     return {"workspace": repo_git.DECKPLAY_WORKSPACE, "receipt": receipt}
 
 
+@contextmanager
+def _archive_client_publication(authority, client):
+    with archive_publication.lock(authority):
+        try:
+            revoked = RevocationFile(authority / "revoked-clients.json")._read_current()
+        except ClientDenied as error:
+            raise repo_archive.ArchiveError(error.code) from None
+        if client in revoked:
+            raise repo_archive.ArchiveError("archive_client_authorization_withdrawn")
+        yield
+
+
 def op_archive_receive(request):
     fields = {"op", "job", "client", "manifest_sha256", "bundle_sha256", "repository_access"}
     if set(request) != fields or type(request["job"]) is not str or not re.fullmatch(r"[a-f0-9]{32}", request["job"]):
@@ -651,7 +663,8 @@ def op_archive_receive(request):
 
     @contextmanager
     def publication_guard():
-        with archive_publication.lock(runtime / "dispatch") as directory:
+        with (archive_publication.lock(runtime / "dispatch") as directory,
+              _archive_client_publication(runtime / "client-authority", request["client"])):
             require_dispatch(directory)
             yield
 
@@ -663,12 +676,26 @@ def op_archive_receive(request):
             client=request["client"], publication_guard=publication_guard, repository_access=request["repository_access"])
     except repo_archive.ArchiveError as error:
         raise Refuse(error.code) from None
+    except OSError:
+        raise Refuse("archive_client_authority_unavailable") from None
+
+
+def op_archive_client_active(request):
+    if (set(request) != {"op", "home", "client"} or type(request["client"]) is not str
+            or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request["client"])):
+        raise Refuse("archive_client_invalid")
+    path = Path(request["home"]) / ".local/state/stynpilot/revoked-clients.json"
+    try:
+        return {"active": request["client"] not in RevocationFile(path).revoked()}
+    except ClientDenied as error:
+        raise Refuse(error.code) from None
 
 
 OPS = {"prepare": op_prepare, "check": op_check, "home_names": op_home_names, "disk": op_disk, "enroll": op_enroll,
        "grant": op_grant, "unenroll": op_unenroll, "protected": op_protected, "import_checkout": op_import_checkout,
        "deckplay_snapshot_preview": op_deckplay_snapshot_preview, "deckplay_snapshot_checkout": op_deckplay_snapshot_checkout,
-       "deckplay_checkout_cleanup": op_deckplay_checkout_cleanup, "archive_receive": op_archive_receive}
+       "deckplay_checkout_cleanup": op_deckplay_checkout_cleanup, "archive_receive": op_archive_receive,
+       "archive_client_active": op_archive_client_active}
 
 
 def main(argv):

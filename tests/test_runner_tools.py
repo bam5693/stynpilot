@@ -80,6 +80,8 @@ class FakeBroker:
                     "selftest": {"ran": self.gate, "ok": self.gate}}
         if call == "workspaces":
             return {"workspaces": [{"name": w, "enrolled_at": 1} for w in self.workspaces]}
+        if call == "lab_enrollment":
+            return {"enrolled": False, "ready": True, "repository": args["repository"]}
         if call == "inference_claim_status":
             return {"claim": getattr(self, "inference_claim", None)}
         if call == "inference_claim":
@@ -117,19 +119,21 @@ class RunnerToolTests(unittest.TestCase):
         (self.projects / "app").mkdir(parents=True)
         (self.projects / "other").mkdir()
         self.broker = FakeBroker()
-        from contextlib import nullcontext
         from unittest.mock import Mock
         self.lab_probe = Mock(return_value={"launch_enabled": False, "preflight_checks_passed": True})
         self.readiness = Mock(return_value={"resource_checks_passed": True})
         self.limiter = RateLimit(per_minute=1000)
         self.router, self.clients = router, clients
-        self.server = create_server(router=router, resource_url=AUDIENCE,
-                                    propose=dict(clients=clients, store=self.store, approval_url="https://ryzen.example.test/app",
-                                                 clock=lambda: self.now[0]),
-                                    runner=dict(broker=self.broker, projects_dir=str(self.projects), clock=lambda: self.now[0],
-                                                limiter=self.limiter, lab_probe=self.lab_probe,
-                                                inference_readiness_probe=self.readiness,
-                                                inference_worker_lease=nullcontext))
+        self.server = RunnerToolTests.make_server(self)
+
+    def make_server(self):
+        from contextlib import nullcontext
+        return create_server(router=self.router, resource_url=AUDIENCE, allowed_hosts=["ryzen.example.test"],
+                             propose=dict(clients=self.clients, store=self.store, approval_url="https://ryzen.example.test/app",
+                                          clock=lambda: self.now[0]),
+                             runner=dict(broker=self.broker, projects_dir=str(self.projects), clock=lambda: self.now[0],
+                                         limiter=self.limiter, lab_probe=self.lab_probe, inference_readiness_probe=self.readiness,
+                                         inference_worker_lease=nullcontext))
 
     def call(self, name, arguments, token="chatgpt"):
         who = Tokens.valid[token]
@@ -159,6 +163,76 @@ class RunnerToolTests(unittest.TestCase):
         self.assertLessEqual(RUNNER_WRITE_TOOLS, PROPOSE_ONLY_TOOLS)
         for reader in ("runner_status", "workspace_list", "workspace_files", "workspace_read", "jobs_list", "job_status", "job_output"):
             self.assertNotIn(reader, RUNNER_WRITE_TOOLS)
+
+    def test_capabilities_keep_legacy_permissions_and_validate_exact_input(self):
+        def invoke(operation, arguments, token="chatgpt", version=1):
+            return self.call("stynpilot_invoke", self.d(operation=operation, arguments=arguments, version=version), token)
+
+        manifest = self.call("stynpilot_capabilities", self.d(), "readonly")["result"]
+        self.assertEqual(manifest["api_version"], 1)
+        operations = {op["name"]: op for op in manifest["operations"]}
+        self.assertEqual(operations["dev-lab.request-enrollment"]["permission"], "YELLOW")
+        self.assertFalse(operations["dev-lab.evidence"]["input_schema"]["additionalProperties"])
+        self.assertEqual(invoke("workspace.list", {}, "readonly"), self.call("workspace_list", self.d(), "readonly"))
+        self.broker.calls.clear()
+        for operation, arguments, code in (
+                ("dev-lab.evidence", {"job_id": "a" * 32, "limit": "10"}, "capability_arguments_invalid"),
+                ("dev-lab.evidence", {"job_id": "a" * 32, "client": "claude-connector"}, "capability_arguments_invalid"),
+                ("dev-lab.evidence", {"job_id": "a" * 32, "offset": False}, "capability_arguments_invalid"),
+                ("job_run", {}, "capability_unknown_or_version_unsupported")):
+            self.assertEqual(invoke(operation, arguments)["error"], code)
+        self.assertFalse(invoke("workspace.list", {}, version=2)["ok"])
+        self.assertFalse(invoke("dev-lab.evidence", {"job_id": "a" * 32}, "readonly")["ok"])
+        self.assertFalse(invoke("dev-lab.request-enrollment", {"repository": "bam5693/stynpilot"}, "readonly")["ok"])
+        self.assertEqual(self.broker.calls, [])
+        self.assertTrue(invoke("dev-lab.evidence", {"job_id": "a" * 32}, "claude")["ok"])
+        self.assertEqual(self.broker.calls[-1], ("lab_job_output", {"client": "claude-connector", "job": "a" * 32,
+                                                                   "offset": 0, "limit": 8192}))
+        pending = invoke("dev-lab.request-enrollment", {"repository": "bam5693/stynpilot"})["result"]
+        self.assertEqual(pending["state"], "pending")
+        self.assertFalse(pending["approved_by_ai"])
+
+    def test_existing_http_client_discovers_an_added_operation_with_same_tool_catalog(self):
+        from contextlib import AsyncExitStack
+        from unittest.mock import patch
+        import httpx
+        from stynpilot.server import capabilities
+
+        register = capabilities.register
+        def earlier(server, *, operations, **kwargs):
+            register(server, operations=tuple(op for op in operations if op.name != "dev-lab.evidence"), **kwargs)
+
+        with patch.object(capabilities, "register", side_effect=earlier):
+            old = self.make_server().streamable_http_app()
+        new = self.server.streamable_http_app()
+
+        async def exercise():
+            current = old
+            async def app(scope, receive, send):
+                await current(scope, receive, send)
+            headers = {"Authorization": "Bearer chatgpt", "Accept": "application/json, text/event-stream",
+                       "MCP-Protocol-Version": "2025-03-26"}
+            async with AsyncExitStack() as contexts:
+                for entry in (old, new):
+                    await contexts.enter_async_context(entry.router.lifespan_context(entry))
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                             base_url="https://ryzen.example.test", headers=headers) as client:
+                    async def rpc(method, params):
+                        reply = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+                        reply.raise_for_status()
+                        return reply.json()["result"]
+                    async def tool(name, **args):
+                        result = await rpc("tools/call", {"name": name, "arguments": self.d(**args)})
+                        return result.get("structuredContent") or json.loads(result["content"][0]["text"])
+                    names = await rpc("tools/list", {})
+                    args = dict(operation="dev-lab.evidence", version=1, arguments={"job_id": "a" * 32})
+                    self.assertFalse((await tool("stynpilot_invoke", **args))["ok"])
+                    current = new
+                    discovered = await tool("stynpilot_capabilities")
+                    self.assertIn("dev-lab.evidence", [entry["name"] for entry in discovered["result"]["operations"]])
+                    self.assertTrue((await tool("stynpilot_invoke", **args))["ok"])
+                    self.assertEqual(await rpc("tools/list", {}), names)
+        asyncio.run(exercise())
 
     # -- asking the owner --------------------------------------------------------------------------------
     def test_setup_and_authorization_requests_are_filed_for_the_owner_only(self):
@@ -244,10 +318,12 @@ class RunnerToolTests(unittest.TestCase):
         self.authorize("app")
         out = self.call("job_run", self.d(workspace_name="app", recipe="git-status", args=["--x"]))
         self.assertTrue(out["ok"], out)
-        self.assertEqual(self.broker.calls[-1], ("run", {"workspace": "app", "recipe": "git-status", "args": ["--x"]}))
+        self.assertEqual(self.broker.calls[-1], ("run", {"workspace": "app", "recipe": "git-status", "args": ["--x"],
+                                                        "client": "chatgpt-connector"}))
         self.assertTrue(self.call("job_status", self.d(job_id="a" * 32))["ok"])
         self.assertTrue(self.call("job_output", self.d(job_id="a" * 32, offset=10, limit=100))["ok"])
-        self.assertEqual(self.broker.calls[-1], ("job_output", {"job_id": "a" * 32, "offset": 10, "limit": 100}))
+        self.assertEqual(self.broker.calls[-1], ("job_output", {"job_id": "a" * 32, "offset": 10, "limit": 100,
+                                                            "client": "chatgpt-connector"}))
         self.assertTrue(self.call("job_cancel", self.d(job_id="a" * 32))["ok"])
         self.assertEqual(self.call("job_run", self.d(workspace_name="other", recipe="git-status"))["error"], "workspace_not_authorized")
 

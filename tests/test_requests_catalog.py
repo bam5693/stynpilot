@@ -92,6 +92,25 @@ class RequestStoreTests(unittest.TestCase):
         self.assertEqual((first["state"], first["requested_by"], first["approved_by_ai"]), ("pending", "chatgpt", False))
         self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
+    def test_checkout_and_workspace_grant_requests_are_client_and_plan_scoped(self):
+        for action in ("deckplay_checkout", "workspace_access"):
+            def file(proposer, audience, expiry):
+                return self.store.submit(kind="runner", software=action, device=DEVICE, owner=OWNER,
+                                         proposer=proposer, payload={"action": action, "client": proposer.client,
+                                         "workspace_clients": audience, "expires_at": str(expiry)},
+                                         summary=["DeckPlay"], expires=expiry)
+            first, created = file(self.chatgpt, [self.chatgpt.client], 5000)
+            self.assertTrue(created)
+            self.assertEqual(file(self.chatgpt, [self.chatgpt.client], 6000), (first, False))
+            other, created = file(self.claude, [self.chatgpt.client], 5000)
+            self.assertTrue(created)
+            self.assertNotEqual(first["request_id"], other["request_id"])
+            self.assertTrue(file(self.chatgpt, sorted([self.chatgpt.client, self.claude.client]), 5000)[1])
+            self.assertEqual(self.store.status(first["request_id"], owner=OWNER, device=DEVICE,
+                                               client=self.chatgpt.client), first)
+            with self.assertRaisesRegex(RequestError, "unknown_request"):
+                self.store.status(first["request_id"], owner=OWNER, device=DEVICE, client=self.claude.client)
+
     def test_status_for_the_same_owner_only(self):
         rid = self.submit({"p": 1})[0]["request_id"]
         self.assertEqual(self.store.status(rid, owner=OWNER, device=DEVICE)["state"], "pending")

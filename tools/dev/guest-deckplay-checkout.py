@@ -101,6 +101,12 @@ def main():
         assert approve(ok("commander_request_workspace_authorization", name="deckplay-hq")["request_id"])["state"] == "done"
         test = ok("runner_selftest")
         assert len(test["passed"]) == 21 and not test["failed"] and not test["unverified"], test
+        capabilities = ok("stynpilot_capabilities")
+        assert capabilities["api_version"] == 1
+        assert "workspace.list" in {entry["name"] for entry in capabilities["operations"]}
+        assert ok("stynpilot_invoke", operation="workspace.list", version=1, arguments={}) == ok("workspace_list")
+        assert call("stynpilot_invoke", operation="workspace.list", version=1,
+                    arguments={"client": "fixture-other"})["error"] == "capability_arguments_invalid"
         interrupt = "a" * 32
         scratch = workspace.parent / (".stynpilot-deckplay-checkout-" + interrupt)
         fixture.as_owner("mkdir", "-m", "700", str(scratch))
@@ -140,6 +146,28 @@ def main():
         assert not (fixture.STATE / "managed-activity").exists()
         assert (workspace / "README").read_text() == "reviewed tree\n" and not (workspace / ".env").exists()
         assert call("deckplay_checkout_preview", **args)["error"] == "checkout_workspace_not_empty"
+
+        def private_visible(client, *, starting=False):
+            reply = call("workspace_list", client=client)
+            if starting and reply.get("error") == "installer_unavailable":
+                return False
+            assert reply["ok"], reply
+            return any(row["name"] == "deckplay-hq" for row in reply["result"]["workspaces"])
+
+        assert private_visible("fixture") and not private_visible("fixture-other")
+        assert call("workspace_read", client="fixture-other", workspace_name="deckplay-hq",
+                    path="README")["error"] == "workspace_not_authorized"
+        share = ok("commander_request_workspace_authorization", name="deckplay-hq",
+                   client_ids=["fixture", "fixture-other"])
+        assert approve(share["request_id"], required=True)["state"] == "done"
+        assert private_visible("fixture-other")
+        fixture.command("systemctl", "restart", "stynpilot-installer.service")
+        assert fixture.until(lambda: private_visible("fixture-other", starting=True), 35)
+        unshare = ok("commander_request_workspace_authorization", name="deckplay-hq", client_ids=["fixture"])
+        assert approve(unshare["request_id"], required=True)["state"] == "done"
+        assert not private_visible("fixture-other")
+        marker = json.loads((workspace / ".git" / "stynpilot-checkout.json").read_text())
+        assert marker["source_commit"] == new and marker["plan_sha256"] == plan["plan_sha256"]
 
         def git(*arguments):
             return fixture.as_owner("/usr/bin/git", "-C", str(workspace), *arguments).stdout.strip()

@@ -377,7 +377,7 @@ def _path(path):
         raise git.ArchiveError("archive_path_invalid")
 
 
-def _safe_path(path):
+def _unprotected_path(path):
     try:
         _path(path)
         parts = tuple(path.lower().split("/"))
@@ -388,7 +388,11 @@ def _safe_path(path):
     if any(parts[start:start + len(location)] == location
            for start in range(len(parts)) for location in _PROTECTED_LOCATIONS):
         return False
-    return not redact.redact(path)[1]
+    return True
+
+
+def _safe_path(path):
+    return _unprotected_path(path) and not redact.redact(path)[1]
 
 
 def _tree(bare, commit):

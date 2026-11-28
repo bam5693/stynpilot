@@ -124,6 +124,8 @@ class JobRunner:
         self._db.row_factory = sqlite3.Row
         self._db.executescript("""
             create table if not exists workspaces(path text primary key, enrolled_at integer, skipped integer);
+            create table if not exists workspace_clients(workspace text not null, client text not null,
+                primary key(workspace,client));
             create table if not exists jobs(id text primary key, workspace text, recipe text, argv text, state text,
                 created integer, started integer, ended integer, exit_code integer, truncated integer default 0);""")
 
@@ -217,6 +219,7 @@ class JobRunner:
                     raise JobError("not_enrolled")
                 # The row goes FIRST: from this instant no job can start here, then the access is taken away.
                 self._db.execute("delete from workspaces where path=?", (path,))
+                self._db.execute("delete from workspace_clients where workspace=?", (path,))
             try:
                 self._ask("unenroll", name=os.path.basename(path))
             except JobError as error:
@@ -224,6 +227,25 @@ class JobRunner:
                                       "os_error_FileNotFoundError"):
                     raise
         return {"workspace": path, "removed": True}
+
+    def workspace_clients(self, path):
+        with self._lock:
+            return [row["client"] for row in self._db.execute(
+                "select client from workspace_clients where workspace=? order by client", (path,))]
+
+    def set_workspace_clients(self, path, clients):
+        """For the fixed private workspace, absence of grants always denies access."""
+        with self._ws_lock, self._lock, self._db:
+            if not self._db.execute("select 1 from workspaces where path=?", (path,)).fetchone():
+                raise JobError("workspace_not_enrolled")
+            if self._db.execute("select 1 from jobs where workspace=? and state='running'", (path,)).fetchone():
+                raise JobError("workspace_git_busy")
+            self._db.execute("begin immediate")
+            self._db.execute("delete from workspace_clients where workspace=?", (path,))
+            self._db.executemany("insert into workspace_clients VALUES (?,?)", [(path, c) for c in clients])
+
+    def workspace_allowed(self, path, client):
+        return os.path.basename(path) != repo_git.DECKPLAY_WORKSPACE or client in self.workspace_clients(path)
 
     def import_checkout(self, workspace, commit, digest, bundle):
         self.require_ready()

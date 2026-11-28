@@ -469,7 +469,8 @@ def start_owner_service(config, *, broker=None, exchange=None, start_listener=No
         flow.after_run = _owner_after_approval(lambda: service.vault)
         diag = dict(policy=safefs.Policy(home=home,
                                          project_roots=safefs.load_project_roots(state / PROJECT_ROOTS_FILE, home),
-                                         extra_deny=[config.state_dir, config.pairing_db, config.broker_socket]),
+                                         extra_deny=[config.state_dir, config.pairing_db, config.broker_socket,
+                                                     os.path.join(home, "StyNpilot-Projects", "deckplay-hq")]),
                     diagnostics=Diagnostics(), system=SystemStatus(backup_dir=config.state_dir / "backups", vault=service.vault),
                     vault=service.vault, broker=broker)
         from . import archive_store, repo_archive

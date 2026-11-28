@@ -82,12 +82,14 @@ class LabBrokerTests(unittest.TestCase):
         jobs = Mock(projects_dir=projects)
         jobs.workspaces.return_value = [{"path": projects + "/deckplay-hq"}]
         jobs.enabled.return_value = True
+        jobs.workspace_clients.return_value = []
         jobs.deckplay_snapshot.return_value = {"receipt": {"snapshot_commit": "f" * 40}}
         self.executor.jobs = jobs
         expires = (datetime.now(timezone.utc) + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
         payload = {"kind": "runner", "action": "deckplay_checkout", "name": "deckplay-hq",
                    "owner": "owner", "device": DEVICE, "client": "assistant", "plan": plan,
-                   "plan_sha256": deckplay_snapshot.plan_digest(plan), "expires_at": expires}
+                   "plan_sha256": deckplay_snapshot.plan_digest(plan), "workspace_clients": ["assistant"],
+                   "expires_at": expires}
         def challenge(p):
             return self.service.handle({"op": "challenge", "payload": p, "decision": "approve"})
         for changed in ({**payload, "plan_sha256": "0" * 64}, {**payload, "name": "stynpilot"},
@@ -109,6 +111,7 @@ class LabBrokerTests(unittest.TestCase):
             self.assertTrue(answer["result"]["ok"], answer)
         jobs.deckplay_snapshot.assert_called_once_with(projects + "/deckplay-hq", "assistant", plan["archive_id"],
                                                       plan["ref"], COMMIT, payload["plan_sha256"])
+        jobs.set_workspace_clients.assert_called_once_with(projects + "/deckplay-hq", ["assistant"])
         self.assertFalse(self.service.handle(request)["ok"])
         jobs.deckplay_snapshot.assert_called_once()
 

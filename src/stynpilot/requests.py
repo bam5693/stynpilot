@@ -7,7 +7,8 @@ the executor (G4) runs only an *approved* request's exact stored plan. This modu
 - deduplicates by *what* is asked ("install htop on this device"): while such a request
   is pending, asking again (by any assistant, at any later second) returns the original
   request with its original exact plan and original expiry. Nothing is extended or
-  re-hashed. Once it is decided or expired, a new ask files a new request;
+  re-hashed. Client-scoped workspace requests also bind the exact actor and plan.
+  Once it is decided or expired, a new ask files a new request;
 - never approves anything: there is no AI-facing way to change a request's state;
 - expires requests whose plan has expired;
 - limits each AI client to a few pending requests, so a runaway assistant can't flood
@@ -43,6 +44,7 @@ _SAFE_RESULT = ("ok", "stopped", "installed", "rollback_id", "restored", "restor
 KINDS = ("install", "rollback", "upgrade", "runner", "passkey", "release", "backup")
 MAX_PENDING_PER_CLIENT = 5
 _REQUEST_ID = re.compile(r"[a-f0-9]{64}\Z")
+_CLIENT_SCOPED = frozenset({"deckplay_checkout", "workspace_access"})
 
 
 class RequestError(Exception):
@@ -115,6 +117,11 @@ class RequestStore:
             raise RequestError("expired")
         rid, canonical = request_id(payload)
         logical = "%s|%s|%s|%s" % (kind, software, owner, device)
+        scoped = kind == "runner" and payload.get("action") in _CLIENT_SCOPED
+        if scoped:
+            if payload.get("client") != proposer.client:
+                raise RequestError("request_conflict")
+            logical += "|" + request_id({k: v for k, v in payload.items() if k != "expires_at"})[0]
         if kind == "backup" and payload.get("action") == "restore_root":
             # Different archives, security states and scopes must never return another pending request's receipt.
             logical += "|" + request_id({k: v for k, v in payload.items() if k != "expires_at"})[0]
@@ -126,7 +133,7 @@ class RequestStore:
                 return self._receipt(same), False        # original plan, original expiry
             row = db.execute("SELECT * FROM requests WHERE request_id=?", (rid,)).fetchone()
             if row is not None:
-                if row["owner"] != owner or row["device"] != device:
+                if row["owner"] != owner or row["device"] != device or (scoped and row["client"] != proposer.client):
                     raise RequestError("request_conflict")
                 return self._receipt(row), False
             pending = db.execute("SELECT COUNT(*) FROM requests WHERE client=? AND state='pending'",
@@ -139,8 +146,8 @@ class RequestStore:
                         json.dumps(summary[:16]), "pending", self.clock(), float(expires)))
             return self._receipt(db.execute("SELECT * FROM requests WHERE request_id=?", (rid,)).fetchone()), True
 
-    def status(self, request_id_value, *, owner, device):
-        """Safe status for any assistant acting for the same owner and device."""
+    def status(self, request_id_value, *, owner, device, client=None):
+        """Client-scoped requests are visible only to their filer and the owner phone flow."""
         if type(request_id_value) is not str or not _REQUEST_ID.fullmatch(request_id_value):
             raise RequestError("unknown_request")
         with self._tx() as db:
@@ -148,6 +155,9 @@ class RequestStore:
             row = db.execute("SELECT * FROM requests WHERE request_id=?", (request_id_value,)).fetchone()
         if row is None or row["owner"] != owner or row["device"] != device:
             raise RequestError("unknown_request")      # never reveal another owner's requests
+        if (client is not None and row["kind"] == "runner" and row["client"] != client
+                and json.loads(row["payload"]).get("action") in _CLIENT_SCOPED):
+            raise RequestError("unknown_request")
         return self._receipt(row)
 
     def transition(self, request_id_value, from_state, to_state, *, result=None):

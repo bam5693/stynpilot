@@ -1,5 +1,6 @@
 """Snapshot tests: archived history stays outside the working bundle."""
 import hashlib
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -48,6 +49,22 @@ class DeckPlaySnapshotTests(unittest.TestCase):
             bundle_sha256=got["bundle_sha256"], clients=["scope.chatgpt"])
         return result["archive_id"], commit
 
+    def test_admission_pins_migration_path_blob_and_tree_and_keeps_other_guards(self):
+        path = "supabase/migrations/20261127001120_sync_catalog_with_inventory_and_public_profiles.sql"
+        blob = b"select 1;\n"
+        tree = "a" * 40
+        hashes = {hashlib.sha256(path.encode()).hexdigest(): hashlib.sha256(blob).hexdigest()}
+        self.assertFalse(archive_store._safe_path(path))
+        with patch.object(deckplay_snapshot, "_MIGRATION_TREE", tree), \
+                patch.object(deckplay_snapshot, "_MIGRATION_BLOBS", hashes):
+            self.assertTrue(deckplay_snapshot.path_admitted(tree, path, blob))
+            self.assertFalse(deckplay_snapshot.path_admitted("b" * 40, path, blob))
+            self.assertFalse(deckplay_snapshot.path_admitted(tree, path, blob + b" "))
+            self.assertFalse(deckplay_snapshot.path_admitted(tree, path.replace("catalog", "schema"), blob))
+            self.assertFalse(deckplay_snapshot.path_admitted(tree, "supabase/migrations/.env", blob))
+        self.assertIsNone(deckplay_snapshot.content_refusal(blob))
+        self.assertEqual(deckplay_snapshot.content_refusal(b"password=synthetic-only"), "sensitive")
+
     def test_exact_tree_without_historical_objects(self):
         archive_id, commit = self.adopt()
         args = (self.store, "scope.chatgpt", archive_id, "refs/heads/main", commit)
@@ -95,6 +112,11 @@ class DeckPlaySnapshotTests(unittest.TestCase):
             self.assertEqual(list(projects.iterdir()), [work])
             result = projects_helper._deckplay_checkout({**request, "plan_sha256": plan["plan_sha256"]}, str(work))
             self.assertEqual(result["receipt"]["source_commit"], commit)
+            evidence = json.loads((work / ".git" / "stynpilot-checkout.json").read_bytes())
+            self.assertEqual(evidence["source_commit"], commit)
+            self.assertEqual(evidence["source_tree"], plan["plan"]["source_tree"])
+            self.assertEqual(evidence["plan_sha256"], plan["plan_sha256"])
+            self.assertEqual(evidence["snapshot_commit"], result["receipt"]["snapshot_commit"])
             self.assertEqual((work / "README").read_text(), "reviewed text\n")
             self.assertFalse((work / ".env").exists())
             self.assertEqual(repo_archive._git(work / ".git", "rev-list", "--count", "HEAD").strip(), b"1")

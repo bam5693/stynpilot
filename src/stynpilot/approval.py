@@ -115,6 +115,7 @@ class ApprovalFlow:
                     "lab_enroll": "lab_enrollment_requires_passkey",
                     "repo_push": "git_push_requires_passkey",
                     "deckplay_checkout": "deckplay_checkout_requires_passkey",
+                    "workspace_access": "workspace_access_requires_passkey",
                     "repo_credential": "repository_credential_requires_passkey"}.get(payload.get("action"))
         if payload.get("action") in ("repository_authorize", "repository_revoke", "repository_suspend", "repository_resume"):
             required = "repository_access_requires_passkey"

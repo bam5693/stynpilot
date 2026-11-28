@@ -163,6 +163,9 @@ class EnrolledClients:
             with self._lock:
                 self._memory.discard(client_id)
 
+    def active(self, client_id):
+        return client_id in self._clients and client_id not in self._revoked()
+
     def proposer(self, who):
         """``who`` is a verified Authorization. Returns a Proposer or raises ClientDenied."""
         client = getattr(who, "client", None)

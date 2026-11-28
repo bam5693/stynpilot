@@ -21,6 +21,7 @@ import errno
 import hashlib
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import stat
@@ -427,7 +428,7 @@ def op_import_checkout(request):
     return {"workspace": repo_git.WORKSPACE, "repository": "bam5693/stynpilot", "commit": commit}
 
 
-def _materialize_checkout(request, path, commit, data, origin, expected_tree=None, target_identity=None):
+def _materialize_checkout(request, path, commit, data, origin, expected_tree=None, target_identity=None, provenance=None):
     with _checkout_scratch(request) as scratch:
         bundle = os.path.join(scratch, "checkout.bundle")
         with open(bundle, "xb") as output:
@@ -469,7 +470,8 @@ def _materialize_checkout(request, path, commit, data, origin, expected_tree=Non
                     meta, raw_path = entry.split(b"\t", 1)
                     mode, kind, oid, size = meta.split()
                     name = raw_path.decode("utf-8")
-                    if not archive_store._safe_path(name) or kind != b"blob" or mode not in (b"100644", b"100755"):
+                    if (not archive_store._unprotected_path(name) or kind != b"blob"
+                            or mode not in (b"100644", b"100755") or int(size) > deckplay_snapshot.MAX_BLOB):
                         raise Refuse("snapshot_path_refused")
                     file = os.path.join(target, name)
                     info = os.lstat(file)
@@ -477,10 +479,17 @@ def _materialize_checkout(request, path, commit, data, origin, expected_tree=Non
                         raise Refuse("snapshot_worktree_changed")
                     with os.fdopen(os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), "rb") as stream:
                         value = stream.read(int(size) + 1)
+                    if (not deckplay_snapshot.path_admitted(expected_tree, name, value)
+                            or deckplay_snapshot.content_refusal(value)):
+                        raise Refuse("snapshot_content_refused")
                     digest = hashlib.sha1(b"blob " + size + b"\0" + value).hexdigest().encode("ascii")
                     if digest != oid or bool(info.st_mode & stat.S_IXUSR) != (mode == b"100755"):
                         raise Refuse("snapshot_worktree_changed")
             git("remote", "add", "origin", origin)
+            if provenance is not None:
+                # Fsync with the rest of the staged tree before the final rename.
+                vault._write_atomic(Path(target) / ".git", "stynpilot-checkout.json",
+                                    json.dumps(provenance, sort_keys=True).encode("ascii") + b"\n")
         except subprocess.SubprocessError:
             raise Refuse("checkout_git_timed_out") from None
         if target_identity is None:
@@ -605,7 +614,9 @@ def _deckplay_checkout(request, path):
                 with bundle.open("rb") as stream:
                     data = repo_git.read_bundle(receipt["snapshot_commit"], receipt["snapshot_bundle_sha256"], stream)
                 _materialize_checkout(request, path, receipt["snapshot_commit"], data, repo_git.DECKPLAY_ORIGIN,
-                                      expected_tree=receipt["source_tree"], target_identity=target_identity)
+                                      expected_tree=receipt["source_tree"], target_identity=target_identity,
+                                      provenance={key: receipt[key] for key in ("archive_id", "ref", "source_commit",
+                                          "source_tree", "source_bundle_sha256", "plan_sha256", "snapshot_commit")})
         finally:
             os.close(fd)
     except (repo_archive.ArchiveError, repo_git.WorkspaceError) as error:

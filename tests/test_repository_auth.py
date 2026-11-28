@@ -3,7 +3,10 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from stynpilot import backup
 from stynpilot.broker import repository_auth as auth
+from stynpilot.broker.executor import Runs
+from stynpilot.ledger import InstallLedger
 
 
 TARGET = {"provider": "gitlab", "origin": "https://gitlab.com/team/fixture.git", "application": "a" * 64, "principal": 938}
@@ -94,6 +97,44 @@ class RepositoryAuthTests(unittest.TestCase):
         self.assertEqual(self.store.status("chatgpt")["grants"], [])
         with self.assertRaisesRegex(auth.AuthorizationError, "repository_grant_unavailable"):
             self.store.use("chatgpt", "fixture", "read", consume)
+
+    def test_maintenance_removes_expired_tokens_and_device_codes_from_storage(self):
+        self.store.purge_expired()
+        self.assertFalse(self.store.root.exists())
+        self.connect()
+        second = "b" * 64
+        self.store.apply("repository_authorize", "other", "fixture", ["fetch"], 2, second)
+        self.store.connect(second, False)
+        self.now += 301
+        self.store.purge_expired()
+        data = (self.store.root / "grants.json").read_text()
+        self.assertNotIn(DEVICE, data)
+        self.assertIn(REFRESH, data)  # renewal remains authorized for this grant
+        with self.assertRaisesRegex(auth.AuthorizationError, "repository_sign_in_expired"):
+            self.store.connect(second, True)
+        self.now += 86400
+        self.store.purge_expired()
+        data = (self.store.root / "grants.json").read_text()
+        self.assertNotIn(SECRET, data)
+        self.assertNotIn(REFRESH, data)
+        self.assertEqual(self.reopen().status("chatgpt")["grants"], [])
+
+    def test_root_backup_of_an_active_grant_cannot_restore_it_after_revocation(self):
+        self.connect()
+        Runs(self.root / "runs.sqlite3")
+        InstallLedger(self.root / "installs.sqlite3")
+        for name in backup.ROOT_TREES:
+            (self.root / name).mkdir(mode=0o700)
+        archive = self.root / "before-revocation.tar"
+        backup.make_backup(self.root, archive, kind="root")
+        self.store.apply("repository_revoke", "chatgpt", "fixture", [], 0, REQUEST)
+        _, contents = backup.read_backup(archive, expected_kind="root")
+        self.assertNotIn("repository-authorization/grants.json", contents)
+        self.assertTrue(all(SECRET.encode() not in data and REFRESH.encode() not in data for data in contents.values()))
+        destination = self.root / "restored"
+        backup.restore_backup(archive, destination, kind="root")
+        restored = auth.Store(destination, {"fixture": TARGET}, clock=lambda: self.now)
+        self.assertEqual(restored.status("chatgpt")["grants"], [])
 
     def test_unspecified_repository_cross_client_push_suspend_and_revoke(self):
         self.connect()

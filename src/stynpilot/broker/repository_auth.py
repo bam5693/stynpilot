@@ -197,9 +197,35 @@ class Store:
             if (type(state) is not dict or set(state) != {"suspended", "grants"} or type(state["suspended"]) is not bool
                     or type(state["grants"]) is not dict or len(state["grants"]) > MAX_GRANTS):
                 raise AuthorizationError("repository_state_untrusted")
+            # Every consumer sheds expired credentials before reading the store.
+            self._purge_expired(state, int(self.clock()))
             yield state
         finally:
             os.close(lock)
+
+    def purge_expired(self):
+        """Maintenance entry point. Do not initialize state until first use."""
+        if self.root.exists():
+            with self._state():
+                pass
+
+    def _purge_expired(self, state, now):
+        changed = False
+        for key, row in list(state["grants"].items()):
+            if type(row) is not dict or type(row.get("expires")) is not int:
+                raise AuthorizationError("repository_state_untrusted")
+            if row["expires"] <= now:
+                del state["grants"][key]
+                changed = True
+            elif row.get("state") in ("approved", "connecting"):
+                until = row.get("connect_until")
+                if type(until) is not int:
+                    raise AuthorizationError("repository_state_untrusted")
+                if until <= now:
+                    self._clear_session(row, "sign_in_expired")
+                    changed = True
+        if changed:
+            self._save(state)
 
     def _save(self, state):
         data = json.dumps(state, sort_keys=True).encode()
@@ -284,7 +310,7 @@ class Store:
                 raise AuthorizationError("repository_grant_unavailable")
             if row["state"] == "active":
                 return {"state": "connected"}
-            if now >= row["connect_until"] or row["state"] not in ("approved", "connecting"):
+            if row["state"] not in ("approved", "connecting") or now >= row["connect_until"]:
                 raise AuthorizationError("repository_sign_in_expired")
             if row["state"] == "approved" and not poll:
                 device = self.provider.start(row["source"])

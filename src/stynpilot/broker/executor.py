@@ -463,6 +463,8 @@ class Executor:
                 raise ExecutionDenied("git_push_requires_passkey")
             if payload.get("action") == "deckplay_checkout":
                 raise ExecutionDenied("deckplay_checkout_requires_passkey")
+            if payload.get("action") == "workspace_access":
+                raise ExecutionDenied("workspace_access_requires_passkey")
             if payload.get("action") in repository_auth.ACTIONS:
                 raise ExecutionDenied("repository_access_requires_passkey")
         self._used_passkey(passkey, rid, decision)
@@ -751,9 +753,11 @@ class Executor:
         if action == "repo_credential":
             fields |= {"client", "repository"}
         if action == "deckplay_checkout":
-            fields |= {"client", "plan", "plan_sha256"}
+            fields |= {"client", "plan", "plan_sha256", "workspace_clients"}
+        if action == "workspace_access":
+            fields |= {"client", "workspace_clients"}
         if (set(payload) != fields or payload.get("kind") != "runner"
-                or action not in ("setup", "enroll", "unenroll", "settle_inference", "lab_enroll", "repo_push", "repo_credential", "deckplay_checkout")
+                or action not in ("setup", "enroll", "unenroll", "settle_inference", "lab_enroll", "repo_push", "repo_credential", "deckplay_checkout", "workspace_access")
                 or payload.get("owner") != self.owner or payload.get("device") != self.device):
             raise ExecutionDenied("runner_request_invalid")
         name = payload.get("name")
@@ -782,6 +786,15 @@ class Executor:
                 raise ExecutionDenied(error.code) from None
             if not any(row["path"] == self._workspace_path(name) for row in self.jobs.workspaces()):
                 raise ExecutionDenied("workspace_not_enrolled")
+            if payload["workspace_clients"] != self._checkout_clients(payload["client"]):
+                raise ExecutionDenied("workspace_access_changed")
+        if action == "workspace_access":
+            allowed = payload["workspace_clients"]
+            if (name != "deckplay-hq" or self.passkeys is None or not isinstance(payload["client"], str)
+                    or not lab.CLIENT.fullmatch(payload["client"]) or type(allowed) is not list or len(allowed) > 8
+                    or any(type(c) is not str or not lab.CLIENT.fullmatch(c) for c in allowed)
+                    or sorted(set(allowed)) != allowed):
+                raise ExecutionDenied("workspace_access_invalid")
         if action == "repo_credential":
             if name != "stynpilot":
                 raise ExecutionDenied("git_workspace_not_bound")
@@ -904,12 +917,17 @@ class Executor:
                                            payload["days"], payload_hash(payload)[0])
         if action == "lab_enroll":
             return self.lab.enroll(payload["client"])
+        if action == "workspace_access":
+            self.jobs.set_workspace_clients(self._workspace_path("deckplay-hq"), payload["workspace_clients"])
+            return {"ok": True, "action": action, "workspace": "deckplay-hq"}
         if action == "deckplay_checkout":
             if managed_activity.held(self.dir):
                 raise JobError("managed_activity_busy")
             plan = payload["plan"]
-            result = self.jobs.deckplay_snapshot(self._workspace_path("deckplay-hq"), payload["client"],
+            path = self._workspace_path("deckplay-hq")
+            result = self.jobs.deckplay_snapshot(path, payload["client"],
                                                  plan["archive_id"], plan["ref"], plan["source_commit"], payload["plan_sha256"])
+            self.jobs.set_workspace_clients(path, payload["workspace_clients"])
             receipt = result["receipt"]
             return {"ok": True, "action": action, "workspace": "deckplay-hq",
                     "source_commit": plan["source_commit"], "source_tree": plan["source_tree"],
@@ -1041,17 +1059,20 @@ class Executor:
     def _runner_green(self, call, args):
         jobs, base = self.jobs, self.jobs.projects_dir
         name_of = lambda path: os.path.basename(path)
+        client = args.get("client")
+        visible = lambda path: jobs.workspace_allowed(path, client) if name_of(path) == "deckplay-hq" else True
         if call == "deckplay_snapshot_preview":
             if set(args) != {"client", "archive_id", "ref", "commit"} or self.passkeys is None:
                 raise ExecutionDenied("deckplay_checkout_not_available")
-            return jobs.deckplay_snapshot(self._workspace_path("deckplay-hq"), args["client"], args["archive_id"],
-                                          args["ref"], args["commit"])
+            audience = self._checkout_clients(client)
+            return {**jobs.deckplay_snapshot(self._workspace_path("deckplay-hq"), client, args["archive_id"],
+                                             args["ref"], args["commit"]), "workspace_clients": audience}
         if call == "status":
             enabled = jobs.enabled()
             test = jobs.selftest_state()
             return {"enabled": enabled, "selftest": self._safe_selftest(test) if test.get("ran") else {"ran": False, "ok": False},
                     "gate_open": not root_restore.held(self.dir) and enabled and test.get("ok") is True and test.get("version") == jobs.version,
-                    "workspaces": [name_of(w["path"]) for w in jobs.workspaces()],
+                    "workspaces": [name_of(w["path"]) for w in jobs.workspaces() if visible(w["path"])],
                     "recipes": {rid: r.title for rid, r in sorted(runner_policy.RECIPES.items())}}
         if call == "inference_claim_status":
             if args:
@@ -1097,27 +1118,41 @@ class Executor:
         if call == "selftest":
             return self._safe_selftest(jobs.selftest())
         if call == "workspaces":
-            return {"workspaces": [{"name": name_of(w["path"]), "enrolled_at": w["enrolled_at"]} for w in jobs.workspaces()]}
+            return {"workspaces": [{"name": name_of(w["path"]), "enrolled_at": w["enrolled_at"]}
+                                   for w in jobs.workspaces() if visible(w["path"])]}
         if call == "run":
             recipe, extra = args.get("recipe"), args.get("args", [])
             if type(recipe) is not str or type(extra) is not list or not all(type(a) is str for a in extra):
                 raise ExecutionDenied("runner_call_invalid")
-            started = jobs.run(self._workspace_path(args.get("workspace")), recipe, extra)
+            path = self._workspace_path(args.get("workspace"))
+            if not visible(path):
+                raise ExecutionDenied("workspace_not_authorized")
+            started = jobs.run(path, recipe, extra)
             return {"job_id": started["job_id"], "argv": started["argv"], "limits": started["limits"]}
         if call == "jobs":
             ws = args.get("workspace")
             rows = jobs.recent(args.get("limit", 20), None if ws is None else self._workspace_path(ws))
-            return {"jobs": [dict(r, workspace=name_of(r["workspace"])) for r in rows]}
+            return {"jobs": [dict(r, workspace=name_of(r["workspace"])) for r in rows if visible(r["workspace"])]}
         if call in ("job_status", "job_output", "job_cancel"):
             job_id = args.get("job_id")
+            st = jobs.status(job_id)
+            if not visible(st["workspace"]):
+                raise ExecutionDenied("job_not_found")
             if call == "job_cancel":
                 return jobs.cancel(job_id)
             if call == "job_output":
                 return jobs.output(job_id, args.get("offset", 0), args.get("limit", 32768))
-            st = jobs.status(job_id)
             st["workspace"] = name_of(st["workspace"])
             return st
         raise ExecutionDenied("runner_call_unknown")
+
+    def _checkout_clients(self, client):
+        if type(client) is not str or not lab.CLIENT.fullmatch(client):
+            raise ExecutionDenied("workspace_access_invalid")
+        audience = self.jobs.workspace_clients(self._workspace_path("deckplay-hq"))
+        if audience and client not in audience:
+            raise ExecutionDenied("workspace_not_authorized")
+        return audience or [client]
 
     # -- self-upgrade ---------------------------------------------------------------------------
     def _check_upgrade_payload(self, payload):

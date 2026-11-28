@@ -211,8 +211,8 @@ def register(server, *, router, clients, store, bearer, ledger=None, resolve_apt
                  description="Check whether the owner approved a request, and its safe progress and result.")
     def install_status(device_id: str, request_id: str) -> dict:
         try:
-            _, owner = guarded(device_id)
-            return {"ok": True, "result": store.status(request_id, owner=owner, device=device_id)}
+            proposer, owner = guarded(device_id)
+            return {"ok": True, "result": store.status(request_id, owner=owner, device=device_id, client=proposer.client)}
         except (ClientDenied, RequestError) as denied:
             return _error(denied.code)
         except Exception as error:

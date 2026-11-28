@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 
-from stynpilot import archive_store, deckplay_snapshot, projects_helper, repo_archive, repo_git
+from stynpilot import archive_store, deckplay_snapshot, projects_helper, redact, repo_archive, repo_git, repo_push
 from stynpilot.server.clients import RevocationFile
 from unittest.mock import patch
 
@@ -55,7 +55,7 @@ class DeckPlaySnapshotTests(unittest.TestCase):
         tree = "a" * 40
         hashes = {hashlib.sha256(path.encode()).hexdigest(): hashlib.sha256(blob).hexdigest()}
         self.assertFalse(archive_store._safe_path(path))
-        with patch.object(deckplay_snapshot, "_MIGRATION_TREE", tree), \
+        with patch.object(deckplay_snapshot, "_REVIEWED_TREE", tree), \
                 patch.object(deckplay_snapshot, "_MIGRATION_BLOBS", hashes):
             self.assertTrue(deckplay_snapshot.path_admitted(tree, path, blob))
             self.assertFalse(deckplay_snapshot.path_admitted("b" * 40, path, blob))
@@ -64,6 +64,35 @@ class DeckPlaySnapshotTests(unittest.TestCase):
             self.assertFalse(deckplay_snapshot.path_admitted(tree, "supabase/migrations/.env", blob))
         self.assertIsNone(deckplay_snapshot.content_refusal(blob))
         self.assertEqual(deckplay_snapshot.content_refusal(b"password=synthetic-only"), "sensitive")
+
+    def test_report_admission_is_exact_and_has_no_content_exemption(self):
+        path = "tests/reports/2026-10-28-competitive-advantage-roadmap.md"
+        tree = "a" * 40
+        blob = b"password=synthetic-only"
+        hashes = {hashlib.sha256(path.encode()).hexdigest(): hashlib.sha256(blob).hexdigest()}
+        self.assertFalse(archive_store._safe_path(path))
+        with (patch.object(deckplay_snapshot, "_REVIEWED_TREE", tree),
+              patch.object(deckplay_snapshot, "_REPORT_BLOBS", hashes)):
+            self.assertTrue(deckplay_snapshot.path_admitted(tree, path, blob))
+            self.assertFalse(deckplay_snapshot.path_admitted("b" * 40, path, blob))
+            self.assertFalse(deckplay_snapshot.path_admitted(tree, path, blob + b" "))
+            self.assertFalse(deckplay_snapshot.path_admitted(tree, path.replace("roadmap", "notes"), blob))
+            self.assertEqual(deckplay_snapshot.content_refusal(blob), "sensitive")
+
+    def test_scanner_keeps_all_findings_except_the_pinned_reference_count(self):
+        path = ".github/workflows/t4-synthetic-long-tracked-migration.yml"
+        blob = b"      - 'tests/reports/2026-10-28-competitive-advantage-roadmap.md'\n"
+        tree = "a" * 40
+        self.assertEqual(redact.redact(blob.decode())[1], {"random-string": 1})
+        pins = {hashlib.sha256(path.encode()).hexdigest(): (hashlib.sha256(blob).hexdigest(), 1)}
+        with (patch.object(deckplay_snapshot, "_REVIEWED_TREE", tree),
+              patch.object(deckplay_snapshot, "_WORKFLOW_REFERENCES", pins)):
+            self.assertIsNone(deckplay_snapshot.content_refusal(blob, tree=tree, path=path))
+            for value, source_tree, name in ((blob, "b" * 40, path), (blob, tree, path + ".txt"),
+                                            (blob + b" ", tree, path), (blob + b"\npassword=fixture\n", tree, path)):
+                self.assertEqual(deckplay_snapshot.content_refusal(value, tree=source_tree, path=name), "sensitive")
+            with patch.object(redact, "redact", return_value=("", {"random-string": 1, "bearer": 1})):
+                self.assertEqual(deckplay_snapshot.content_refusal(blob, tree=tree, path=path), "sensitive")
 
     def test_exact_tree_without_historical_objects(self):
         archive_id, commit = self.adopt()
@@ -89,6 +118,55 @@ class DeckPlaySnapshotTests(unittest.TestCase):
                 repo_archive._git(bare, "cat-file", "-t", self.old)
         self.assertFalse(bundle.exists())
         self.assertEqual(self.store.history("scope.chatgpt", archive_id, commit)["items"][0]["parents"], [self.old])
+
+    def test_stage_publication_keeps_original_ancestry_out_of_the_working_copy(self):
+        archive_id, commit = self.adopt()
+        args = (self.store, "scope.chatgpt", archive_id, "refs/heads/main", commit)
+        source_plan = deckplay_snapshot.review(*args)
+        digest = deckplay_snapshot.plan_digest(source_plan)
+        with deckplay_snapshot.stage(*args, digest) as (bundle, work_receipt):
+            work = self.root / "reviewed-work.git"
+            snapshot = work_receipt["snapshot_commit"]
+            repo_archive._restore_bundle(bundle, work, {deckplay_snapshot.REF: snapshot}, deckplay_snapshot.REF)
+        source = self.root / "reviewed-content"
+        source.write_bytes(b"reviewed edit\n")
+        blob = repo_archive._git(work, "hash-object", "-w", "--no-filters", str(source)).decode().strip()
+        repo_archive._git(work, "read-tree", snapshot)
+        repo_archive._git(work, "update-index", "--add", "--cacheinfo", "100644," + blob + ",README")
+        edited_tree = repo_archive._git(work, "write-tree").decode().strip()
+        new_oid = repo_archive._git(work, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                                   "commit-tree", edited_tree, "-p", snapshot, "-m", "reviewed edit").decode().strip()
+        ref = "refs/heads/work/review"
+        repo_archive._git(work, "update-ref", ref, new_oid)
+        reviewed = self.root / "work.bundle"
+        repo_archive._git(work, "bundle", "create", str(reviewed), ref)
+        binding = (self.store, "scope.chatgpt", source_plan, digest, snapshot,
+                   reviewed, hashlib.sha256(reviewed.read_bytes()).hexdigest(), ref, new_oid)
+        remote = self.root / "staged-remote.git"
+        self.git("clone", "-q", "--bare", str(self.working), str(remote))
+        repo_archive._git(remote, "update-ref", ref, commit)
+        with deckplay_snapshot.stage_publication(*binding, edited_tree, expected_remote=commit) as (publish, receipt):
+            self.assertEqual(repo_archive._git(publish, "rev-parse", receipt["commit"] + "^").decode().strip(), commit)
+            self.assertEqual(receipt["tree"], edited_tree)
+            self.assertEqual(repo_archive._git(publish, "show", receipt["commit"] + ":README"), b"reviewed edit\n")
+            self.assertEqual(repo_archive._git(publish, "cat-file", "-t", self.old).strip(), b"commit")
+            with self.assertRaises(repo_archive.ArchiveError):
+                repo_archive._git(work, "cat-file", "-t", self.old)
+            self.assertEqual(receipt["origin"], repo_git.DECKPLAY_ORIGIN)
+            self.assertEqual(receipt["expected_remote"], commit)
+            outbound = self.root / "publish.bundle"
+            repo_archive._git(publish, "bundle", "create", str(outbound), ref)
+            repo_push.push_bundle(outbound.read_bytes(), "work/review", receipt["commit"], commit, "",
+                                  remote=str(remote))
+            self.assertEqual(repo_archive._git(remote, "rev-parse", ref).strip(), receipt["commit"].encode())
+            self.assertEqual(repo_archive._git(remote, "rev-parse", "refs/heads/main").strip(), commit.encode())
+        self.assertFalse(publish.exists())
+        with self.assertRaisesRegex(repo_archive.ArchiveError, "snapshot_publication_review_required"):
+            with deckplay_snapshot.stage_publication(*binding, "0" * 40, expected_remote=commit):
+                self.fail("changed tree accepted")
+        with self.assertRaisesRegex(repo_archive.ArchiveError, "snapshot_destination_not_ancestor"):
+            with deckplay_snapshot.stage_publication(*binding, edited_tree, expected_remote=snapshot):
+                self.fail("isolated snapshot accepted as a remote base")
 
     def test_owner_helper_materializes_exact_empty_workspace_only(self):
         archive_id, commit = self.adopt()

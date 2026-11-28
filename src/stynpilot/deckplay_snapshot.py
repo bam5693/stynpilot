@@ -20,13 +20,48 @@ MAX_ENTRIES = 2048
 MAX_TOTAL = 64 << 20
 MAX_BLOB = 4 << 20
 MAX_SECONDS = 60
-POLICY = "deckplay-clean-snapshot-v2"
+POLICY = "deckplay-clean-snapshot-v4"
 REF = "refs/heads/stynpilot-import"
 
 # Filename entropy false positives from the reviewed DeckPlay source tree.
 # Each pair pins the UTF-8 path and raw blob. Content still passes the scanner.
-_MIGRATION_TREE = "aaec79d0f851d6c4d3d6f7612b19b51216fa2c11"
+_REVIEWED_TREE = "aaec79d0f851d6c4d3d6f7612b19b51216fa2c11"
 _MIGRATION_PATH = re.compile(r"supabase/migrations/[0-9]{14}_[a-z0-9_]+\.sql")
+_REPORT_PATH = re.compile(r"tests/reports/[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+\.md")
+_LOCAL_TEST_WORKFLOW = ".github/workflows/t2-unread-local.yml"
+_LOCAL_TEST_WORKFLOW_BLOB = "c34011831863c49c391f8e59f66316e70c1546030dc10d6c5cf4e18b0d9174cd"
+_WORKFLOW_PATH = re.compile(r"\.github/workflows/[a-z0-9-]+\.yml")
+# The flagged strings in these specific blobs are existing tracked source paths
+# in the workflows' push path lists. Values pin the raw file and finding count.
+_WORKFLOW_REFERENCES = {
+    "994a20129d373fd90d5205626e9d201728fab95b1794bcc4cfa2a2e5e58be68f":
+        ("20946c990b0298451e970605ec8c07fd033d823ad8c572dda7ad917a01b7ce03", 1),
+    "2184183b16c95a77cbd7e64a5c40f5b6affe580e2d544b3e1e1ef20535dcb1c7":
+        ("ba3874e1c68905479d414f577bc5c26cd41e03b1027d3136940f3c072f0c6438", 1),
+    "89a2c6186f95abf0231c16d8c449062abdace60e07335b4d5eb53bf9948ad58e":
+        ("89806c1c38992e2601359fa63511397c1a96598afe444b7c63e0108b7c886d56", 1),
+    "74d01bde413686e36c6370b8244c2b0ec0cdaf7801cab1d6ee16ed6a0cda9805":
+        ("afca7667abddf8c7658344ab9e8439891177349eb6d6f25cb7c95d45df6fa924", 1),
+    "fb366a4c7ad9f0572d8b1f86dea57ae658e1f57a15a2c086cd21b32ad8861da4":
+        ("a5e503193f25daaf76c6684fac1f75d2c10727705b0cf1341adcc061a903fc90", 2),
+    "7e5a0041f657636cd8857b0c6e33edb41a3cf5dc5a3a1000de60943ac3750414":
+        ("4a705526c8b9f77348fef7094269fd92bb1825123dcf22a89717f7fe0166cdeb", 1),
+    "160875fae657c4ad4a1a44c5dc86911b77d55cf7f855bdc4afb3d5f168b904e5":
+        ("0270a0fbb575216ce04bb1d88303874f6cb9ef5982236c765e8ceacf244e27b4", 1),
+    "b02ad121d8c87a5c5ffae696a58cd8cf84268c6680716f652cac1979de017720":
+        ("8b3b7766252315aa6a85dcf5db3413acf951f72d42679fec2376f950c356a614", 2),
+    "084d7d1d42b2eb61e48f3c8e60f2eb939815ac25142d3653118d9958f752b418":
+        ("6e2ecb683786fadae6ef42009b4f20f103e52056ead67e32b4d52f6d76ad64ef", 1),
+    "1226da272ac04eb1a059d390671bd611f24916b6c41afd8859daf98d3c474814":
+        ("a8a482516e82732c105c5c9c0dfa9b76a372b70fc181895c8fb0965bac29adaa", 1),
+    "1f4a24f5a1f1547d0f6ae980ba59832c59481af6de6143e2677a1153125a3c55":
+        ("0cf0d0663564437959ca63acef0baad71396a7ae84aca81c0a26af7d4a7241b5", 1),
+}
+# The handoff report references another tracked Markdown file by name.
+_REPORT_REFERENCES = {
+    "9357c2eb7127884f672e6660836e38100a1661073884126613eecb06bbe4f2f2":
+        ("a4ad65fa90ba7212627215563bf35a72fd7dab3aae19243d2a2e36c9212deb94", 1),
+}
 _MIGRATION_BLOBS = {
     "f92c89f31e4a8bf48adf8c9956d0794dfe0ffac1f5ea61d166748b8a6b83e93b":
         "dd9820c891621132252561cb8c87a62574861c60b72eb41d0c57ed46f18cc3f3",
@@ -53,6 +88,18 @@ _MIGRATION_BLOBS = {
     "763b6e6bf385ac634e75d231e02788e74ca66f34748ffe16edb1552ef7f2b4bc":
         "7b4b0bfc5e92a8bb070788bafeee0b7f43e5b866b60733b783ba0b618bf0f78e",
 }
+_REPORT_BLOBS = {
+    "08b0896159546d266f10be70515f9730ef540db35e9345d0539502c27d46e5ac":
+        "7cad6f0ad6f73201459af0a34a61cf54c7dd314930d75e26ed92cdb9407ee3cb",
+    "3ef36e3ef31734c1ee6943145f2cdb69e45f701f9e2726bf301c7b18cb9571d5":
+        "5c33116eea78d475c9514ee1aabb50f4ed54ba756cf7ee57b4567328d27b3349",
+    "437dc3121d5f6d7bcbcd8688ce04feb4bf6879f0d4fb0595deb3a47f5bce6820":
+        "512ed1a3d07d52f75df266fac7c935989e108ba1c6ebd634e3282c5497cf56d7",
+    "a8c75fa1c09624283dbf1608bbe43bc9dc343d43fefb740e9a46e670e75a37de":
+        "2aa62443d037d1c9f697e294faa6aa31bf4dc3b99f04f32c17e3acd9552e1337",
+    "9d46054cd1d6b7662d0ab9fb2de202d6b7f95f1aea755c2130ca2f20be0f535c":
+        "b4a55fe865451fa194539ee6b1775bd29e8bf0b20d8f5eb9e5c1151785f8d8ae",
+}
 
 
 def path_admitted(tree, path, data):
@@ -61,20 +108,47 @@ def path_admitted(tree, path, data):
     flags = redact.redact(path)[1]
     if not flags:
         return True
-    return (tree == _MIGRATION_TREE and set(flags) == {"random-string"}
-            and _MIGRATION_PATH.fullmatch(path) is not None
-            and _MIGRATION_BLOBS.get(hashlib.sha256(path.encode("utf-8")).hexdigest())
-            == hashlib.sha256(data).hexdigest())
+    if tree != _REVIEWED_TREE or set(flags) != {"random-string"}:
+        return False
+    if path == _LOCAL_TEST_WORKFLOW:
+        return hashlib.sha256(data).hexdigest() == _LOCAL_TEST_WORKFLOW_BLOB
+    if _reviewed_reference(tree, path, data) is not None:
+        return True
+    if _MIGRATION_PATH.fullmatch(path):
+        reviewed = _MIGRATION_BLOBS
+    elif _REPORT_PATH.fullmatch(path):
+        reviewed = _REPORT_BLOBS
+    else:
+        return False
+    return reviewed.get(hashlib.sha256(path.encode("utf-8")).hexdigest()) == hashlib.sha256(data).hexdigest()
 
 
-def content_refusal(data):
+def _reviewed_reference(tree, path, data):
+    if tree != _REVIEWED_TREE:
+        return None
+    if _WORKFLOW_PATH.fullmatch(path):
+        pins = _WORKFLOW_REFERENCES
+    elif _REPORT_PATH.fullmatch(path):
+        pins = _REPORT_REFERENCES
+    else:
+        return None
+    reviewed = pins.get(hashlib.sha256(path.encode("utf-8")).hexdigest())
+    if reviewed is not None and reviewed[0] == hashlib.sha256(data).hexdigest():
+        return reviewed[1]
+    return None
+
+
+def content_refusal(data, *, tree="", path=""):
     try:
         decoded = data.decode("utf-8")
     except UnicodeDecodeError:
         return "binary"
     if "\0" in decoded:
         return "binary"
-    return "sensitive" if redact.redact(decoded)[1] else None
+    findings = redact.redact(decoded)[1]
+    if findings and findings != {"random-string": _reviewed_reference(tree, path, data)}:
+        return "sensitive"
+    return None
 
 
 def _remaining(deadline):
@@ -88,7 +162,7 @@ def _call(bare, deadline, *args):
     return git._git(bare, *args, timeout=_remaining(deadline))
 
 
-def _review(bare, commit, deadline, target=None):
+def _review(bare, commit, deadline, target=None, *, admitted_tree=None):
     tree = archive_store._tree(bare, commit)
     if not 0 < len(tree) <= MAX_ENTRIES:
         raise git.ArchiveError("snapshot_entry_limit")
@@ -113,10 +187,10 @@ def _review(bare, commit, deadline, target=None):
         data = _call(bare, deadline, "cat-file", "blob", oid)
         if len(data) != size or hashlib.sha1(b"blob " + str(size).encode("ascii") + b"\0" + data).hexdigest() != oid:
             raise git.ArchiveError("snapshot_object_changed")
-        if not path_admitted(source_tree, path, data):
+        if not path_admitted(admitted_tree or source_tree, path, data):
             blocked["protected"] += 1
             continue
-        refusal = content_refusal(data)
+        refusal = content_refusal(data, tree=admitted_tree or source_tree, path=path)
         if refusal:
             blocked[refusal] += 1
             continue
@@ -202,3 +276,62 @@ def stage(store, client, archive_id, ref, commit, expected_plan_sha256):
             git._verify_bundle(bundle, {REF: snapshot})
             yield bundle, {**plan, "plan_sha256": expected_plan_sha256, "snapshot_commit": snapshot,
                            "snapshot_bundle_sha256": digest, "snapshot_bundle_size": size}
+
+
+
+@contextmanager
+def stage_publication(store, client, source_plan, source_plan_sha256, snapshot_commit,
+                      work_bundle, work_bundle_sha256, work_ref, work_commit, work_tree, *, expected_remote):
+    """Attach an exact reviewed snapshot tree to its original ancestry offline.
+
+    The caller must supply trusted checkout provenance and an exact reviewed
+    work bundle. The yielded repository is owner-private and cannot be exported
+    back into the development workspace. This stage does not push a branch.
+    """
+    validate_plan(source_plan, source_plan_sha256)
+    if (any(type(value) is not str or not git.OID.fullmatch(value)
+            for value in (snapshot_commit, work_commit, work_tree, expected_remote))
+            or type(work_bundle_sha256) is not str or not git.DIGEST.fullmatch(work_bundle_sha256)
+            or type(work_ref) is not str or not work_ref.startswith(("refs/heads/work/", "refs/heads/test/"))
+            or not git._ref_name(work_ref)):
+        raise git.ArchiveError("snapshot_publication_invalid")
+    deadline = time.monotonic() + MAX_SECONDS
+    original = source_plan["source_commit"]
+    with store._deckplay_transfer_bundle(client, source_plan["archive_id"], source_plan["ref"], original) as (base, receipt):
+        if receipt["source_bundle_sha256"] != source_plan["source_bundle_sha256"]:
+            raise git.ArchiveError("snapshot_origin_changed")
+        with tempfile.TemporaryDirectory(prefix="stynpilot-deckplay-publication-") as private:
+            private = Path(private)
+            incoming = private / "work.bundle"
+            work = private / "work.git"
+            publication = private / "publication.git"
+            with incoming.open("xb") as frozen:
+                if git._bundle_digest(work_bundle, copy_to=frozen)[0] != work_bundle_sha256:
+                    raise git.ArchiveError("archive_bundle_digest_mismatch")
+            git._restore_bundle(incoming, work, {work_ref: work_commit}, work_ref)
+            if (_call(work, deadline, "rev-list", "--max-parents=0", work_commit).splitlines() != [snapshot_commit.encode()]
+                    or _call(work, deadline, "rev-parse", snapshot_commit + "^{tree}").strip()
+                    != source_plan["source_tree"].encode()):
+                raise git.ArchiveError("snapshot_work_history_mismatch")
+            git._restore_bundle(base, publication, {source_plan["ref"]: original}, source_plan["ref"])
+            if _call(publication, deadline, "rev-parse", original + "^{tree}").strip() != source_plan["source_tree"].encode():
+                raise git.ArchiveError("snapshot_origin_changed")
+            review = _review(work, work_commit, deadline, target=(private / "blob", publication),
+                             admitted_tree=source_plan["source_tree"])
+            tree = _call(publication, deadline, "write-tree").decode("ascii").strip()
+            if not review["eligible"] or review["source_tree"] != work_tree or tree != work_tree:
+                raise git.ArchiveError("snapshot_publication_review_required")
+            commit = _call(publication, deadline, "-c", "user.name=StyNpilot reviewed snapshot",
+                           "-c", "user.email=snapshot@stynpilot.invalid", "commit-tree", tree,
+                           "-p", original, "-m", "Apply reviewed DeckPlay work " + work_commit).decode("ascii").strip()
+            if not git.OID.fullmatch(commit):
+                raise git.ArchiveError("snapshot_commit_invalid")
+            _call(publication, deadline, "update-ref", work_ref, commit)
+            _call(publication, deadline, "fsck", "--full", "--strict", "--no-dangling")
+            if expected_remote != "0" * 40:
+                try:
+                    _call(publication, deadline, "merge-base", "--is-ancestor", expected_remote, commit)
+                except git.ArchiveError:
+                    raise git.ArchiveError("snapshot_destination_not_ancestor") from None
+            yield publication, {"commit": commit, "tree": tree, "parent": original, "work_commit": work_commit,
+                                "ref": work_ref, "origin": source_plan["source"]["url"], "expected_remote": expected_remote}

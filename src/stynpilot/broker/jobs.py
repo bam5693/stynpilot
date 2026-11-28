@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import re
 import secrets
 import shutil
 import signal
@@ -32,7 +33,7 @@ from .. import managed_activity, redact, repo_git, runner, safefs, vault
 from . import apt
 from ..projects_helper import block_devices
 from .helper import MEASURE_TIMEOUT, SLACK, STOP_WAIT, HelperError, LocalHelper, SystemdHelper, checkout_unit
-from .lab import LabError, SystemdLab
+from .lab import CLIENT, LabError, SystemdLab
 
 MAX_OUT = 256 * 1024
 MAX_ENTRIES = 50000
@@ -40,6 +41,7 @@ MAX_JOBS_KEPT = 200
 BATCH = 100
 LIB = str(Path(__file__).resolve().parents[2])      # where the stynpilot package lives (the sandbox imports acl_repair from here)
 _ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+_WORKSPACE_REVISION = re.compile(r"[a-f0-9]{64}\Z")
 
 
 class JobError(Exception):
@@ -128,6 +130,10 @@ class JobRunner:
                 primary key(workspace,client));
             create table if not exists jobs(id text primary key, workspace text, recipe text, argv text, state text,
                 created integer, started integer, ended integer, exit_code integer, truncated integer default 0);""")
+        self._workspace_policy = self.dir / "deckplay-workspace-authority.json"
+        # Older releases read this table. Keep it empty even if a legacy
+        # runner database was carried forward. A new grant needs a passkey.
+        self._db.execute("delete from workspace_clients")
 
     # -- the runner user ----------------------------------------------------------------------------------
     def ensure_user(self):
@@ -217,9 +223,10 @@ class JobRunner:
                     raise JobError("a_job_is_running_in_this_workspace")
                 if not self._db.execute("select 1 from workspaces where path=?", (path,)).fetchone():
                     raise JobError("not_enrolled")
+                if os.path.basename(path) == repo_git.DECKPLAY_WORKSPACE:
+                    self._save_workspace_authority([])
                 # The row goes FIRST: from this instant no job can start here, then the access is taken away.
                 self._db.execute("delete from workspaces where path=?", (path,))
-                self._db.execute("delete from workspace_clients where workspace=?", (path,))
             try:
                 self._ask("unenroll", name=os.path.basename(path))
             except JobError as error:
@@ -228,24 +235,47 @@ class JobRunner:
                     raise
         return {"workspace": path, "removed": True}
 
-    def workspace_clients(self, path):
-        with self._lock:
-            return [row["client"] for row in self._db.execute(
-                "select client from workspace_clients where workspace=? order by client", (path,))]
+    def workspace_authority(self):
+        try:
+            row = json.loads(vault._read_private(self._workspace_policy, 4096))
+        except FileNotFoundError:
+            return {"revision": "0" * 64, "clients": None}
+        except (OSError, ValueError, vault.VaultError):
+            raise JobError("workspace_authority_untrusted") from None
+        if (type(row) is not dict or set(row) != {"revision", "clients"}
+                or type(row["revision"]) is not str or not _WORKSPACE_REVISION.fullmatch(row["revision"])
+                or not self._valid_workspace_clients(row["clients"])):
+            raise JobError("workspace_authority_untrusted")
+        return row
 
-    def set_workspace_clients(self, path, clients):
-        """For the fixed private workspace, absence of grants always denies access."""
-        with self._ws_lock, self._lock, self._db:
+    @staticmethod
+    def _valid_workspace_clients(clients):
+        return (type(clients) is list and len(clients) <= 8
+                and all(type(c) is str and CLIENT.fullmatch(c) for c in clients)
+                and sorted(set(clients)) == clients)
+
+    def _save_workspace_authority(self, clients):
+        state = {"revision": secrets.token_hex(32), "clients": clients}
+        try:
+            vault._write_atomic(self.dir, self._workspace_policy.name, json.dumps(state).encode())
+        except (OSError, vault.VaultError):
+            raise JobError("workspace_authority_untrusted") from None
+
+    def set_workspace_clients(self, path, clients, revision):
+        """Write current authority independently of recoverable runner records."""
+        if os.path.basename(path) != repo_git.DECKPLAY_WORKSPACE or not self._valid_workspace_clients(clients):
+            raise JobError("workspace_access_invalid")
+        with self._ws_lock, self._lock:
+            if revision != self.workspace_authority()["revision"]:
+                raise JobError("workspace_access_changed")
             if not self._db.execute("select 1 from workspaces where path=?", (path,)).fetchone():
                 raise JobError("workspace_not_enrolled")
             if self._db.execute("select 1 from jobs where workspace=? and state='running'", (path,)).fetchone():
                 raise JobError("workspace_git_busy")
-            self._db.execute("begin immediate")
-            self._db.execute("delete from workspace_clients where workspace=?", (path,))
-            self._db.executemany("insert into workspace_clients VALUES (?,?)", [(path, c) for c in clients])
+            self._save_workspace_authority(clients)
 
     def workspace_allowed(self, path, client):
-        return os.path.basename(path) != repo_git.DECKPLAY_WORKSPACE or client in self.workspace_clients(path)
+        return os.path.basename(path) != repo_git.DECKPLAY_WORKSPACE or client in (self.workspace_authority()["clients"] or [])
 
     def import_checkout(self, workspace, commit, digest, bundle):
         self.require_ready()

@@ -4,6 +4,7 @@ import html
 import json
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -166,6 +167,13 @@ def main():
         unshare = ok("commander_request_workspace_authorization", name="deckplay-hq", client_ids=["fixture"])
         assert approve(unshare["request_id"], required=True)["state"] == "done"
         assert not private_visible("fixture-other")
+        with sqlite3.connect(fixture.STATE / "jobs.sqlite3") as db:
+            db.execute("INSERT INTO workspace_clients VALUES (?,?)", (str(workspace), "fixture-other"))
+        fixture.command("systemctl", "restart", "stynpilot-installer.service")
+        assert fixture.until(lambda: private_visible("fixture", starting=True), 35)
+        assert not private_visible("fixture-other")
+        with sqlite3.connect(fixture.STATE / "jobs.sqlite3") as db:
+            assert db.execute("SELECT COUNT(*) FROM workspace_clients").fetchone() == (0,)
         marker = json.loads((workspace / ".git" / "stynpilot-checkout.json").read_text())
         assert marker["source_commit"] == new and marker["plan_sha256"] == plan["plan_sha256"]
 

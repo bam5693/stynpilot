@@ -167,6 +167,7 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
             payload = {"kind": "runner", "action": "deckplay_checkout", "name": "deckplay-hq",
                        "owner": owner, "device": device_id, "client": proposer.client,
                        "workspace_clients": result["workspace_clients"],
+                       "workspace_revision": result["workspace_revision"],
                        "plan": plan, "plan_sha256": plan_sha256, "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
             row, _ = store.submit(kind="runner", software="deckplay-checkout-" + plan_sha256[:24], device=device_id,
                                   owner=owner, proposer=proposer, payload=payload, summary=render_summary(payload),
@@ -448,9 +449,11 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
                 if (name != "deckplay-hq" or len(set(client_ids)) != len(client_ids)
                         or len(client_ids) > 8 or any(not clients.active(c) for c in client_ids)):
                     raise WorkspaceError("workspace_access_invalid")
+                revision = broker.runner("workspace_access_revision", {"workspace": name})["workspace_revision"]
                 expires = now() + timedelta(minutes=20)
                 payload = {"kind": "runner", "action": "workspace_access", "name": name,
                            "owner": owner, "device": device_id, "client": ctx.client,
+                           "workspace_revision": revision,
                            "workspace_clients": sorted(client_ids), "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
                 row, _ = store.submit(kind="runner", software="deckplay-workspace-access", device=device_id,
                                       owner=owner, proposer=ctx.proposer, payload=payload,

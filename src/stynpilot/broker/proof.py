@@ -184,6 +184,7 @@ def render_summary(payload):
         if payload.get("action") == "workspace_access":
             return ["Replace the DeckPlay HQ workspace client grants.",
                     "New access list: " + (", ".join(payload["workspace_clients"]) or "No AI clients") + ".",
+                    "An intervening change invalidates this request.",
                     "Listed clients may read, edit and start approved sandbox recipes in this workspace. Other AI clients are denied.", expires]
         if payload.get("action") == "repo_push":
             base = payload["expected_remote"]

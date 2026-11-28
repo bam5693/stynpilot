@@ -9,11 +9,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from stynpilot import managed_activity, root_restore, vault
+from stynpilot import backup, managed_activity, root_restore, vault
 from stynpilot.broker import lab
-from stynpilot.broker.executor import Executor
+from stynpilot.broker.executor import Executor, Runs
+from stynpilot.broker.jobs import JobError, JobRunner, LocalBackend
 from stynpilot.broker.release_authority import Authority, AuthorityError
 from stynpilot.broker.service import BrokerService
+from stynpilot.ledger import InstallLedger
 
 COMMIT = "a" * 40
 SOURCE = b"synthetic git archive"
@@ -82,13 +84,14 @@ class LabBrokerTests(unittest.TestCase):
         jobs = Mock(projects_dir=projects)
         jobs.workspaces.return_value = [{"path": projects + "/deckplay-hq"}]
         jobs.enabled.return_value = True
-        jobs.workspace_clients.return_value = []
+        jobs.workspace_authority.return_value = {"revision": "0" * 64, "clients": None}
         jobs.deckplay_snapshot.return_value = {"receipt": {"snapshot_commit": "f" * 40}}
         self.executor.jobs = jobs
         expires = (datetime.now(timezone.utc) + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
         payload = {"kind": "runner", "action": "deckplay_checkout", "name": "deckplay-hq",
                    "owner": "owner", "device": DEVICE, "client": "assistant", "plan": plan,
                    "plan_sha256": deckplay_snapshot.plan_digest(plan), "workspace_clients": ["assistant"],
+                   "workspace_revision": "0" * 64,
                    "expires_at": expires}
         def challenge(p):
             return self.service.handle({"op": "challenge", "payload": p, "decision": "approve"})
@@ -105,15 +108,52 @@ class LabBrokerTests(unittest.TestCase):
         with patch.object(self.executor, "_prove", return_value=("ordinary-token", None)):
             self.assertEqual(self.service.handle(request)["error"], "deckplay_checkout_requires_passkey")
         jobs.deckplay_snapshot.assert_not_called()
+        jobs.workspace_authority.return_value = {"revision": "b" * 64, "clients": ["assistant"]}
+        self.assertEqual(self.service.handle(request)["error"], "workspace_access_changed")
+        jobs.workspace_authority.return_value = {"revision": "0" * 64, "clients": None}
         with patch.object(self.executor, "_prove", return_value=("passkey-proof", {"kid": "fixture"})), \
                 patch.object(self.executor, "_used_passkey"):
             answer = self.service.handle(request)
             self.assertTrue(answer["result"]["ok"], answer)
         jobs.deckplay_snapshot.assert_called_once_with(projects + "/deckplay-hq", "assistant", plan["archive_id"],
                                                       plan["ref"], COMMIT, payload["plan_sha256"])
-        jobs.set_workspace_clients.assert_called_once_with(projects + "/deckplay-hq", ["assistant"])
+        jobs.set_workspace_clients.assert_called_once_with(projects + "/deckplay-hq", ["assistant"], "0" * 64)
         self.assertFalse(self.service.handle(request)["ok"])
         jobs.deckplay_snapshot.assert_called_once()
+
+    def test_private_workspace_authority_refuses_stale_approvals_and_restored_legacy_access(self):
+        def runner(state):
+            instance = JobRunner(state, owner_uid=os.geteuid(), home=self.root, backend=LocalBackend())
+            self.addCleanup(instance._db.close)
+            instance._db.execute("INSERT INTO workspaces VALUES (?,0,0)", (workspace,))
+            return instance
+
+        workspace = str(self.root / "projects" / "deckplay-hq")
+        jobs = runner(self.root / "workspace-state")
+        initial = jobs.workspace_authority()
+        self.assertIsNone(initial["clients"])
+        jobs.set_workspace_clients(workspace, ["assistant"], initial["revision"])
+        self.assertTrue(jobs.workspace_allowed(workspace, "assistant"))
+        self.assertFalse(jobs._db.execute("SELECT * FROM workspace_clients").fetchall())
+        Runs(jobs.dir / "runs.sqlite3")
+        InstallLedger(jobs.dir / "installs.sqlite3")
+        for name in backup.ROOT_TREES:
+            (jobs.dir / name).mkdir(mode=0o700)
+        archive = self.root / "before-unshare.tar"
+        backup.make_backup(jobs.dir, archive, kind="root")
+        jobs.set_workspace_clients(workspace, [], jobs.workspace_authority()["revision"])
+        with self.assertRaisesRegex(JobError, "workspace_access_changed"):
+            jobs.set_workspace_clients(workspace, ["assistant"], initial["revision"])
+        self.assertEqual(jobs.workspace_authority()["clients"], [])
+        destination = self.root / "restored"
+        backup.restore_backup(archive, destination, kind="root")
+        self.assertFalse(runner(destination).workspace_allowed(workspace, "assistant"))
+        self.assertFalse((destination / jobs._workspace_policy.name).exists())
+        jobs._db.execute("INSERT INTO workspace_clients VALUES (?,?)", (workspace, "assistant"))
+        reopened = JobRunner(jobs.dir, owner_uid=os.geteuid(), home=self.root, backend=LocalBackend())
+        self.addCleanup(reopened._db.close)
+        self.assertFalse(reopened.workspace_allowed(workspace, "assistant"))
+        self.assertFalse(reopened._db.execute("SELECT * FROM workspace_clients").fetchall())
 
     def test_only_verified_commit_and_digest_from_the_enrolled_repository_can_start(self):
         self.assertEqual(self.start()["error"], "lab_enrollment_required")

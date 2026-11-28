@@ -754,9 +754,9 @@ class Executor:
         if action == "repo_credential":
             fields |= {"client", "repository"}
         if action == "deckplay_checkout":
-            fields |= {"client", "plan", "plan_sha256", "workspace_clients"}
+            fields |= {"client", "plan", "plan_sha256", "workspace_clients", "workspace_revision"}
         if action == "workspace_access":
-            fields |= {"client", "workspace_clients"}
+            fields |= {"client", "workspace_clients", "workspace_revision"}
         if (set(payload) != fields or payload.get("kind") != "runner"
                 or action not in ("setup", "enroll", "unenroll", "settle_inference", "lab_enroll", "repo_push", "repo_credential", "deckplay_checkout", "workspace_access")
                 or payload.get("owner") != self.owner or payload.get("device") != self.device):
@@ -777,6 +777,13 @@ class Executor:
                 raise ExecutionDenied("lab_executor_unavailable")
             if state["enrolled"]:
                 raise ExecutionDenied("lab_already_enrolled")
+        if action in ("deckplay_checkout", "workspace_access"):
+            try:
+                authority = self.jobs.workspace_authority()
+            except JobError as error:
+                raise ExecutionDenied(error.code) from None
+            if payload["workspace_revision"] != authority["revision"]:
+                raise ExecutionDenied("workspace_access_changed")
         if action == "deckplay_checkout":
             from .. import deckplay_snapshot, repo_archive
             if name != "deckplay-hq" or self.passkeys is None or type(payload["client"]) is not str or not lab.CLIENT.fullmatch(payload["client"]):
@@ -787,7 +794,7 @@ class Executor:
                 raise ExecutionDenied(error.code) from None
             if not any(row["path"] == self._workspace_path(name) for row in self.jobs.workspaces()):
                 raise ExecutionDenied("workspace_not_enrolled")
-            if payload["workspace_clients"] != self._checkout_clients(payload["client"]):
+            if payload["workspace_clients"] != self._checkout_clients(payload["client"], authority):
                 raise ExecutionDenied("workspace_access_changed")
         if action == "workspace_access":
             allowed = payload["workspace_clients"]
@@ -919,7 +926,8 @@ class Executor:
         if action == "lab_enroll":
             return self.lab.enroll(payload["client"])
         if action == "workspace_access":
-            self.jobs.set_workspace_clients(self._workspace_path("deckplay-hq"), payload["workspace_clients"])
+            self.jobs.set_workspace_clients(self._workspace_path("deckplay-hq"), payload["workspace_clients"],
+                                            payload["workspace_revision"])
             return {"ok": True, "action": action, "workspace": "deckplay-hq"}
         if action == "deckplay_checkout":
             if managed_activity.held(self.dir):
@@ -928,7 +936,7 @@ class Executor:
             path = self._workspace_path("deckplay-hq")
             result = self.jobs.deckplay_snapshot(path, payload["client"],
                                                  plan["archive_id"], plan["ref"], plan["source_commit"], payload["plan_sha256"])
-            self.jobs.set_workspace_clients(path, payload["workspace_clients"])
+            self.jobs.set_workspace_clients(path, payload["workspace_clients"], payload["workspace_revision"])
             receipt = result["receipt"]
             return {"ok": True, "action": action, "workspace": "deckplay-hq",
                     "source_commit": plan["source_commit"], "source_tree": plan["source_tree"],
@@ -1086,12 +1094,20 @@ class Executor:
         name_of = lambda path: os.path.basename(path)
         client = args.get("client")
         visible = lambda path: jobs.workspace_allowed(path, client) if name_of(path) == "deckplay-hq" else True
+        if call == "workspace_access_revision":
+            if set(args) != {"workspace"} or args["workspace"] != "deckplay-hq" or self.passkeys is None:
+                raise ExecutionDenied("workspace_access_invalid")
+            if not any(row["path"] == self._workspace_path("deckplay-hq") for row in jobs.workspaces()):
+                raise ExecutionDenied("workspace_not_enrolled")
+            return {"workspace_revision": jobs.workspace_authority()["revision"]}
         if call == "deckplay_snapshot_preview":
             if set(args) != {"client", "archive_id", "ref", "commit"} or self.passkeys is None:
                 raise ExecutionDenied("deckplay_checkout_not_available")
-            audience = self._checkout_clients(client)
+            authority = jobs.workspace_authority()
+            audience = self._checkout_clients(client, authority)
             return {**jobs.deckplay_snapshot(self._workspace_path("deckplay-hq"), client, args["archive_id"],
-                                             args["ref"], args["commit"]), "workspace_clients": audience}
+                                             args["ref"], args["commit"]), "workspace_clients": audience,
+                    "workspace_revision": authority["revision"]}
         if call == "status":
             enabled = jobs.enabled()
             test = jobs.selftest_state()
@@ -1171,13 +1187,13 @@ class Executor:
             return st
         raise ExecutionDenied("runner_call_unknown")
 
-    def _checkout_clients(self, client):
+    def _checkout_clients(self, client, authority):
         if type(client) is not str or not lab.CLIENT.fullmatch(client):
             raise ExecutionDenied("workspace_access_invalid")
-        audience = self.jobs.workspace_clients(self._workspace_path("deckplay-hq"))
-        if audience and client not in audience:
+        audience = authority["clients"]
+        if audience is not None and client not in audience:
             raise ExecutionDenied("workspace_not_authorized")
-        return audience or [client]
+        return [client] if audience is None else audience
 
     # -- self-upgrade ---------------------------------------------------------------------------
     def _check_upgrade_payload(self, payload):

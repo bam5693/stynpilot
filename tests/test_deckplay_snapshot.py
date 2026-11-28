@@ -132,3 +132,11 @@ class DeckPlaySnapshotTests(unittest.TestCase):
         clients.set_revoked("scope.chatgpt", True)
         with self.assertRaisesRegex(projects_helper.Refuse, "deckplay_checkout_client_revoked"):
             projects_helper._deckplay_client_active(request)
+
+    def test_archive_git_respects_the_tighter_checkout_file_limit(self):
+        import sys
+        invocation = ('import sys; sys.path.insert(0, sys.argv[1]); '
+                      'from stynpilot.repo_archive import _git; '
+                      'assert _git(None, "--version").startswith(b"git version ")')
+        subprocess.run(["/usr/bin/prlimit", "--fsize=67108864:67108864", "--", sys.executable, "-IB", "-c",
+                        invocation, str(Path(repo_archive.__file__).resolve().parents[1])], check=True)

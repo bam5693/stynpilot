@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
 import stat
 import subprocess
@@ -54,8 +55,12 @@ def source_origin(provider, origin):
 
 
 def _git(repository, *argv, timeout=120):
+    # The DeckPlay helper has a lower inherited hard ceiling. Respect both
+    # inherited limits; an unprivileged helper cannot raise the hard limit.
+    soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    limit = min([MAX_BUNDLE] + [value for value in (soft, hard) if value != resource.RLIM_INFINITY])
     command = [
-        "/usr/bin/prlimit", f"--fsize={MAX_BUNDLE}:{MAX_BUNDLE}", "--as=1610612736:1610612736",
+        "/usr/bin/prlimit", f"--fsize={limit}:{limit}", "--as=1610612736:1610612736",
         "--", "/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
         "-c", "protocol.allow=never", "-c", "submodule.recurse=false", "-c", "pack.threads=2",
     ]

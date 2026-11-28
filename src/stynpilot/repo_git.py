@@ -14,6 +14,11 @@ from .workspace import WorkspaceError, parts_of
 
 WORKSPACE = "stynpilot"
 ORIGIN = "https://github.com/bam5693/stynpilot.git"
+# Local-only recipes may use either explicitly named project. The release
+# authority, network fetch and approved push remain StyNpilot-only.
+DECKPLAY_WORKSPACE = "deckplay-hq"
+DECKPLAY_ORIGIN = "https://github.com/bam5693/Deckplay-hq.git"
+LOCAL_ORIGINS = {WORKSPACE: ORIGIN, DECKPLAY_WORKSPACE: DECKPLAY_ORIGIN}
 BRANCH, COMMIT = "git-work-branch", "git-work-commit"
 SWITCH, FAST_FORWARD = "git-work-switch", "git-work-fast-forward"
 RECIPES = frozenset((BRANCH, COMMIT, SWITCH, FAST_FORWARD))
@@ -54,7 +59,7 @@ def read_bundle(commit, digest, stream):
 def validate(recipe, args, workspace):
     fixed_count = {BRANCH: 2, SWITCH: 3, FAST_FORWARD: 3}
     valid_count = len(args) == fixed_count[recipe] if recipe in fixed_count else recipe == COMMIT and 4 <= len(args) <= 11
-    if Path(workspace).name != WORKSPACE:
+    if Path(workspace).name not in LOCAL_ORIGINS:
         raise WorkspaceError("git_workspace_not_bound")
     if not valid_count or not _REF.fullmatch(args[0]) or not _SHA.fullmatch(args[1]):
         raise WorkspaceError("git_request_invalid")
@@ -111,7 +116,7 @@ def run(recipe, args, folder):
             raise WorkspaceError("git_checkout_config_not_supported")
         if key == "remote.origin.url":
             origins.append(value)
-    if origins != [ORIGIN]:
+    if origins != [LOCAL_ORIGINS[folder.name]]:
         raise WorkspaceError("git_workspace_origin_mismatch")
     if recipe == FETCH:
         commit, digest = args

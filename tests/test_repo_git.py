@@ -115,4 +115,25 @@ class WorkspaceGitTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(runner.RunnerError):
                 runner.build_argv(repo_git.COMMIT, ["work/one", self.base, "message", path], str(self.folder))
         with self.assertRaisesRegex(runner.RunnerError, "git_workspace_not_bound"):
-            runner.build_argv(repo_git.BRANCH, ["work/one", self.base], str(self.folder.parent / "deckplay-hq"))
+            runner.build_argv(repo_git.BRANCH, ["work/one", self.base], str(self.folder.parent / "other-project"))
+
+    def test_deckplay_local_operations_only(self):
+        destination = self.folder.parent / repo_git.DECKPLAY_WORKSPACE
+        self.folder.rename(destination)
+        self.folder = destination
+        with self.assertRaisesRegex(WorkspaceError, "git_workspace_origin_mismatch"):
+            self.run_recipe(repo_git.BRANCH, "work/deckplay", self.base)
+        self.git("remote", "set-url", "origin", repo_git.DECKPLAY_ORIGIN)
+        self.assertEqual(self.run_recipe(repo_git.BRANCH, "work/deckplay", self.base), self.base)
+        (self.folder / "first.txt").write_text("DeckPlay change\n")
+        new = self.run_recipe(repo_git.COMMIT, "work/deckplay", self.base, "local DeckPlay edit", "first.txt")
+        self.assertEqual(new, self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.base, self.git("rev-parse", "main"))
+        self.run_recipe(repo_git.BRANCH, "test/deckplay", new)
+        self.assertEqual(new, self.run_recipe(repo_git.SWITCH, "work/deckplay", new, new))
+        for recipe in (repo_git.FETCH, repo_git.EXPORT):
+            with self.subTest(recipe=recipe), self.assertRaisesRegex(WorkspaceError, "git_workspace_not_bound"):
+                repo_git.run(recipe, ["work/deckplay", new], self.folder)
+            with self.assertRaisesRegex(runner.RunnerError, "unknown_recipe"):
+                runner.build_argv(recipe, ["work/deckplay", new], str(self.folder))
+        self.assertEqual(self.git("remote", "get-url", "origin"), repo_git.DECKPLAY_ORIGIN)

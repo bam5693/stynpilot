@@ -16,16 +16,21 @@ partial result.
 
 Usage: ``python3 -I projects_helper.py '<json request>'`` -> one JSON line. Standard library plus stynpilot.safefs only.
 """
+from contextlib import contextmanager
+import errno
+import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from stynpilot import repo_git, safefs  # noqa: E402
+from stynpilot import archive_store, deckplay_snapshot, repo_archive, repo_git, safefs, vault  # noqa: E402
+from stynpilot.server.clients import ClientDenied, RevocationFile  # noqa: E402
 
 MAX_ENTRIES = 50000
 MAX_DEPTH = 64
@@ -418,7 +423,12 @@ def op_import_checkout(request):
         data = repo_git.read_bundle(commit, digest, sys.stdin.buffer)
     except repo_git.WorkspaceError as error:
         raise Refuse(error.code) from None
-    with tempfile.TemporaryDirectory(prefix=".stynpilot-checkout-", dir=request["projects"]) as scratch:
+    _materialize_checkout(request, path, commit, data, repo_git.ORIGIN)
+    return {"workspace": repo_git.WORKSPACE, "repository": "bam5693/stynpilot", "commit": commit}
+
+
+def _materialize_checkout(request, path, commit, data, origin, expected_tree=None, target_identity=None):
+    with _checkout_scratch(request) as scratch:
         bundle = os.path.join(scratch, "checkout.bundle")
         with open(bundle, "xb") as output:
             output.write(data)
@@ -448,20 +458,167 @@ def op_import_checkout(request):
             if (not entries or len(entries) > MAX_ENTRIES or any(not size.isdigit() for size in sizes)
                     or sum(map(int, sizes)) > (64 << 20)):
                 raise Refuse("checkout_tree_exceeds_limits")
+            if expected_tree is not None:
+                if (git("rev-parse", commit + "^{tree}").strip() != expected_tree.encode("ascii")
+                        or git("rev-list", "--count", commit).strip() != b"1"
+                        or git("fsck", "--full", "--strict", "--unreachable", "--no-reflogs", commit).strip()):
+                    raise Refuse("snapshot_history_or_tree_mismatch")
             git("checkout", "--quiet", "--detach", "--no-recurse-submodules", commit)
-            git("remote", "add", "origin", repo_git.ORIGIN)
+            if expected_tree is not None:
+                for entry in entries:
+                    meta, raw_path = entry.split(b"\t", 1)
+                    mode, kind, oid, size = meta.split()
+                    name = raw_path.decode("utf-8")
+                    if not archive_store._safe_path(name) or kind != b"blob" or mode not in (b"100644", b"100755"):
+                        raise Refuse("snapshot_path_refused")
+                    file = os.path.join(target, name)
+                    info = os.lstat(file)
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != int(size):
+                        raise Refuse("snapshot_worktree_changed")
+                    with os.fdopen(os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), "rb") as stream:
+                        value = stream.read(int(size) + 1)
+                    digest = hashlib.sha1(b"blob " + size + b"\0" + value).hexdigest().encode("ascii")
+                    if digest != oid or bool(info.st_mode & stat.S_IXUSR) != (mode == b"100755"):
+                        raise Refuse("snapshot_worktree_changed")
+            git("remote", "add", "origin", origin)
         except subprocess.SubprocessError:
             raise Refuse("checkout_git_timed_out") from None
-        # POSIX refuses to replace a nonempty directory, even if a file was
-        # added during import. The source was created by the same owner.
-        os.replace(target, path)
-    return {"workspace": repo_git.WORKSPACE, "repository": "bam5693/stynpilot", "commit": commit}
+        if target_identity is None:
+            os.replace(target, path)
+        else:
+            if "dispatch" in request:
+                _deckplay_client_active(request)
+            _publish_deckplay(target, path, target_identity)
 
 
+def _publish_deckplay(target, path, target_identity):
+    parent_fd, parent_stat, original = target_identity
+    name = os.path.basename(path)
+    archive_store._sync_tree(target)
+    # The original destination and its parent stay pinned across verification.
+    # The kernel's final nonempty-directory check also covers a late file write.
+    if (not os.path.samestat(os.lstat(os.path.dirname(path)), parent_stat)
+            or not os.path.samestat(os.stat(name, dir_fd=parent_fd, follow_symlinks=False), original)):
+        raise Refuse("checkout_destination_changed")
+    try:
+        os.replace(target, name, dst_dir_fd=parent_fd)
+    except OSError as error:
+        if error.errno in (errno.ENOTEMPTY, errno.EEXIST):
+            raise Refuse("checkout_workspace_not_empty") from None
+        raise
+    try:
+        os.fsync(parent_fd)
+    except OSError:
+        # The replacement may already be visible. Never report that the
+        # workspace is unchanged or try to remove the published tree here.
+        raise Refuse("checkout_outcome_unverified") from None
+
+
+def _checkout_slot(request):
+    job = request.get("checkout_job")
+    if type(job) is not str or not re.fullmatch(r"[a-f0-9]{32}", job):
+        raise Refuse("deckplay_checkout_dispatch_invalid")
+    return os.path.join(_projects(request), ".stynpilot-deckplay-checkout-" + job)
+
+
+@contextmanager
+def _checkout_scratch(request):
+    if "checkout_job" not in request:
+        with tempfile.TemporaryDirectory(prefix=".stynpilot-checkout-", dir=request["projects"]) as path:
+            yield path
+        return
+    path = _checkout_slot(request)
+    os.mkdir(path, 0o700)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path)
+
+
+def op_deckplay_checkout_cleanup(request):
+    path = _checkout_slot(request)
+    if os.path.lexists(path):
+        info = _own_folder(path)
+        if info.st_mode & 0o077 or not shutil.rmtree.avoids_symlink_attacks:
+            raise Refuse("deckplay_checkout_dispatch_invalid")
+        shutil.rmtree(path)
+        vault._fsync_dir(os.path.dirname(path))
+    return {"cleaned": True}
+
+
+def _deckplay_archive(request):
+    # Fixed default owner-state layout; no caller-specified path or URL.
+    path = os.path.join(request["home"], ".local", "state", "stynpilot", "repository-archives")
+    _no_links(path)
+    _deckplay_client_active(request)
+    return archive_store.Store(path)
+
+
+def _deckplay_client_active(request):
+    path = os.path.join(request["home"], ".local", "state", "stynpilot", "revoked-clients.json")
+    try:
+        if request["client"] in RevocationFile(path).revoked():
+            raise Refuse("deckplay_checkout_client_revoked")
+    except ClientDenied as error:
+        raise Refuse(error.code) from None
+
+
+def _deckplay_empty(request):
+    if request.get("name") != repo_git.DECKPLAY_WORKSPACE:
+        raise Refuse("git_workspace_not_bound")
+    path = _workspace(request)
+    if os.listdir(path):
+        raise Refuse("checkout_workspace_not_empty")
+    return path
+
+
+def op_deckplay_snapshot_preview(request):
+    _deckplay_empty(request)
+    try:
+        plan = deckplay_snapshot.review(_deckplay_archive(request), request["client"], request["archive_id"],
+                                        request["ref"], request["commit"])
+    except repo_archive.ArchiveError as error:
+        raise Refuse(error.code) from None
+    return {"plan": plan, "plan_sha256": deckplay_snapshot.plan_digest(plan)}
+
+
+def op_deckplay_snapshot_checkout(request):
+    path = _deckplay_empty(request)
+    if request.get("dispatch") != "/run/stynpilot-deckplay-dispatch":
+        raise Refuse("deckplay_checkout_dispatch_invalid")
+    with open(request["dispatch"], "rb") as dispatch:
+        if dispatch.read(66) != (request["plan_sha256"] + "\n").encode("ascii"):
+            raise Refuse("deckplay_checkout_dispatch_invalid")
+    return _deckplay_checkout(request, path)
+
+
+def _deckplay_checkout(request, path):
+    parent_fd, parent_stat = _open_root(os.path.dirname(path))
+    try:
+        fd = os.open(os.path.basename(path), _DIR, dir_fd=parent_fd)
+        try:
+            target_identity = parent_fd, parent_stat, os.fstat(fd)
+            if os.listdir(fd):
+                raise Refuse("checkout_workspace_not_empty")
+            with deckplay_snapshot.stage(_deckplay_archive(request), request["client"], request["archive_id"],
+                                          request["ref"], request["commit"], request["plan_sha256"]) as (bundle, receipt):
+                with bundle.open("rb") as stream:
+                    data = repo_git.read_bundle(receipt["snapshot_commit"], receipt["snapshot_bundle_sha256"], stream)
+                _materialize_checkout(request, path, receipt["snapshot_commit"], data, repo_git.DECKPLAY_ORIGIN,
+                                      expected_tree=receipt["source_tree"], target_identity=target_identity)
+        finally:
+            os.close(fd)
+    except (repo_archive.ArchiveError, repo_git.WorkspaceError) as error:
+        raise Refuse(error.code) from None
+    finally:
+        os.close(parent_fd)
+    return {"workspace": repo_git.DECKPLAY_WORKSPACE, "receipt": receipt}
 
 
 OPS = {"prepare": op_prepare, "check": op_check, "home_names": op_home_names, "disk": op_disk, "enroll": op_enroll,
-       "grant": op_grant, "unenroll": op_unenroll, "protected": op_protected, "import_checkout": op_import_checkout}
+       "grant": op_grant, "unenroll": op_unenroll, "protected": op_protected, "import_checkout": op_import_checkout,
+       "deckplay_snapshot_preview": op_deckplay_snapshot_preview, "deckplay_snapshot_checkout": op_deckplay_snapshot_checkout,
+       "deckplay_checkout_cleanup": op_deckplay_checkout_cleanup}
 
 
 def main(argv):

@@ -171,6 +171,15 @@ def render_summary(payload):
                     "Enter a fine-grained GitHub personal access token for only this repository with Contents read and write.",
                     "The phone binds the entered token to your passkey approval. Only the installer stores it.",
                     "This approval does not push code or change the release signing credential.", expires]
+        if payload.get("action") == "deckplay_checkout":
+            plan = payload["plan"]
+            return ["Create an offline DeckPlay HQ working checkout for AI client " + payload["client"] + ".",
+                    "Existing archive " + plan["archive_id"] + "; branch " + plan["ref"] + ".",
+                    "Original commit " + plan["source_commit"] + "; exact tree " + plan["source_tree"] + ".",
+                    "Review plan SHA-256 " + payload["plan_sha256"] + "; " + str(plan["entry_count"]) + " files.",
+                    "The current tree becomes a new root commit. Original history remains in the private archive. "
+                    "The scanner is heuristic; verify the source is suitable for AI access. No download, push or deployment. "
+                    "An occupied workspace is refused.", expires]
         if payload.get("action") == "repo_push":
             base = payload["expected_remote"]
             return ["Publish " + payload["repository"] + " branch " + payload["branch"] + ".",

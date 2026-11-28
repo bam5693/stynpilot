@@ -70,6 +70,48 @@ class LabBrokerTests(unittest.TestCase):
         self.assertFalse(self.call("lab_enrollment", "other", repository=lab.REPOSITORY)["result"]["enrolled"])
         self.assertEqual(self.service.handle(request)["error"], "lab_already_enrolled")
 
+    def test_deckplay_checkout_requires_passkey_and_exact_plan_once(self):
+        from stynpilot import deckplay_snapshot, repo_git
+        plan = {"archive_id": "a" * 32, "source": {"provider": "github", "url": repo_git.DECKPLAY_ORIGIN},
+                "source_bundle_sha256": "b" * 64, "ref": "refs/heads/main", "source_commit": COMMIT,
+                "workspace": "deckplay-hq", "policy": deckplay_snapshot.POLICY, "source_tree": "c" * 40,
+                "entry_count": 1, "scanned_bytes": 8,
+                "blocked": dict.fromkeys(("protected", "nonregular", "oversize", "binary", "sensitive"), 0),
+                "eligible": True}
+        projects = str(self.root / "projects")
+        jobs = Mock(projects_dir=projects)
+        jobs.workspaces.return_value = [{"path": projects + "/deckplay-hq"}]
+        jobs.enabled.return_value = True
+        jobs.deckplay_snapshot.return_value = {"receipt": {"snapshot_commit": "f" * 40}}
+        self.executor.jobs = jobs
+        expires = (datetime.now(timezone.utc) + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload = {"kind": "runner", "action": "deckplay_checkout", "name": "deckplay-hq",
+                   "owner": "owner", "device": DEVICE, "client": "assistant", "plan": plan,
+                   "plan_sha256": deckplay_snapshot.plan_digest(plan), "expires_at": expires}
+        def challenge(p):
+            return self.service.handle({"op": "challenge", "payload": p, "decision": "approve"})
+        for changed in ({**payload, "plan_sha256": "0" * 64}, {**payload, "name": "stynpilot"},
+                        {**payload, "expires_at": "2000-01-01T00:00:00Z"},
+                        {**payload, "plan": {**plan, "eligible": False}}):
+            self.assertFalse(challenge(changed)["ok"])
+        result = challenge(payload)
+        self.assertTrue(result["ok"], result)
+        self.assertIn(COMMIT, " ".join(result["challenge"]["summary"]))
+        self.assertIn("new root commit", " ".join(result["challenge"]["summary"]))
+        request = {"op": "runner_admin", "payload": payload, "challenge": result["challenge"]["challenge"],
+                   "proof": "test"}
+        with patch.object(self.executor, "_prove", return_value=("ordinary-token", None)):
+            self.assertEqual(self.service.handle(request)["error"], "deckplay_checkout_requires_passkey")
+        jobs.deckplay_snapshot.assert_not_called()
+        with patch.object(self.executor, "_prove", return_value=("passkey-proof", {"kid": "fixture"})), \
+                patch.object(self.executor, "_used_passkey"):
+            answer = self.service.handle(request)
+            self.assertTrue(answer["result"]["ok"], answer)
+        jobs.deckplay_snapshot.assert_called_once_with(projects + "/deckplay-hq", "assistant", plan["archive_id"],
+                                                      plan["ref"], COMMIT, payload["plan_sha256"])
+        self.assertFalse(self.service.handle(request)["ok"])
+        jobs.deckplay_snapshot.assert_called_once()
+
     def test_only_verified_commit_and_digest_from_the_enrolled_repository_can_start(self):
         self.assertEqual(self.start()["error"], "lab_enrollment_required")
         self.jobs.enroll("assistant")

@@ -461,6 +461,8 @@ class Executor:
                 raise ExecutionDenied("lab_enrollment_requires_passkey")
             if payload.get("action") == "repo_push":
                 raise ExecutionDenied("git_push_requires_passkey")
+            if payload.get("action") == "deckplay_checkout":
+                raise ExecutionDenied("deckplay_checkout_requires_passkey")
             if payload.get("action") in repository_auth.ACTIONS:
                 raise ExecutionDenied("repository_access_requires_passkey")
         self._used_passkey(passkey, rid, decision)
@@ -748,8 +750,10 @@ class Executor:
             fields |= {"client", "repository", "branch", "commit", "expected_remote"}
         if action == "repo_credential":
             fields |= {"client", "repository"}
+        if action == "deckplay_checkout":
+            fields |= {"client", "plan", "plan_sha256"}
         if (set(payload) != fields or payload.get("kind") != "runner"
-                or action not in ("setup", "enroll", "unenroll", "settle_inference", "lab_enroll", "repo_push", "repo_credential")
+                or action not in ("setup", "enroll", "unenroll", "settle_inference", "lab_enroll", "repo_push", "repo_credential", "deckplay_checkout")
                 or payload.get("owner") != self.owner or payload.get("device") != self.device):
             raise ExecutionDenied("runner_request_invalid")
         name = payload.get("name")
@@ -768,6 +772,16 @@ class Executor:
                 raise ExecutionDenied("lab_executor_unavailable")
             if state["enrolled"]:
                 raise ExecutionDenied("lab_already_enrolled")
+        if action == "deckplay_checkout":
+            from .. import deckplay_snapshot, repo_archive
+            if name != "deckplay-hq" or self.passkeys is None or type(payload["client"]) is not str or not lab.CLIENT.fullmatch(payload["client"]):
+                raise ExecutionDenied("deckplay_checkout_not_available")
+            try:
+                deckplay_snapshot.validate_plan(payload["plan"], payload["plan_sha256"])
+            except repo_archive.ArchiveError as error:
+                raise ExecutionDenied(error.code) from None
+            if not any(row["path"] == self._workspace_path(name) for row in self.jobs.workspaces()):
+                raise ExecutionDenied("workspace_not_enrolled")
         if action == "repo_credential":
             if name != "stynpilot":
                 raise ExecutionDenied("git_workspace_not_bound")
@@ -843,10 +857,15 @@ class Executor:
                 except (JobError, runner_policy.RunnerError, managed_activity.ActivityError, lab.LabError,
                         repository_auth.AuthorizationError) as stopped:
                     result = {"ok": False, "stopped": stopped.code, "changed_anything": None, "action": payload["action"]}
+                    if payload["action"] == "deckplay_checkout" and stopped.code in (
+                            "checkout_outcome_unverified", "projects_helper_timed_out", "deckplay_checkout_quiescence_unverified"):
+                        self._attention(rid, None, stopped.code, "Check the DeckPlay workspace and receipt before retrying.")
+                        result["needs_owner_intervention"] = True
                 except Exception as error:
                     result = {"ok": False, "stopped": "unexpected_%s" % type(error).__name__, "changed_anything": None,
                               "action": payload["action"]}
-                self._record_result(rid, "done" if result.get("ok") else "failed", result)
+                state = "needs_owner_intervention" if result.get("needs_owner_intervention") else "done" if result.get("ok") else "failed"
+                self._record_result(rid, state, result)
                 return result
         except managed_activity.ActivityError as error:
             raise ExecutionDenied(error.code) from None
@@ -885,6 +904,16 @@ class Executor:
                                            payload["days"], payload_hash(payload)[0])
         if action == "lab_enroll":
             return self.lab.enroll(payload["client"])
+        if action == "deckplay_checkout":
+            if managed_activity.held(self.dir):
+                raise JobError("managed_activity_busy")
+            plan = payload["plan"]
+            result = self.jobs.deckplay_snapshot(self._workspace_path("deckplay-hq"), payload["client"],
+                                                 plan["archive_id"], plan["ref"], plan["source_commit"], payload["plan_sha256"])
+            receipt = result["receipt"]
+            return {"ok": True, "action": action, "workspace": "deckplay-hq",
+                    "source_commit": plan["source_commit"], "source_tree": plan["source_tree"],
+                    "plan_sha256": payload["plan_sha256"], "snapshot_commit": receipt["snapshot_commit"]}
         if action == "repo_push":
             from .. import repo_git
             from .repo_push import Transport
@@ -1012,6 +1041,11 @@ class Executor:
     def _runner_green(self, call, args):
         jobs, base = self.jobs, self.jobs.projects_dir
         name_of = lambda path: os.path.basename(path)
+        if call == "deckplay_snapshot_preview":
+            if set(args) != {"client", "archive_id", "ref", "commit"} or self.passkeys is None:
+                raise ExecutionDenied("deckplay_checkout_not_available")
+            return jobs.deckplay_snapshot(self._workspace_path("deckplay-hq"), args["client"], args["archive_id"],
+                                          args["ref"], args["commit"])
         if call == "status":
             enabled = jobs.enabled()
             test = jobs.selftest_state()

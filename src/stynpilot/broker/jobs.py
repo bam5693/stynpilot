@@ -28,10 +28,11 @@ import threading
 import time
 from pathlib import Path
 
-from .. import redact, repo_git, runner, safefs
+from .. import managed_activity, redact, repo_git, runner, safefs, vault
 from . import apt
 from ..projects_helper import block_devices
-from .helper import MEASURE_TIMEOUT, SLACK, STOP_WAIT, HelperError, LocalHelper, SystemdHelper
+from .helper import MEASURE_TIMEOUT, SLACK, STOP_WAIT, HelperError, LocalHelper, SystemdHelper, checkout_unit
+from .lab import LabError, SystemdLab
 
 MAX_OUT = 256 * 1024
 MAX_ENTRIES = 50000
@@ -243,6 +244,59 @@ class JobRunner:
             except HelperError as error:
                 raise JobError(error.code) from None
 
+    def deckplay_snapshot(self, workspace, client, archive_id, ref, commit, plan_sha256=None):
+        """Owner-side review or approved materialization under workspace exclusion."""
+        self.require_ready()
+        real = self._workspace_ok(workspace)
+        if os.path.basename(real) != repo_git.DECKPLAY_WORKSPACE:
+            raise JobError("git_workspace_not_bound")
+        with self._ws_lock:
+            with self._lock:
+                if not self._db.execute("select 1 from workspaces where path=?", (real,)).fetchone():
+                    raise JobError("workspace_not_enrolled")
+                if self._db.execute("select 1 from jobs where workspace=? and state='running'", (real,)).fetchone():
+                    raise JobError("workspace_git_busy")
+            if self._measure(real, local=False)["free"] < self.disk_start_free:
+                raise JobError("not_enough_free_disk_space_to_start_a_job")
+            request = {"op": "deckplay_snapshot_preview" if plan_sha256 is None else "deckplay_snapshot_checkout",
+                       "home": self.home, "projects": self.projects_dir, "name": repo_git.DECKPLAY_WORKSPACE,
+                       "client": client, "archive_id": archive_id, "ref": ref, "commit": commit}
+            if plan_sha256 is not None:
+                return self._dispatch_deckplay_checkout(request, plan_sha256)
+            try:
+                return self.helper.call(request, timeout=90)
+            except HelperError as error:
+                raise JobError(error.code) from None
+
+    def _dispatch_deckplay_checkout(self, request, plan_sha256):
+        job = secrets.token_hex(16)
+        kind = "deckplay_checkout"
+        dispatch = self.dir / ("deckplay-dispatch-" + job)
+        managed_activity.claim(self.dir, kind, job)
+        try:
+            vault._write_atomic(self.dir, dispatch.name, (plan_sha256 + "\n").encode("ascii"), mode=0o644)
+            return self.helper.call(dict(request, plan_sha256=plan_sha256, checkout_job=job, dispatch=str(dispatch)), timeout=180)
+        except HelperError as error:
+            raise JobError(error.code) from None
+        finally:
+            self.reconcile_deckplay_checkout()
+
+    def reconcile_deckplay_checkout(self):
+        """Called under exclusive restore admission. Never replay a spent checkout."""
+        claim = managed_activity.current(self.dir)
+        if not claim or claim["kind"] != "deckplay_checkout":
+            return
+        job = claim["job_id"]
+        dispatch = self.dir / ("deckplay-dispatch-" + job)
+        dispatch.unlink(missing_ok=True)
+        vault._fsync_dir(self.dir)
+        try:
+            SystemdLab(unit_name=checkout_unit).stop(job)
+        except (LabError, OSError, subprocess.SubprocessError):
+            raise JobError("deckplay_checkout_quiescence_unverified") from None
+        self._ask("deckplay_checkout_cleanup", _timeout=10, checkout_job=job)
+        managed_activity.finish(self.dir, "deckplay_checkout", job)
+
     def fetch_checkout(self, workspace, commit, digest, bundle):
         self.require_ready()
         real = self._workspace_ok(workspace)
@@ -333,6 +387,10 @@ class JobRunner:
     def _start(self, real, label, argv, limits, seconds, need_enrolled=True, masked=None, run_user=None, input_data=None):
         self.ensure_user()
         with self._ws_lock:
+            if need_enrolled and os.path.basename(real) == repo_git.DECKPLAY_WORKSPACE:
+                claim = managed_activity.current(self.dir)
+                if claim and claim["kind"] == "deckplay_checkout":
+                    raise JobError("deckplay_checkout_in_progress")
             if need_enrolled:
                 with self._lock:
                     running = self._db.execute(

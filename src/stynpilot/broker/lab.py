@@ -46,8 +46,9 @@ def _control(argv, timeout):
 class SystemdLab:
     """The root controller can start and stop only its own named transient units."""
 
-    def __init__(self, *, control=_control, cgroups="/sys/fs/cgroup"):
+    def __init__(self, *, control=_control, cgroups="/sys/fs/cgroup", unit_name=_name):
         self.control, self.cgroups = control, Path(cgroups)
+        self.unit_name = unit_name
 
     def ready(self):
         return (all(os.access(path, os.X_OK) for path in
@@ -85,7 +86,7 @@ class SystemdLab:
             raise LabError("lab_start_failed")
 
     def _properties(self, job):
-        unit = _name(job)
+        unit = self.unit_name(job)
         request = ["/usr/bin/systemctl", "show", "--all", "--no-pager",
                    "--property=LoadState,ActiveState,ControlGroup,Job", unit]
         result = self.control(request, 3)
@@ -104,7 +105,7 @@ class SystemdLab:
             return False
         if not (self.cgroups / "cgroup.controllers").is_file():
             raise LabError("lab_quiescence_unverified")
-        events = self.cgroups / "system.slice" / _name(job) / "cgroup.events"
+        events = self.cgroups / "system.slice" / self.unit_name(job) / "cgroup.events"
         try:
             values = dict(line.split() for line in events.read_text().splitlines())
         except FileNotFoundError:
@@ -117,7 +118,7 @@ class SystemdLab:
 
     def stop(self, job):
         if not self.idle(job):
-            self.control(["/usr/bin/systemctl", "stop", _name(job)], 12)
+            self.control(["/usr/bin/systemctl", "stop", self.unit_name(job)], 12)
         if not self.idle(job):
             raise LabError("lab_quiescence_unverified")
 

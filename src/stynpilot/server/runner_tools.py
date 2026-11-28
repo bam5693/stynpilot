@@ -136,6 +136,34 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
         return lab_call("workspace_fetch_stynpilot", device_id, "lab_fetch", repository=repository,
                         commit=commit, bundle_sha256=bundle_sha256)
 
+    @server.tool(name="deckplay_checkout_preview", title="Review existing DeckPlay archive for offline checkout",
+                 annotations=READ_ONLY, description="Inspect the exact archived branch tip, protected and unreviewed content counts, and review plan. Does not copy files.")
+    def deckplay_checkout_preview(device_id: str, archive_id: str, ref: str, commit: str) -> dict:
+        return lab_call("deckplay_checkout_preview", device_id, "deckplay_snapshot_preview",
+                        archive_id=archive_id, ref=ref, commit=commit)
+
+    @server.tool(name="commander_request_deckplay_checkout", title="Request phone approval for DeckPlay offline checkout",
+                 annotations=FILES_A_REQUEST, description="Request passkey approval to create a history-isolated local working snapshot from an eligible archive review. No network, push or overwrite.")
+    def request_deckplay_checkout(device_id: str, archive_id: str, ref: str, commit: str, plan_sha256: str) -> dict:
+        def work(owner):
+            from .. import deckplay_snapshot
+            proposer = ctx.proposer
+            result = broker.runner("deckplay_snapshot_preview", {"client": proposer.client, "archive_id": archive_id,
+                                                                  "ref": ref, "commit": commit})
+            plan = result["plan"]
+            deckplay_snapshot.validate_plan(plan, plan_sha256)
+            if result["plan_sha256"] != plan_sha256:
+                return _error("snapshot_plan_changed")
+            expires = now() + timedelta(minutes=20)
+            payload = {"kind": "runner", "action": "deckplay_checkout", "name": "deckplay-hq",
+                       "owner": owner, "device": device_id, "client": proposer.client,
+                       "plan": plan, "plan_sha256": plan_sha256, "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            row, _ = store.submit(kind="runner", software="deckplay-checkout-" + plan_sha256[:24], device=device_id,
+                                  owner=owner, proposer=proposer, payload=payload, summary=render_summary(payload),
+                                  expires=expires.timestamp())
+            return receipt(row)
+        return run("commander_request_deckplay_checkout", device_id, work, write=True)
+
     @server.tool(name="commander_request_stynpilot_push", title="Request approval for one exact StyNpilot work-branch push",
                  annotations=FILES_A_REQUEST,
                  description="Request an independent passkey approval to publish one exact local work/test branch commit. Supply its current remote SHA, or forty zeros for a new branch. Fast-forward only.")
@@ -681,7 +709,7 @@ def register(server, *, router, clients, store, bearer, broker, projects_dir, ap
                               "git-status, git-diff, git-log) inside an authorized project, in the locked-down sandbox: no network, no view of "
                               "the owner's other files, limited time/memory/processes. args are the recipe's few allowed options. Returns a "
                               "job_id; poll job_status and read job_output. Refused until the live sandbox self-test has passed. "
-                              "For the enrolled StyNpilot checkout only: git-work-branch takes [new_branch, expected_head_sha]. "
+                              "For the enrolled StyNpilot or DeckPlay HQ checkout: git-work-branch takes [new_branch, expected_head_sha]. "
                               "git-work-commit takes [current_branch, expected_head_sha, message, file, ...]. "
                               "git-work-switch takes [target_branch, expected_head_sha, expected_target_sha]. "
                               "git-work-fast-forward takes [current_branch, expected_head_sha, local_target_sha]. "

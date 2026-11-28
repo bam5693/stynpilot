@@ -38,7 +38,8 @@ _SAFE_RESULT = ("ok", "stopped", "installed", "rollback_id", "restored", "restor
                 "action", "workspace", "entries", "skipped", "runner_user", "enabled", "selftest",
                 "enrollment_open", "label", "kid", "passkeys_active",
                 "side", "mode", "restore", "generation", "rotation", "progress", "reencrypted", "left_with_old_key", "moved_unreadable",
-                "generations_kept", "owner_side_authorized", "finished_later")
+                "generations_kept", "owner_side_authorized", "finished_later",
+                "source_commit", "source_tree", "plan_sha256", "snapshot_commit")
 KINDS = ("install", "rollback", "upgrade", "runner", "passkey", "release", "backup")
 MAX_PENDING_PER_CLIENT = 5
 _REQUEST_ID = re.compile(r"[a-f0-9]{64}\Z")

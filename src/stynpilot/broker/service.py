@@ -120,7 +120,7 @@ class BrokerService:
         approving = isinstance(payload, dict) and (
             (msg.get("op") == "backup_admin" and payload.get("action") == "restore_root")
             or (msg.get("op") == "runner_admin" and payload.get("action") in
-                ("settle_inference", "lab_enroll", "repo_push", *REPOSITORY_ACTIONS))
+                ("settle_inference", "lab_enroll", "repo_push", "deckplay_checkout", *REPOSITORY_ACTIONS))
             or (msg.get("op") == "repository_credential_install" and payload.get("action") == "repo_credential"))
         exclusive = approving or (msg.get("op") == "runner" and msg.get("call") in
                                   ("inference_claim", "inference_finish", "lab_start", "lab_cancel", "lab_checkout", "lab_fetch"))
@@ -316,7 +316,7 @@ class BrokerService:
         runs; the ``_busy`` lock still allows only ONE change (and no new decisions) at a time."""
         sock = self._sock or self.bind()
         lab = getattr(self.executor, "lab", None)
-        if lab is not None:
+        if lab is not None or getattr(self.executor, "jobs", None) is not None:
             self._lab_boot_pending = True
             threading.Thread(target=self._watch_lab, args=(sock, lab), name="stynpilot-lab-reconcile", daemon=True).start()
         slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
@@ -356,9 +356,13 @@ class BrokerService:
         previous_error = None
         while sock.fileno() >= 0:
             try:
-                if startup or managed_activity.held(lab.state):
-                    with root_restore.admission(lab.state, exclusive=True):
-                        lab.reconcile(startup=startup)
+                state = self.executor.dir
+                if startup or managed_activity.held(state):
+                    with root_restore.admission(state, exclusive=True):
+                        if self.executor.jobs is not None:
+                            self.executor.jobs.reconcile_deckplay_checkout()
+                        if lab is not None:
+                            lab.reconcile(startup=startup)
                         startup = False
                         self._lab_boot_pending = False
                         previous_error = None

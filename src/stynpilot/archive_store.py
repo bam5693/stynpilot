@@ -27,6 +27,7 @@ _ARCHIVE = re.compile(r"[a-f0-9]{32}\Z")
 _CLIENT = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 _PENDING = re.compile(r"\.pending-[a-z0-9_]{8}\Z")
 _PROTECTED_LOCATIONS = tuple(tuple(path.lower().split("/")) for path in safefs.HOME_DENY) + ((".git",),)
+_DECKPLAY_SOURCE = {"provider": "github", "url": "https://github.com/bam5693/Deckplay-hq.git"}
 
 
 def _private_dir(path):
@@ -95,7 +96,7 @@ class Store:
         if write:
             self.path.mkdir(mode=0o700, exist_ok=True)
         _private_dir(self.path)
-        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        flags = (os.O_RDWR if write else os.O_RDONLY) | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
         fd = os.open(self.path / "store.lock", flags | (os.O_CREAT if write else 0), 0o600)
         try:
             info = os.fstat(fd)
@@ -232,6 +233,61 @@ class Store:
         if os.path.lexists(bare / "objects/info/alternates") or os.path.lexists(bare / "shallow"):
             raise git.ArchiveError("archive_store_untrusted")
         return bare, receipt
+
+    def _deckplay_checkout_binding(self, client, archive_id, ref, commit):
+        # Caller holds the store lock. Never accept a path or origin from MCP.
+        bare, receipt = self._lookup(archive_id, client)
+        if receipt["source"] != _DECKPLAY_SOURCE:
+            raise git.ArchiveError("archive_checkout_source_mismatch")
+        if (type(ref) is not str or not ref.startswith("refs/heads/")
+                or type(commit) is not str or not git.OID.fullmatch(commit)
+                or receipt["refs"].get(ref) != commit):
+            raise git.ArchiveError("archive_checkout_ref_mismatch")
+        bundle = self.path / archive_id / "archive" / "source.bundle"
+        if git._bundle_digest(bundle) != (receipt["bundle_sha256"], receipt["bundle_size"]):
+            raise git.ArchiveError("archive_bundle_digest_mismatch")
+        if git._git(bare, "show-ref", "--verify", "--hash", ref, timeout=8).strip() != commit.encode("ascii"):
+            raise git.ArchiveError("archive_checkout_ref_mismatch")
+        return bare, receipt
+
+    def deckplay_checkout_preview(self, client, archive_id, ref, commit):
+        """Metadata-only preflight for a future separately authorized checkout.
+
+        This does not grant checkout permission, expose historical objects, or
+        write to a workspace. A full import must additionally enforce workspace
+        enrollment, owner approval and content/history isolation.
+        """
+        with self._locked():
+            bare, receipt = self._deckplay_checkout_binding(client, archive_id, ref, commit)
+            tree = _tree(bare, commit)
+            return {"archive_id": archive_id, "source": dict(receipt["source"]),
+                    "workspace": "deckplay-hq", "ref": ref, "commit": commit,
+                    "bundle_sha256": receipt["bundle_sha256"],
+                    "bundle_size": receipt["bundle_size"], "entry_count": len(tree),
+                    "protected_path_count": sum(not _safe_path(name) for name in tree),
+                    "nonregular_entry_count": sum(row["mode"] not in ("100644", "100755")
+                                                  or row["type"] != "blob" for row in tree.values()),
+                    "checkout_authorized": False, "requires_content_review": True}
+
+    @contextmanager
+    def _deckplay_transfer_bundle(self, client, archive_id, ref, commit):
+        """Stage a self-contained single-tip bundle, internally, without networking.
+
+        Not an MCP operation. A future approval-bound consumer must separately
+        authorize materialization and historical-content access. Never return
+        this path or bytes in an assistant-visible response.
+        """
+        with self._locked():
+            bare, receipt = self._deckplay_checkout_binding(client, archive_id, ref, commit)
+            with tempfile.TemporaryDirectory(prefix="stynpilot-deckplay-transfer-") as scratch:
+                bundle = Path(scratch) / "checkout.bundle"
+                git._git(bare, "bundle", "create", str(bundle), ref)
+                digest, size = git._bundle_digest(bundle)
+                # Verify without consulting the original object store.
+                git._verify_bundle(bundle, {ref: commit})
+                yield bundle, {"archive_id": archive_id, "source": dict(receipt["source"]),
+                               "ref": ref, "commit": commit, "bundle_sha256": digest,
+                               "bundle_size": size, "source_bundle_sha256": receipt["bundle_sha256"]}
 
     def refs(self, client, archive_id, offset=0, limit=50):
         with self._locked():

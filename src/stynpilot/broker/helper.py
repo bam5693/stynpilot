@@ -13,12 +13,20 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .. import managed_activity
+
 HELPER = str(Path(__file__).resolve().parent.parent / "projects_helper.py")
 DEFAULT_TIMEOUT = 120          # walks over big workspaces; the measurement the disk watchdog uses asks for much less
 MEASURE_TIMEOUT = 4
 SLACK = 1               # seconds the client waits past the unit's own deadline before it stops the unit itself
 STOP_WAIT = 2           # seconds the cleanup (systemctl kill) may take; it can fail or time out without ever escaping the helper
 _ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+
+
+def checkout_unit(job):
+    if type(job) is not str or not managed_activity.ID.fullmatch(job):
+        raise HelperError("deckplay_checkout_dispatch_invalid")
+    return "stynpilot-deckplay-checkout-" + job + ".service"
 
 
 class HelperError(Exception):
@@ -44,18 +52,26 @@ class SystemdHelper:
     def call(self, request, timeout=DEFAULT_TIMEOUT, *, data=None):
         """One owner-side operation with a HARD deadline: systemd itself ends the unit at ``timeout`` (RuntimeMaxSec), and if the
         client is still hanging a little later the unit is stopped by name and the call fails. A slow measurement is a failed one."""
-        writable = request.get("home") if request.get("op") == "prepare" else request.get("projects")
-        unit = "stynpilot-projects-helper-" + secrets.token_hex(8)
+        operation = request.get("op")
+        writable = (request.get("home") if operation == "prepare" else request.get("projects")) if operation != "deckplay_snapshot_preview" else None
+        dispatch = request.get("dispatch") if operation == "deckplay_snapshot_checkout" else None
+        unit = checkout_unit(request.get("checkout_job")).removesuffix(".service") if dispatch else "stynpilot-projects-helper-" + secrets.token_hex(8)
         cmd = ["systemd-run", "--pipe", "--wait", "--collect", "--quiet", "--unit", unit, "-p", "RuntimeMaxSec=%d" % max(1, int(timeout)),
                "-p", "User=" + self.owner_user, "-p", "ProtectSystem=strict",
                "-p", "PrivateNetwork=yes", "-p", "PrivateTmp=yes", "-p", "NoNewPrivileges=yes", "-p", "CapabilityBoundingSet=",
                "-p", "ProtectKernelModules=yes", "-p", "RestrictAddressFamilies=AF_UNIX", "-p", "TimeoutStopSec=5"]
         if writable:
             cmd += ["-p", "ReadWritePaths=" + str(writable)]
-        if data is not None:
+        if dispatch:
+            cmd += ["-p", "Slice=system.slice", "-p", "ExitType=cgroup", "-p", "BindsTo=stynpilot-installer.service",
+                    "-p", "After=stynpilot-installer.service", "-p", "BindReadOnlyPaths=" + dispatch + ":/run/stynpilot-deckplay-dispatch"]
+            request = dict(request, dispatch="/run/stynpilot-deckplay-dispatch")
+        if data is not None or request.get("op") in ("deckplay_snapshot_preview", "deckplay_snapshot_checkout"):
             cmd += ["-p", "MemoryMax=768M", "-p", "MemorySwapMax=0", "-p", "TasksMax=32",
                     "-p", "CPUQuota=200%", "-p", "LimitFSIZE=64M", "-p", "KillMode=control-group", "-p", "UMask=0077"]
-        cmd += ["--", self.python, "-IB", HELPER, json.dumps(request)]
+        if operation in ("deckplay_snapshot_preview", "deckplay_snapshot_checkout"):
+            cmd += ["-p", "LimitCORE=0", "-p", "TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size=256M,mode=1777"]
+        cmd += ["--", self.python, "-IB", "-X", "pycache_prefix=/usr/lib/stynpilot/.source-only", HELPER, json.dumps(request)]
         try:
             done = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout + SLACK, env=_ENV, check=False)
         except subprocess.TimeoutExpired:

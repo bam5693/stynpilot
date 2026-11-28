@@ -44,6 +44,10 @@ GitHub App installation credentials can be narrowed to one repository with Conte
 
 ## Milestones and versions
 
+Dev30 adds an owner-passkey-approved offline checkout from an existing DeckPlay archive to the fixed empty workspace. The approval binds source, checkout tree, scanner result and expiry. The approved worker publishes a one-commit Git history with the exact reviewed tree and returns the source and snapshot commit IDs. The original history remains private. The installer keeps recovery excluded until the helper's entire cgroup is quiescent and its private staging is cleaned. A refused or interrupted pre-publication checkout leaves the existing workspace intact. Run `restore-media.sh PACKAGE --deckplay-checkout-case` for packaged acceptance.
+
+To ship reviewed work later, apply a reviewed delta from the local snapshot to a fresh branch based on the exact archived source commit or a separately approved successor. Verify the resulting tree, ancestry and tests, and use the separate repository-specific push authorization. Keep the one-commit snapshot and original archive as provenance.
+
 | Milestone | Scope | Debian package |
 | --- | --- | --- |
 | Dev22 | Encrypted backup vaults, verification and drills | `0.1.0~dev22` |
@@ -54,6 +58,7 @@ GitHub App installation credentials can be narrowed to one repository with Conte
 | GitHub credential setup | Phone entry and transport hardening | `0.1.0~dev27` released |
 | Repository archives | Scoped archive inspection and adoption | `0.1.0~dev28` candidate |
 | Private repository authorization | Phone passkey grant and guided GitLab read authorization | `0.1.0~dev29` candidate |
+| DeckPlay checkout | Phone-approved history-isolated working snapshot | `0.1.0~dev30` candidate |
 | Dev23 Stage 4 | Owner-side restoration | Following unused increment |
 
 Dev24 off-machine backup and Dev25 repository management are milestone labels. Every separately published package consumes a version increment.

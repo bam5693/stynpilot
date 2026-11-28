@@ -57,6 +57,53 @@ class StoreTests(unittest.TestCase):
         with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_path_invalid"):
             self.store.file("scope.chatgpt", archive_id, self.old, "../grant.json")
 
+    def test_deckplay_checkout_preview_is_bound_and_nonmutating(self):
+        adopted = self.store.adopt(self.archive, **self.binding)
+        archive_id = adopted["archive_id"]
+        with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_checkout_source_mismatch"):
+            self.store.deckplay_checkout_preview("scope.chatgpt", archive_id, "refs/heads/main", self.new)
+        with patch.object(archive_store, "_DECKPLAY_SOURCE", adopted["source"]):
+            with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_not_found"):
+                self.store.deckplay_checkout_preview("scope.other", archive_id, "refs/heads/main", self.new)
+            for ref, commit in (("refs/heads/main", self.old), ("refs/heads/other", self.new),
+                                ("refs/tags/main", self.new), ("refs/heads/main", "HEAD")):
+                with self.subTest(ref=ref, commit=commit), self.assertRaisesRegex(
+                        repo_archive.ArchiveError, "archive_checkout_ref_mismatch"):
+                    self.store.deckplay_checkout_preview("scope.chatgpt", archive_id, ref, commit)
+            preview = self.store.deckplay_checkout_preview("scope.chatgpt", archive_id, "refs/heads/main", self.new)
+            self.assertEqual(preview["workspace"], "deckplay-hq")
+            self.assertEqual(preview["bundle_sha256"], adopted["bundle_sha256"])
+            self.assertEqual(preview["entry_count"], 4)
+            self.assertEqual(preview["protected_path_count"], 2)
+            self.assertEqual(preview["nonregular_entry_count"], 0)
+            self.assertFalse(preview["checkout_authorized"])
+            self.assertTrue(preview["requires_content_review"])
+            self.assertNotIn("paths", preview)
+            self.assertFalse((self.root / "deckplay-hq").exists())
+            bundle = self.store.path / archive_id / "archive" / "source.bundle"
+            with bundle.open("ab") as stream:
+                stream.write(b"x")
+            with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_bundle_digest_mismatch"):
+                self.store.deckplay_checkout_preview("scope.chatgpt", archive_id, "refs/heads/main", self.new)
+
+    def test_deckplay_transfer_bundle_is_self_contained_and_ephemeral(self):
+        adopted = self.store.adopt(self.archive, **self.binding)
+        archive_id = adopted["archive_id"]
+        with patch.object(archive_store, "_DECKPLAY_SOURCE", adopted["source"]):
+            with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_not_found"):
+                with self.store._deckplay_transfer_bundle("scope.other", archive_id, "refs/heads/main", self.new):
+                    self.fail("unapproved client")
+            with self.store._deckplay_transfer_bundle("scope.chatgpt", archive_id, "refs/heads/main", self.new) as (bundle, receipt):
+                self.assertEqual(receipt["source_bundle_sha256"], adopted["bundle_sha256"])
+                self.assertEqual(receipt["commit"], self.new)
+                self.assertEqual(repo_archive._bundle_digest(bundle), (receipt["bundle_sha256"], receipt["bundle_size"]))
+                restored = self.root / "isolated.git"
+                repo_archive._restore_bundle(bundle, restored, {"refs/heads/main": self.new}, "refs/heads/main")
+                self.assertEqual(repo_archive._git(restored, "rev-parse", "HEAD").decode().strip(), self.new)
+                self.assertEqual(repo_archive._git(restored, "rev-parse", "HEAD^").decode().strip(), self.old)
+            self.assertFalse(bundle.exists())
+            self.assertEqual(self.store.list("scope.chatgpt")["archives"], [adopted])
+
     def test_capacity_binding_and_startup_recovery(self):
         with patch.object(archive_store, "MAX_RETAINED", 4096), self.assertRaisesRegex(
                      repo_archive.ArchiveError, "archive_store_capacity"):

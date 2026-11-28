@@ -52,7 +52,8 @@ RUNNER_WRITE_TOOLS = frozenset({"commander_prepare_stynpilot_release", "commande
                                 "dev_lab_job_status", "dev_lab_job_output", "dev_lab_cancel",
                                 "repository_archive_list", "repository_archive_refs", "repository_archive_history",
                                 "repository_archive_tree", "repository_archive_file", "repository_archive_compare",
-                                "commander_request_repository_access", "repository_access_grants", "repository_private_readiness"})
+                                "commander_request_repository_access", "repository_access_grants", "repository_private_readiness",
+                                "deckplay_checkout_preview", "commander_request_deckplay_checkout"})
 PROPOSE_ONLY_TOOLS = frozenset({"commander_request_software_install", "commander_software_install_status",
                                 "commander_request_software_rollback", "commander_request_stynpilot_upgrade"}) | RUNNER_WRITE_TOOLS
 FILES_A_REQUEST = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)

@@ -4,7 +4,7 @@ set -eu
 umask 077
 test "$#" -ge 1 && test "$#" -le 2
 if [ "$#" -eq 2 ]; then
-    case "$2" in --fault-cases|--power-case|--limits-case|--oom-case|--upgrade-case|--lab-mcp-case|--archive-mcp-case|--repository-auth-case) ;; *) exit 2;; esac
+    case "$2" in --fault-cases|--power-case|--limits-case|--oom-case|--upgrade-case|--lab-mcp-case|--archive-mcp-case|--repository-auth-case|--deckplay-checkout-case) ;; *) exit 2;; esac
 fi
 package=$(realpath "$1")
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -25,7 +25,10 @@ fi
 if [ "${2-}" = --repository-auth-case ]; then
     cp "$repo/tools/dev/guest-repository-auth.py" "$repo/tools/dev/guest-archive-mcp.py" "$repo/tests/test_repository_auth.py" "$run/payload/"
 fi
-if [ "${2-}" = --lab-mcp-case ]; then
+if [ "${2-}" = --deckplay-checkout-case ]; then
+    cp "$repo/tools/dev/guest-deckplay-checkout.py" "$run/payload/"
+fi
+if [ "${2-}" = --lab-mcp-case ] || [ "${2-}" = --deckplay-checkout-case ]; then
     cp "$repo/tools/dev/guest-lab-mcp.py" "$run/payload/"
     (
         cd "$dev_dir/cache/lab-guest-debs"
@@ -83,6 +86,10 @@ if [[ -e /mnt/stynpilot-fixture/archive-mcp-case ]]; then
 fi
 if [[ -e /mnt/stynpilot-fixture/repository-auth-case ]]; then
     fixture=(/usr/bin/python3 -IB /mnt/stynpilot-fixture/guest-repository-auth.py)
+fi
+if [[ -e /mnt/stynpilot-fixture/deckplay-checkout-case ]]; then
+    "${apt_local[@]}" -y --no-install-recommends install bubblewrap python3-pytest
+    fixture=(/usr/bin/python3 -IB /mnt/stynpilot-fixture/guest-deckplay-checkout.py)
 fi
 if ! "${fixture[@]}"; then
     journalctl -b -u stynpilot-installer.service -u stynpilot-restore.service -u stynpilot-restore.path -u 'run-*.service' -u 'stynpilot-lab-*.service' --no-pager -n 160

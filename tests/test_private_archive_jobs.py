@@ -1,5 +1,6 @@
 """Private native archive jobs reserve recovery until both cgroups quiesce."""
 
+from contextlib import nullcontext
 import tempfile
 import threading
 import time
@@ -30,6 +31,7 @@ class PrivateArchiveJobsTests(unittest.TestCase):
                                   expires=int(time.time()) + 360)
         auth = Mock()
         auth.begin_fetch.return_value = binding
+        auth.fetch_guard.side_effect = lambda _: nullcontext()
         auth.describe.return_value = {"authorization_profile": "e" * 64}
         self.transport, self.receiver = Mock(), Mock()
         self.transport.capture.side_effect = self._capture

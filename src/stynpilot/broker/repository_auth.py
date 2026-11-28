@@ -245,10 +245,14 @@ class Store:
         if changed:
             self._save(state)
 
+    before_save = None
+
     def _save(self, state):
         data = json.dumps(state, sort_keys=True).encode()
         if len(data) > MAX_STATE:
             raise AuthorizationError("repository_grant_limit")
+        if self.before_save is not None:
+            self.before_save(state)
         vault._write_atomic(self.root, "grants.json", data)
 
     def target(self, repository):
@@ -419,13 +423,30 @@ class Store:
             return FetchLease(rid, client, repository, (target["provider"], target["origin"]),
                               minimum, state["epoch"], credential)
 
-    def check_fetch(self, lease):
-        """Refuse publication if the original exact grant, credential or deadline changed."""
+    def _check_fetch(self, state, lease):
+        _, row, target = self._grant(state, lease.client, lease.repository, "fetch", request_id=lease.request_id)
+        if ((target["provider"], target["origin"]) != lease.source or lease.expires <= int(self.clock())
+                or state["epoch"] != lease.epoch
+                or not secrets.compare_digest(row["credential"]["access"], lease.credential[1])):
+            raise AuthorizationError("repository_fetch_grant_changed")
+
+    def fetch_matches(self, state, lease):
+        try:
+            self._check_fetch(state, lease)
+        except AuthorizationError:
+            return False
+        return True
+
+    @contextmanager
+    def fetch_guard(self, lease):
+        """Hold the authorization lock while the broker writes the dispatch."""
         with self._state() as state:
-            _, row, target = self._grant(state, lease.client, lease.repository, "fetch", request_id=lease.request_id)
-            if ((target["provider"], target["origin"]) != lease.source or lease.expires <= int(self.clock())
-                    or state["epoch"] != lease.epoch
-                    or not secrets.compare_digest(row["credential"]["access"], lease.credential[1])):
-                raise AuthorizationError("repository_fetch_grant_changed")
+            self._check_fetch(state, lease)
+            yield
+
+    def check_fetch(self, lease):
+        with self.fetch_guard(lease):
+            pass
+
     def probe(self, client, repository):
         return self.use(client, repository, "read", self.provider.probe)

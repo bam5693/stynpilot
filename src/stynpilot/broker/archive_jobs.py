@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 
-from .. import archive_store, managed_activity, repo_archive, root_restore, statelock, vault
+from .. import archive_publication, archive_store, managed_activity, repo_archive, root_restore, statelock, vault
 from .archive_transport import Transport
 from .helper import HelperError, archive_receive_unit
 from .lab import LabError, SystemdLab
@@ -35,6 +35,8 @@ class Jobs:
         self.transport = transport or Transport()
         self.receive_fence = receive_fence or SystemdLab(unit_name=archive_receive_unit)
         self._active = None
+        if authorization is not None:
+            authorization.before_save = self._before_grant_save
 
     def _folder(self, job):
         if type(job) is not str or not managed_activity.ID.fullmatch(job):
@@ -120,8 +122,8 @@ class Jobs:
         # A concurrent revoke or cancellation cannot publish an older grant.
         for _ in range(20):
             try:
-                with root_restore.admission(self.state, exclusive=True):
-                    self.authorization.check_fetch(binding)
+                with (root_restore.admission(self.state, exclusive=True),
+                      self.authorization.fetch_guard(binding)):
                     if (self._read(job)["state"] != "running"
                             or managed_activity.current(self.state) != {"job_id": job, "kind": KIND}):
                         raise repo_archive.ArchiveError("archive_job_cancelled")
@@ -159,11 +161,28 @@ class Jobs:
         finally:
             self._write(job, "result.json", result)
 
+    def _invalidate(self, job):
+        dispatch = self._permit(job).parent
+        try:
+            with archive_publication.lock(dispatch) as directory:
+                try:
+                    os.unlink("permit.json", dir_fd=directory)
+                except FileNotFoundError:
+                    return
+                os.fsync(directory)
+        except FileNotFoundError:
+            return
+
+    def _before_grant_save(self, state):
+        current = self._active
+        if current is not None and not self.authorization.fetch_matches(state, current[1]):
+            try:
+                self._invalidate(current[0])
+            except repo_archive.ArchiveError as error:
+                raise AuthorizationError(error.code) from None
+
     def _stop(self, job):
-        permit = self._permit(job)
-        if permit.exists():
-            permit.unlink()
-            vault._fsync_dir(permit.parent)
+        self._invalidate(job)
         for fence in (self.transport.fence, self.receive_fence):
             try:
                 fence.stop(job)
@@ -173,6 +192,7 @@ class Jobs:
     def cancel(self, client, job):
         row = self._owned(client, job)
         if row["state"] in _ACTIVE:
+            self._invalidate(job)
             row.update(state="cancel_requested", stop_reason="cancelled")
             self._write(job, "job.json", row)
             self.reconcile()
@@ -197,6 +217,7 @@ class Jobs:
                     reason = "authorization_withdrawn"
             if reason is None:
                 return
+            self._invalidate(job)
             row.update(state="cancel_requested", stop_reason=reason)
             self._write(job, "job.json", row)
         self._stop(job)

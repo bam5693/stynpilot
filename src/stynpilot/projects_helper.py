@@ -31,7 +31,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from stynpilot import archive_store, deckplay_snapshot, repo_archive, repo_git, safefs, vault  # noqa: E402
+from stynpilot import archive_publication, archive_store, deckplay_snapshot, repo_archive, repo_git, safefs, vault  # noqa: E402
 from stynpilot.server.clients import ClientDenied, RevocationFile  # noqa: E402
 
 MAX_ENTRIES = 50000
@@ -633,12 +633,10 @@ def op_archive_receive(request):
         raise Refuse("archive_transfer_invalid")
     runtime = Path("/run") / ("stynpilot-archive-receive-" + request["job"])
 
-    def require_dispatch():
-        # Bind the directory so an unlink or atomic replacement by the broker
-        # is visible. A read-only mount of just the file would pin its old inode.
+    def require_dispatch(directory):
         try:
             flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
-            with os.fdopen(os.open(runtime / "dispatch" / "permit.json", flags), "rb") as stream:
+            with os.fdopen(os.open("permit.json", flags, dir_fd=directory), "rb") as stream:
                 info = os.fstat(stream.fileno())
                 if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
                         or info.st_mode & 0o022 or not 0 < info.st_size <= 1024):
@@ -651,11 +649,18 @@ def op_archive_receive(request):
         if {key: value for key, value in data.items() if key != "expires"} != request:
             raise Refuse("archive_transfer_authority_changed")
 
-    require_dispatch()
+    @contextmanager
+    def publication_guard():
+        with archive_publication.lock(runtime / "dispatch") as directory:
+            require_dispatch(directory)
+            yield
+
     try:
+        with publication_guard():
+            pass
         return archive_store.Store(runtime / "archives").adopt_stream(
             sys.stdin.buffer, manifest_sha256=request["manifest_sha256"], bundle_sha256=request["bundle_sha256"],
-            client=request["client"], before_publish=require_dispatch, repository_access=request["repository_access"])
+            client=request["client"], publication_guard=publication_guard, repository_access=request["repository_access"])
     except repo_archive.ArchiveError as error:
         raise Refuse(error.code) from None
 

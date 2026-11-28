@@ -208,7 +208,13 @@ def main():
         capture_args = {**repository, "refs": expected_refs, "head": "refs/heads/main"}
         names = {item["name"] for item in call("stynpilot_capabilities")["result"]["operations"]}
         assert {"repository.archive-capture", "repository.archive-status", "repository.archive-cancel"} <= names
-        assert invoke("capture", client="fixture-other", **capture_args)["error"] == "repository_grant_unavailable"
+
+        def unauthorized_capture():
+            reply = invoke("capture", client="fixture-other", **capture_args)
+            return None if reply.get("error") == "lab_restart_reconciling" else reply
+
+        refused = fixture.until(unauthorized_capture, 20)
+        assert refused.get("error") == "repository_grant_unavailable", refused
         started = invoke("capture", **capture_args)
         assert started["ok"], started
         job = started["result"]["job_id"]

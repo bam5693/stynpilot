@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import hashlib
 import json
 from io import BytesIO
@@ -5,9 +6,11 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from stynpilot import archive_store, repo_archive, repo_git
+from stynpilot import archive_publication, archive_store, managed_activity, repo_archive, repo_git, root_restore
+from stynpilot.broker import archive_jobs, repository_auth
+from test_repository_auth import FakeGitLab, REQUEST, TARGET
 
 
 class StoreTests(unittest.TestCase):
@@ -84,7 +87,7 @@ class StoreTests(unittest.TestCase):
             raise repo_archive.ArchiveError("synthetic_revocation")
 
         with self.assertRaisesRegex(repo_archive.ArchiveError, "synthetic_revocation"):
-            self.store.adopt_stream(BytesIO(header + bundle), client="scope.chatgpt", before_publish=revoke, **binding)
+            self.store.adopt_stream(BytesIO(header + bundle), client="scope.chatgpt", publication_guard=revoke, **binding)
         self.assertEqual(self.store.list("scope.chatgpt"), {"archives": []})
         adopted = self.store.adopt_stream(BytesIO(header + bundle), client="scope.chatgpt", **binding)
         self.assertEqual(self.store.list("scope.chatgpt")["archives"], [adopted])
@@ -115,6 +118,86 @@ class StoreTests(unittest.TestCase):
         with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_not_found"):
             store.history("scope.chatgpt", adopted["archive_id"], self.new)
         self.assertTrue((store.path / adopted["archive_id"] / "archive" / "source.bundle").is_file())
+
+    def _publication_fixture(self, directory):
+        directory.mkdir()
+        now = [100]
+        provider = FakeGitLab()
+        provider.ready = True
+        auth = repository_auth.Store(directory, {"fixture": TARGET}, provider=repository_auth.GitLab(provider),
+                                     clock=lambda: now[0])
+        auth.apply("repository_authorize", "chatgpt", "fixture", ["read", "fetch"], 1, REQUEST)
+        auth.connect(REQUEST, False)
+        now[0] += 5
+        auth.connect(REQUEST, True)
+        lease = auth.begin_fetch("chatgpt", "fixture", seconds=60)
+        jobs = archive_jobs.Jobs(directory, auth, Mock(), "/home/fixture", transport=Mock(),
+                                 receive_fence=Mock(), clock=lambda: now[0])
+        job = "d" * 32
+        jobs._folder(job).mkdir(mode=0o700)
+        jobs._write(job, "job.json", {"job_id": job, "client": "chatgpt", "state": "running",
+                                     "deadline": lease.expires})
+        jobs._active = (job, lease, Mock())
+        with root_restore.admission(directory, exclusive=True):
+            managed_activity.claim(directory, archive_jobs.KIND, job)
+        binding = {key: value for key, value in self.binding.items() if key != "clients"}
+        dispatch = jobs._dispatch(job, lease, binding, {"repository": "fixture", "authorization_profile": "e" * 64})
+
+        def cancel():
+            with root_restore.admission(directory, exclusive=True):
+                jobs.cancel("chatgpt", job)
+
+        def revoke():
+            auth.apply("repository_revoke", "chatgpt", "fixture", [], 0, "e" * 64)
+
+        @contextmanager
+        def guard():
+            with archive_publication.lock(dispatch):
+                if not (dispatch / "permit.json").is_file():
+                    raise repo_archive.ArchiveError("archive_transfer_authority_missing")
+                yield
+
+        raw = (self.archive / "manifest.json").read_bytes()
+        frame = len(raw).to_bytes(4, "big") + raw + (self.archive / "source.bundle").read_bytes()
+        return dispatch, cancel, revoke, guard, frame, binding
+
+    def test_cancel_and_revoke_after_staging_prevent_publication(self):
+        sync = archive_store._sync_tree
+        for mode in ("cancel", "revoke"):
+            with self.subTest(mode=mode):
+                dispatch, cancel, revoke, guard, frame, binding = self._publication_fixture(self.root / mode)
+                action = cancel if mode == "cancel" else revoke
+
+                def withdraw(path):
+                    sync(path)
+                    action()
+                    self.assertFalse((dispatch / "permit.json").exists())
+
+                with (patch.object(archive_store, "_sync_tree", side_effect=withdraw) as staged,
+                      self.assertRaisesRegex(repo_archive.ArchiveError, "archive_transfer_authority_missing")):
+                    self.store.adopt_stream(BytesIO(frame), client="scope.chatgpt", publication_guard=guard, **binding)
+                staged.assert_called_once()
+                self.assertFalse((self.store.path / binding["manifest_sha256"][:32]).exists())
+                self.assertFalse(any(path.name.startswith(".pending-") for path in self.store.path.iterdir()))
+
+    def test_cancel_and_revoke_cannot_race_atomic_publication(self):
+        dispatch, cancel, revoke, guard, frame, binding = self._publication_fixture(self.root / "busy")
+        publish = repo_archive._publish_directory
+
+        def finish(staged, target):
+            with self.assertRaisesRegex(repo_archive.ArchiveError, "archive_publication_busy"):
+                cancel()
+            with self.assertRaisesRegex(repository_auth.AuthorizationError, "archive_publication_busy"):
+                revoke()
+            self.assertTrue((dispatch / "permit.json").is_file())
+            return publish(staged, target)
+
+        with patch.object(repo_archive, "_publish_directory", side_effect=finish) as committed:
+            adopted = self.store.adopt_stream(BytesIO(frame), client="scope.chatgpt", publication_guard=guard, **binding)
+        committed.assert_called_once()
+        revoke()
+        self.assertFalse((dispatch / "permit.json").exists())
+        self.assertTrue((self.store.path / adopted["archive_id"] / "archive" / "source.bundle").is_file())
 
     def test_private_transport_cross_checks_worker_frame_and_fences_before_return(self):
         from types import SimpleNamespace

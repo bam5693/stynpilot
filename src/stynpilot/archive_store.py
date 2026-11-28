@@ -1,7 +1,7 @@
 """Owner-side, read-only archive access for approved AI clients."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import fcntl
 import hashlib
 import json
@@ -167,7 +167,7 @@ class Store:
         return self._adopt(raw, manifest_sha256, bundle_sha256, clients,
                            lambda output, size: git._bundle_digest(source / "source.bundle", copy_to=output))
 
-    def adopt_stream(self, stream, *, manifest_sha256, bundle_sha256, client, before_publish=None, repository_access=None):
+    def adopt_stream(self, stream, *, manifest_sha256, bundle_sha256, client, publication_guard=None, repository_access=None):
         """Adopt a verified capture from the broker without passing paths or credentials."""
         header = stream.read(4)
         length = int.from_bytes(header, "big")
@@ -178,9 +178,9 @@ class Store:
             raise git.ArchiveError("archive_manifest_invalid")
         return self._adopt(raw, manifest_sha256, bundle_sha256, [client],
                            lambda output, size: git._hash_bundle_stream(stream, copy_to=output, limit=size),
-                           before_publish=before_publish, repository_access=repository_access)
+                           publication_guard=publication_guard, repository_access=repository_access)
 
-    def _adopt(self, raw, manifest_sha256, bundle_sha256, clients, receive_bundle, *, before_publish=None, repository_access=None):
+    def _adopt(self, raw, manifest_sha256, bundle_sha256, clients, receive_bundle, *, publication_guard=None, repository_access=None):
         if (type(clients) is not list or not 1 <= len(clients) <= 8
                 or any(type(c) is not str or not _CLIENT.fullmatch(c) for c in clients)
                 or len(set(clients)) != len(clients)):
@@ -227,9 +227,8 @@ class Store:
                 vault._write_atomic(pending, "grant.json", json.dumps(grant).encode())
                 _size(self.path, MAX_RETAINED)
                 _sync_tree(pending)
-                if before_publish is not None:
-                    before_publish()
-                git._publish_directory(pending, dest)
+                with (publication_guard() if publication_guard is not None else nullcontext()):
+                    git._publish_directory(pending, dest)
             finally:
                 if pending.exists():
                     self._recover()
